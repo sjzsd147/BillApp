@@ -1,0 +1,22 @@
+{
+  "name": "billapp-desktop",
+  "version": "1.0.0",
+  "description": "账单助手 (BillApp) - 本地优先的跨平台个人账单管理桌面应用",
+  "author": "BillApp Contributors <noreply@github.com>",
+  "homepage": "https://github.com/sjzsd147/BillApp",
+  "license": "MIT",
+  "main": "src/main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "dev": "node scripts/dev.cjs",
+    "test": "node --test tests/backend.test.cjs",
+    "pack:dir": "electron-builder --config electron-builder.yml --dir",
+    "pack:win": "electron-builder --config electron-builder.yml --win",
+    "pack:mac": "electron-builder --config electron-builder.yml --mac",
+    "pack:linux": "electron-builder --config electron-builder.yml --linux"
+  },
+  "devDependencies": {
+    "electron": "^45.3.2",
+    "electron-builder": "^26.18.0"
+  }
+}

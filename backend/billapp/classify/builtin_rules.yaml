@@ -1,0 +1,801 @@
+version: "1.0"
+rules:
+  # =========================================================================
+  # 1. 餐饮美食 (food)
+  # =========================================================================
+  # --- 正餐 (food.dining) ---
+  - rule_id: builtin_food_mcdonalds
+    name: 麦当劳/金拱门快餐
+    category_key: food
+    subcategory_key: food.dining
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '(?i)麦当劳|金拱门|mcdonald'
+    priority: 10
+  - rule_id: builtin_food_mcdonalds_desc
+    name: 麦当劳/金拱门食品公司
+    category_key: food
+    subcategory_key: food.dining
+    field: description
+    pattern_type: contains
+    pattern_value: '金拱门'
+    priority: 10
+  - rule_id: builtin_food_kfc
+    name: 肯德基点餐
+    category_key: food
+    subcategory_key: food.dining
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '(?i)肯德基|kfc'
+    priority: 10
+  - rule_id: builtin_food_tastin
+    name: 塔斯汀中国汉堡
+    category_key: food
+    subcategory_key: food.dining
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '塔斯汀'
+    priority: 10
+  - rule_id: builtin_food_sukiya
+    name: 食其家
+    category_key: food
+    subcategory_key: food.dining
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '食其家'
+    priority: 10
+  - rule_id: builtin_food_yonghe
+    name: 永和大王
+    category_key: food
+    subcategory_key: food.dining
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '永和大王'
+    priority: 10
+  - rule_id: builtin_food_laoshengxing
+    name: 老盛兴汤包馆
+    category_key: food
+    subcategory_key: food.dining
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '老盛兴'
+    priority: 10
+  - rule_id: builtin_food_sushiro
+    name: 寿司郎回转寿司
+    category_key: food
+    subcategory_key: food.dining
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '寿司郎'
+    priority: 10
+  - rule_id: builtin_food_starbucks
+    name: 星巴克咖啡
+    category_key: food
+    subcategory_key: food.dining
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '(?i)星巴克|starbucks'
+    priority: 10
+  - rule_id: builtin_food_burgerking
+    name: 汉堡王
+    category_key: food
+    subcategory_key: food.dining
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '(?i)汉堡王|burger king'
+    priority: 10
+  - rule_id: builtin_food_pizzahut
+    name: 必胜客
+    category_key: food
+    subcategory_key: food.dining
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '(?i)必胜客|pizza hut'
+    priority: 10
+  - rule_id: builtin_food_subway
+    name: 赛百味
+    category_key: food
+    subcategory_key: food.dining
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '(?i)赛百味|subway'
+    priority: 10
+  - rule_id: builtin_food_haidilao
+    name: 海底捞火锅
+    category_key: food
+    subcategory_key: food.dining
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '海底捞'
+    priority: 10
+  - rule_id: builtin_food_xibei
+    name: 西贝莜面村
+    category_key: food
+    subcategory_key: food.dining
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '西贝'
+    priority: 10
+
+  # --- 外卖 (food.takeout) ---
+  - rule_id: builtin_food_meituan_waimai
+    name: 美团外卖/餐饮商户
+    category_key: food
+    subcategory_key: food.takeout
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '美团|三快'
+    priority: 15
+  - rule_id: builtin_food_meituan_desc
+    name: 美团App餐饮外卖订单
+    category_key: food
+    subcategory_key: food.takeout
+    field: description
+    pattern_type: contains
+    pattern_value: '美团App'
+    priority: 20
+  - rule_id: builtin_food_eleme
+    name: 饿了么外卖
+    category_key: food
+    subcategory_key: food.takeout
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '(?i)饿了么|拉扎斯'
+    priority: 15
+
+  # --- 饮品零食 (food.drinks) ---
+  - rule_id: builtin_food_luckin
+    name: 瑞幸咖啡
+    category_key: food
+    subcategory_key: food.drinks
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '(?i)luckin|瑞幸'
+    priority: 10
+  - rule_id: builtin_food_chagee
+    name: 霸王茶姬
+    category_key: food
+    subcategory_key: food.drinks
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '茶姬'
+    priority: 10
+  - rule_id: builtin_food_jiangxiaobai
+    name: 浆小白豆浆
+    category_key: food
+    subcategory_key: food.drinks
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '浆小白'
+    priority: 10
+  - rule_id: builtin_food_heytea
+    name: 喜茶
+    category_key: food
+    subcategory_key: food.drinks
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '喜茶'
+    priority: 10
+  - rule_id: builtin_food_nayuki
+    name: 奈雪的茶
+    category_key: food
+    subcategory_key: food.drinks
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '奈雪'
+    priority: 10
+  - rule_id: builtin_food_mixue
+    name: 蜜雪冰城
+    category_key: food
+    subcategory_key: food.drinks
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '蜜雪冰城'
+    priority: 10
+  - rule_id: builtin_food_coco
+    name: 都可CoCo奶茶
+    category_key: food
+    subcategory_key: food.drinks
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '(?i)都可|coco都可'
+    priority: 10
+  - rule_id: builtin_food_manning
+    name: 一点点奶茶
+    category_key: food
+    subcategory_key: food.drinks
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '一点点'
+    priority: 10
+  - rule_id: builtin_food_guming
+    name: 古茗奶茶
+    category_key: food
+    subcategory_key: food.drinks
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '古茗'
+    priority: 10
+
+  # --- 食堂 (food.canteen) ---
+  - rule_id: builtin_food_canteen_desc
+    name: 学生食堂各餐厅档口
+    category_key: food
+    subcategory_key: food.canteen
+    field: description
+    pattern_type: regex
+    pattern_value: '餐|餐厅|早点|米粉|轻食|炒饭|农家菜|粉丝汤|牛肉面'
+    priority: 20
+  - rule_id: builtin_food_canteen_cp
+    name: 校园餐饮与食堂
+    category_key: food
+    subcategory_key: food.canteen
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '食堂|餐饮中心|校园餐饮'
+    priority: 30
+
+  # =========================================================================
+  # 2. 交通出行 (transport)
+  # =========================================================================
+  # --- 打车出行 (transport.taxi) ---
+  - rule_id: builtin_trans_didi
+    name: 滴滴出行/快车/专车
+    category_key: transport
+    subcategory_key: transport.taxi
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '滴滴'
+    priority: 10
+  - rule_id: builtin_trans_didi_desc
+    name: 滴滴行程账单
+    category_key: transport
+    subcategory_key: transport.taxi
+    field: description
+    pattern_type: contains
+    pattern_value: '滴滴快车'
+    priority: 10
+  - rule_id: builtin_trans_t3
+    name: T3出行
+    category_key: transport
+    subcategory_key: transport.taxi
+    field: counterparty
+    pattern_type: contains
+    pattern_value: 'T3出行'
+    priority: 10
+  - rule_id: builtin_trans_caocao
+    name: 曹操出行
+    category_key: transport
+    subcategory_key: transport.taxi
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '曹操出行'
+    priority: 10
+
+  # --- 公共交通 (transport.public) ---
+  - rule_id: builtin_trans_sptc
+    name: 上海公共交通卡随用随充
+    category_key: transport
+    subcategory_key: transport.public
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '公共交通卡'
+    priority: 10
+  - rule_id: builtin_trans_metro
+    name: 地铁乘车码/申通地铁
+    category_key: transport
+    subcategory_key: transport.public
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '地铁|申通|轨道交通'
+    priority: 10
+  - rule_id: builtin_trans_bus
+    name: 公交公司乘车
+    category_key: transport
+    subcategory_key: transport.public
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '公交|巴士'
+    priority: 10
+
+  # --- 火车飞机 (transport.flight_train) ---
+  - rule_id: builtin_trans_12306
+    name: 中国铁路12306购票
+    category_key: transport
+    subcategory_key: transport.flight_train
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '12306'
+    priority: 10
+  - rule_id: builtin_trans_ctrip
+    name: 携程旅行机酒票务
+    category_key: transport
+    subcategory_key: transport.flight_train
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '携程|去哪儿|同程'
+    priority: 15
+
+  # --- 加油停车 (transport.fuel_parking) ---
+  - rule_id: builtin_trans_plate_shuttle
+    name: 校车出行/车辆车牌缴费
+    category_key: transport
+    subcategory_key: transport.fuel_parking
+    field: description
+    pattern_type: regex
+    pattern_value: '沪[A-Z0-9]{5,6}'
+    priority: 20
+  - rule_id: builtin_trans_gas_sinopec
+    name: 中国石化加油
+    category_key: transport
+    subcategory_key: transport.fuel_parking
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '中石化'
+    priority: 10
+  - rule_id: builtin_trans_gas_petrochina
+    name: 中国石油加油
+    category_key: transport
+    subcategory_key: transport.fuel_parking
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '中石油'
+    priority: 10
+  - rule_id: builtin_trans_ev_charging
+    name: 特来电/星星充电汽车充电
+    category_key: transport
+    subcategory_key: transport.fuel_parking
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '特来电|星星充电|国家电网充电'
+    priority: 10
+
+  # =========================================================================
+  # 3. 日用百货/购物 (shopping)
+  # =========================================================================
+  # --- 日用便利 (shopping.daily) ---
+  - rule_id: builtin_shop_lawson
+    name: 罗森便利店
+    category_key: shopping
+    subcategory_key: shopping.daily
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '(?i)lawson|罗森'
+    priority: 10
+  - rule_id: builtin_shop_711
+    name: 统一超商/7-Eleven便利店
+    category_key: shopping
+    subcategory_key: shopping.daily
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '(?i)7-eleven|统一超商|统一商贸'
+    priority: 10
+  - rule_id: builtin_shop_familymart
+    name: 全家便利店
+    category_key: shopping
+    subcategory_key: shopping.daily
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '(?i)全家|familymart'
+    priority: 10
+  - rule_id: builtin_shop_siyuan
+    name: 社区便利店与小超市
+    category_key: shopping
+    subcategory_key: shopping.daily
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '便利店'
+    priority: 10
+  - rule_id: builtin_shop_vending_up
+    name: UP售货机智能货柜
+    category_key: shopping
+    subcategory_key: shopping.daily
+    field: counterparty
+    pattern_type: contains
+    pattern_value: 'UP售货机'
+    priority: 10
+  - rule_id: builtin_shop_vending_fugui
+    name: 福柜智能自动售货机
+    category_key: shopping
+    subcategory_key: shopping.daily
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '福柜'
+    priority: 10
+  - rule_id: builtin_shop_vending_citybox
+    name: 魔盒CITYBOX智能货柜
+    category_key: shopping
+    subcategory_key: shopping.daily
+    field: counterparty
+    pattern_type: contains
+    pattern_value: 'CITYBOX'
+    priority: 10
+  - rule_id: builtin_shop_meiyijia
+    name: 美宜佳便利店
+    category_key: shopping
+    subcategory_key: shopping.daily
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '美宜佳'
+    priority: 10
+
+  # --- 服饰装扮 (shopping.apparel) ---
+  - rule_id: builtin_shop_uniqlo
+    name: 优衣库UNIQLO
+    category_key: shopping
+    subcategory_key: shopping.apparel
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '(?i)uniqlo|优衣库'
+    priority: 10
+  - rule_id: builtin_shop_zara
+    name: ZARA服饰
+    category_key: shopping
+    subcategory_key: shopping.apparel
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '(?i)zara|飒拉'
+    priority: 10
+
+  # --- 数码电器 (shopping.electronics) ---
+  - rule_id: builtin_shop_jd
+    name: 京东商城电子/数码
+    category_key: shopping
+    subcategory_key: shopping.electronics
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '京东'
+    priority: 10
+  - rule_id: builtin_shop_electronics_keywords
+    name: 数码配件与电子元件通用关键词
+    category_key: shopping
+    subcategory_key: shopping.electronics
+    field: description
+    pattern_type: regex
+    pattern_value: '数码配件|遥控手柄|电子元件|开发板|传感器'
+    priority: 25
+  - rule_id: builtin_shop_apple_store_hardware
+    name: 苹果官方零售直营店硬件
+    category_key: shopping
+    subcategory_key: shopping.electronics
+    field: counterparty
+    pattern_type: contains
+    pattern_value: 'Apple Store 零售店'
+    priority: 10
+
+  # --- 家居家装 (shopping.home) ---
+  - rule_id: builtin_shop_ikea
+    name: 宜家家居
+    category_key: shopping
+    subcategory_key: shopping.home
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '宜家'
+    priority: 10
+
+  # =========================================================================
+  # 4. 住房物业 (housing)
+  # =========================================================================
+  - rule_id: builtin_house_rent
+    name: 房租自如租房
+    category_key: housing
+    subcategory_key: housing.rent_mortgage
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '自如|链家租房|相寓'
+    priority: 10
+
+  # =========================================================================
+  # 5. 生活缴费 (utilities)
+  # =========================================================================
+  # --- 校园生活/生活设施 (utilities.campus_facilities) ---
+  - rule_id: builtin_util_campus_facilities
+    name: 校园宿舍水电空调与一卡通设施
+    category_key: utilities
+    subcategory_key: utilities.campus_facilities
+    field: description
+    pattern_type: regex
+    pattern_value: '校园空调|校园热水|寝室水电|宿舍水电|饮水机'
+    priority: 20
+  - rule_id: builtin_util_campus_card
+    name: 校园卡在线充值
+    category_key: utilities
+    subcategory_key: utilities.campus_facilities
+    field: description
+    pattern_type: contains
+    pattern_value: '校园卡充值'
+    priority: 10
+
+  # --- 水电气煤 (utilities.water_electricity) ---
+  - rule_id: builtin_util_state_grid
+    name: 国家电网电费缴费
+    category_key: utilities
+    subcategory_key: utilities.water_electricity
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '国家电网'
+    priority: 10
+  - rule_id: builtin_util_gas
+    name: 燃气天然气缴费
+    category_key: utilities
+    subcategory_key: utilities.water_electricity
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '燃气|天然气'
+    priority: 10
+  - rule_id: builtin_util_water
+    name: 自来水水费缴费
+    category_key: utilities
+    subcategory_key: utilities.water_electricity
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '自来水|水务'
+    priority: 10
+
+  # --- 话费宽带 (utilities.telecom) ---
+  - rule_id: builtin_util_telecom_cmcc
+    name: 中国移动话费充值
+    category_key: utilities
+    subcategory_key: utilities.telecom
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '中国移动'
+    priority: 10
+  - rule_id: builtin_util_telecom_cu
+    name: 中国联通通信充值
+    category_key: utilities
+    subcategory_key: utilities.telecom
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '中国联通'
+    priority: 10
+  - rule_id: builtin_util_telecom_ct
+    name: 中国电信通信缴费
+    category_key: utilities
+    subcategory_key: utilities.telecom
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '中国电信'
+    priority: 10
+
+  # --- 软件服务/云订阅 (utilities.subscription) ---
+  - rule_id: builtin_util_tencent_cloud
+    name: 腾讯云开发者服务器/云产品
+    category_key: utilities
+    subcategory_key: utilities.subscription
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '腾讯云'
+    priority: 10
+  - rule_id: builtin_util_aliyun
+    name: 阿里云云资源费用
+    category_key: utilities
+    subcategory_key: utilities.subscription
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '阿里云'
+    priority: 10
+
+  # =========================================================================
+  # 6. 休闲娱乐 (entertainment)
+  # =========================================================================
+  # --- 网络游戏 (entertainment.gaming) ---
+  - rule_id: builtin_ent_mihoyo
+    name: 上海米哈游游戏充值/空月祝福
+    category_key: entertainment
+    subcategory_key: entertainment.gaming
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '米哈游'
+    priority: 10
+  - rule_id: builtin_ent_qq_coin_cp
+    name: 腾讯计算机Q币购买
+    category_key: entertainment
+    subcategory_key: entertainment.gaming
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '腾讯计算机'
+    priority: 15
+  - rule_id: builtin_ent_qq_coin_desc
+    name: 腾讯Q币充值消费
+    category_key: entertainment
+    subcategory_key: entertainment.gaming
+    field: description
+    pattern_type: contains
+    pattern_value: 'Q币'
+    priority: 10
+  - rule_id: builtin_ent_steam
+    name: Steam游戏平台消费
+    category_key: entertainment
+    subcategory_key: entertainment.gaming
+    field: counterparty
+    pattern_type: contains
+    pattern_value: 'Steam'
+    priority: 10
+
+  # --- 影音会员 (entertainment.media) ---
+  - rule_id: builtin_ent_apple_store
+    name: App Store & Apple Music数字音乐
+    category_key: entertainment
+    subcategory_key: entertainment.media
+    field: counterparty
+    pattern_type: contains
+    pattern_value: 'App Store'
+    priority: 10
+  - rule_id: builtin_ent_icloud
+    name: iCloud云上贵州/云上艾珀存储
+    category_key: entertainment
+    subcategory_key: entertainment.media
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '(?i)icloud|云上贵州|云上艾珀'
+    priority: 10
+  - rule_id: builtin_ent_bilibili
+    name: 哔哩哔哩大会员
+    category_key: entertainment
+    subcategory_key: entertainment.media
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '(?i)bilibili|哔哩哔哩'
+    priority: 10
+
+  # =========================================================================
+  # 7. 医疗健康 (medical)
+  # =========================================================================
+  # --- 商业保险 (medical.insurance) ---
+  - rule_id: builtin_med_chinalife
+    name: 中国人寿商业保险
+    category_key: medical
+    subcategory_key: medical.insurance
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '中国人寿'
+    priority: 10
+  - rule_id: builtin_med_pingan_ins
+    name: 平安保险
+    category_key: medical
+    subcategory_key: medical.insurance
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '平安人寿'
+    priority: 10
+
+  # --- 药品器械 (medical.pharmacy) ---
+  - rule_id: builtin_med_pharmacy
+    name: 药房药店买药
+    category_key: medical
+    subcategory_key: medical.pharmacy
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '药房|大药房|药店'
+    priority: 15
+
+  # --- 就诊门诊 (medical.treatment) ---
+  - rule_id: builtin_med_hospital
+    name: 医院就诊挂号
+    category_key: medical
+    subcategory_key: medical.treatment
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '医院|门诊|卫生院'
+    priority: 15
+
+  # =========================================================================
+  # 8. 文教培训 (education)
+  # =========================================================================
+  - rule_id: builtin_edu_books
+    name: 当当/新华书店图书文具
+    category_key: education
+    subcategory_key: education.books
+    field: counterparty
+    pattern_type: regex
+    pattern_value: '新华书店|当当网|西西弗'
+    priority: 15
+
+  # =========================================================================
+  # 9. 人情往来 (family_social)
+  # =========================================================================
+  - rule_id: builtin_soc_group_aa
+    name: 微信群收款AA分摊
+    category_key: family_social
+    subcategory_key: family_social.aa
+    field: platform_category
+    pattern_type: contains
+    pattern_value: '群收款'
+    priority: 10
+
+  # =========================================================================
+  # 10. 金融转账 (financial)
+  # =========================================================================
+  - rule_id: builtin_fin_self_transfer
+    name: 资金互转跨行转账
+    category_key: financial
+    subcategory_key: financial.internal_transfer
+    field: description
+    pattern_type: regex
+    pattern_value: '跨行转账|资金互转'
+    priority: 10
+  - rule_id: builtin_fin_withdraw_ccb
+    name: 微信零钱提现建设银行
+    category_key: financial
+    subcategory_key: financial.internal_transfer
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '建设银行'
+    priority: 10
+  - rule_id: builtin_fin_withdraw_cmb
+    name: 微信零钱提现招商银行
+    category_key: financial
+    subcategory_key: financial.internal_transfer
+    field: counterparty
+    pattern_type: contains
+    pattern_value: '招商银行'
+    priority: 10
+  - rule_id: builtin_fin_dir_transfer
+    name: 转账流水
+    category_key: financial
+    subcategory_key: financial.internal_transfer
+    field: direction
+    pattern_type: exact
+    pattern_value: 'transfer'
+    priority: 60
+
+  # =========================================================================
+  # 11. 理财收益 (investment)
+  # =========================================================================
+  - rule_id: builtin_inc_rebate_icbc
+    name: 工行信用卡Visa商户返现
+    category_key: investment
+    subcategory_key: investment.rebate
+    field: counterparty
+    pattern_type: contains
+    pattern_value: 'VisaMerchantRebate'
+    priority: 10
+  - rule_id: builtin_inc_rebate_visa
+    name: Visa全球活动消费返现
+    category_key: investment
+    subcategory_key: investment.rebate
+    field: counterparty
+    pattern_type: contains
+    pattern_value: 'Visa 26Q4 Glocal'
+    priority: 10
+
+  # =========================================================================
+  # 12. 转账收款 (transfer_income)
+  # =========================================================================
+  - rule_id: builtin_inc_transfer_wechat
+    name: 微信个人转账收款
+    category_key: transfer_income
+    subcategory_key: transfer_income.peer
+    field: description
+    pattern_type: contains
+    pattern_value: '微信转账'
+    priority: 10
+  - rule_id: builtin_inc_peer_transfer
+    name: 个人转账收款
+    category_key: transfer_income
+    subcategory_key: transfer_income.peer
+    field: description
+    pattern_type: regex
+    pattern_value: '转账收款|个人转账'
+    priority: 10
+
+  # =========================================================================
+  # 13. 报销退款 (reimbursement)
+  # =========================================================================
+  - rule_id: builtin_ref_desc_refund
+    name: 交易退款退货
+    category_key: reimbursement
+    subcategory_key: reimbursement.refund
+    field: description
+    pattern_type: regex
+    pattern_value: '退款|退货'
+    priority: 50
+  - rule_id: builtin_ref_dir_refund
+    name: 退款流水冲抵
+    category_key: reimbursement
+    subcategory_key: reimbursement.refund
+    field: direction
+    pattern_type: exact
+    pattern_value: 'refund'
+    priority: 60

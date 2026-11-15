@@ -1,0 +1,40 @@
+# 真实账单样本（含个人隐私，禁止上传）
+Sample/
+# Agent 工作流临时目录
+.agent/
+.agents/
+
+# 日志与临时文件
+*.log
+debug.log
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# 运行时数据 / 密钥
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+.env
+
+# 构建产物
+build/*
+!build/billapp.spec
+!build/build.mjs
+!build/build.ps1
+dist/
+frontend/dist/
+electron/dist/
+node_modules/
+
+# 系统文件
+Thumbs.db
+.DS_Store

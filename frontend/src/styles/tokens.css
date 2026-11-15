@@ -1,0 +1,61 @@
+:root {
+  /* Surfaces & Backgrounds */
+  --bg: #F6F7F9;
+  --surface: #FFFFFF;
+  --surface-alt: #FAFBFC;
+  --surface-hover: #F5F7FA;
+
+  /* Borders */
+  --border: #E6E8EB;
+  --border-2: #F0F1F3;
+  --border-strong: #D5D9DF;
+
+  /* Typography Colors */
+  --text: #1B1F26;
+  --text-2: #5B6472;
+  --text-3: #8B94A3;
+
+  /* Brand Primary */
+  --primary: #2F6BFF;
+  --primary-hover: #1F5AF0;
+  --primary-soft: #EEF3FF;
+  --primary-soft-2: #F5F8FF;
+
+  /* Semantics */
+  --success: #15803D;
+  --success-soft: #ECFDF3;
+  --warning: #B45309;
+  --warning-soft: #FFFBEB;
+  --danger: #C62828;
+  --danger-soft: #FEF2F2;
+  --info: #475569;
+
+  /* Transaction Direction Colors */
+  --expense: #1B1F26;        /* Expense is body text color, NOT RED */
+  --expense-soft: #F5F6F8;
+  --income: #15803D;
+  --income-soft: #ECFDF3;
+  --refund: #1D4ED8;
+  --refund-soft: #EFF6FF;
+  --transfer: #6B7280;
+  --transfer-soft: #F3F4F6;
+  --neutral: #9AA3AF;
+  --neutral-soft: #F8FAFC;
+
+  /* Focus & Shadows */
+  --focus-ring: 0 0 0 3px rgba(47, 107, 255, 0.28);
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06);
+  --shadow-md: 0 4px 12px rgba(16, 24, 40, 0.08);
+  --shadow-lg: 0 12px 32px rgba(16, 24, 40, 0.14);
+
+  /* Geometry */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
+  --sidebar-width: 200px;
+  --sidebar-collapsed-width: 64px;
+  --topbar-height: 56px;
+  --row-height: 44px;
+  --row-height-compact: 36px;
+}
