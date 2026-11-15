@@ -34,6 +34,7 @@ function parseArgs(argv) {
     outDir: '',
     platformFlag: '',
     archFlag: '',
+    publishMode: 'never',
   };
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === '--out' && argv[i + 1]) {
@@ -41,6 +42,11 @@ function parseArgs(argv) {
       i += 1;
     } else if (argv[i].startsWith('--out=')) {
       opts.outDir = path.resolve(argv[i].slice('--out='.length));
+    } else if (argv[i] === '--publish' && argv[i + 1]) {
+      opts.publishMode = argv[i + 1];
+      i += 1;
+    } else if (argv[i].startsWith('--publish=')) {
+      opts.publishMode = argv[i].slice('--publish='.length);
     } else if (argv[i] === '--win' || argv[i] === '--mac' || argv[i] === '--linux') {
       opts.platformFlag = argv[i];
     } else if (argv[i] === '--arm64' || argv[i] === '--x64' || argv[i] === '--universal') {
@@ -193,6 +199,9 @@ function main() {
   }
   if (opts.archFlag) {
     builderArgs.push(opts.archFlag);
+  }
+  if (opts.publishMode) {
+    builderArgs.push('--publish', opts.publishMode);
   }
   builderArgs.push(`--config.directories.output=${distOutDir}`);
   runNpm(builderArgs, { cwd: electronDir });
