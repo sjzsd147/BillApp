@@ -107,7 +107,8 @@ function getUnpackedExecutable(distOutDir) {
     const arm64 = path.join(distOutDir, 'mac-arm64', 'BillApp.app', 'Contents', 'MacOS', 'BillApp');
     return [arm, arm64, intel].find((p) => fs.existsSync(p)) || arm;
   }
-  return path.join(distOutDir, 'linux-unpacked', 'billapp');
+  return ['billapp-desktop', 'billapp'].map((name) => path.join(distOutDir, 'linux-unpacked', name)).find((p) => fs.existsSync(p))
+    || path.join(distOutDir, 'linux-unpacked', 'billapp-desktop');
 }
 
 function hasWindowsLowMandatoryLevel(filePath) {
@@ -203,8 +204,26 @@ function main() {
   if (opts.publishMode) {
     builderArgs.push('--publish', opts.publishMode);
   }
+  // GitHub Actions expands unset secrets (e.g. CSC_LINK: ${{ secrets.CSC_LINK }}) to "".
+  // On macOS, electron-builder checks `cscLink == null` rather than empty string, causing it
+  // to resolve "" against electronDir and fail with `<electronDir> not a file`.
+  const builderEnv = { ...process.env };
+  for (const key of [
+    'CSC_LINK',
+    'CSC_KEY_PASSWORD',
+    'CSC_NAME',
+    'CSC_INSTALLER_LINK',
+    'CSC_INSTALLER_KEY_PASSWORD',
+    'WIN_CSC_LINK',
+    'WIN_CSC_KEY_PASSWORD',
+  ]) {
+    if (typeof builderEnv[key] === 'string' && builderEnv[key].trim() === '') {
+      delete builderEnv[key];
+    }
+  }
+
   builderArgs.push(`--config.directories.output=${distOutDir}`);
-  runNpm(builderArgs, { cwd: electronDir });
+  runNpm(builderArgs, { cwd: electronDir, env: builderEnv });
 
   const unpackedExe = getUnpackedExecutable(distOutDir);
   if (!opts.skipSmoke && fs.existsSync(unpackedExe)) {
