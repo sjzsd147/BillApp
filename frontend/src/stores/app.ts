@@ -13,7 +13,7 @@ import {
 import type { CategoryItemOut, MetaAccount, LLMStatusResponse } from '@/types/api';
 
 export const useAppStore = defineStore('app', () => {
-  const version = ref('1.2.0');
+  const version = ref('1.2.1');
   const dbPath = ref('');
   const categories = ref<CategoryItemOut[]>([]);
   const accounts = ref<MetaAccount[]>([]);

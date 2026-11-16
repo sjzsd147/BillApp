@@ -3,7 +3,7 @@
     <!-- Sidebar -->
     <aside class="sidebar">
       <div class="brand">
-        <div class="logo">账</div>
+        <img src="/icon.png" alt="账单助手" class="brand-logo-img" />
         <div class="brand-text" v-if="!isCollapsed">
           <div class="app-title">账单助手</div>
           <div class="app-subtitle">Bill App</div>
@@ -311,17 +311,11 @@ onMounted(() => {
   border-bottom: 1px solid var(--border-2);
 }
 
-.logo {
+.brand-logo-img {
   width: 32px;
   height: 32px;
-  background: linear-gradient(135deg, var(--primary) 0%, #5B8DEF 100%);
-  color: #fff;
   border-radius: var(--radius-md);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 700;
-  font-size: 16px;
+  object-fit: contain;
   flex-shrink: 0;
 }
 
