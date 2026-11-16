@@ -32,14 +32,14 @@ def client(tmp_path: Path) -> Generator[TestClient, None, None]:
 def test_api_health_check(client: TestClient):
     resp = client.get("/api/health")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok", "version": "1.0.0"}
+    assert resp.json() == {"status": "ok", "version": "1.2.0"}
 
 
 def test_api_meta_endpoint(client: TestClient):
     resp = client.get("/api/meta")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["version"] == "1.0.0"
+    assert data["version"] == "1.2.0"
     assert "categories" in data
     assert len(data["categories"]) == 16  # 16 root categories
     assert "accounts" in data

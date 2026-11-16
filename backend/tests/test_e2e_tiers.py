@@ -1376,7 +1376,7 @@ class TestTier1_F25_FastAPIAppAndLifespan:
         assert envelope["code"] == "PDF_PASSWORD_REQUIRED"
 
     def test_f25_03_health_check_contract(self):
-        health = {"status": "ok", "version": "1.0.0", "db_connected": True}
+        health = {"status": "ok", "version": "1.2.0", "db_connected": True}
         assert health["status"] == "ok"
 
     def test_f25_04_session_lifecycle_commit_rollback(self, mem_db: sqlite3.Connection):

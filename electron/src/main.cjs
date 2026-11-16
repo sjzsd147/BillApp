@@ -2,8 +2,9 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, Menu, dialog, ipcMain, net, shell } = require('electron');
 const { startBackend, httpPostBuffer, parseDbCliArg } = require('./backend.cjs');
+const { createAppUpdater } = require('./updater.cjs');
 
 app.setName('BillApp');
 // Ensure loopback traffic to the local FastAPI sidecar never routes through system HTTP proxies.
@@ -17,6 +18,7 @@ let mainWindow = null;
 let backendHandle = null;
 let isQuitting = false;
 let stopInFlight = null;
+let appUpdaterController = null;
 
 if (!ALLOW_MULTI) {
   const gotLock = app.requestSingleInstanceLock();
@@ -210,13 +212,40 @@ function createMainWindow() {
   return { win, uiUrl };
 }
 
+function getAppUpdaterController() {
+  if (!appUpdaterController) {
+    appUpdaterController = createAppUpdater({
+      app,
+      openUrl: (url) => shell.openExternal(url),
+      beforeInstall: () => shutdownBackend(),
+      fetchImpl: (url, opts) => net.fetch(url, opts),
+      onStateChange: (state) => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('bill:updater-state', state);
+        }
+      },
+    });
+    appUpdaterController.init();
+  }
+  return appUpdaterController;
+}
+
 function registerIpcHandlers() {
+  const updater = getAppUpdaterController();
+
   ipcMain.handle('bill:get-desktop-info', () => ({
     platform: process.platform,
     isPackaged: app.isPackaged,
     appVersion: app.getVersion(),
     backendUrl: backendHandle ? backendHandle.url : undefined,
+    installMode: updater.getState().installMode,
   }));
+
+  ipcMain.handle('bill:updater-get-state', () => updater.getState());
+  ipcMain.handle('bill:updater-check', () => updater.checkForUpdates({ silent: false }));
+  ipcMain.handle('bill:updater-download', () => updater.downloadUpdate());
+  ipcMain.handle('bill:updater-quit-and-install', () => updater.quitAndInstall());
+  ipcMain.handle('bill:updater-open-release', () => updater.openReleasePage());
 
   ipcMain.handle('bill:save-database-backup', async (_event, payload = {}) => {
     if (!backendHandle) {
@@ -364,7 +393,9 @@ async function loadAndMaybeSmokeTest({ win, uiUrl }) {
           isElectron: window.billDesktop.isElectron,
           platform: window.billDesktop.platform,
           hasSaveBackup: typeof window.billDesktop.saveDatabaseBackup === 'function',
+          hasUpdater: typeof window.billDesktop.updater?.checkForUpdates === 'function',
           info: await window.billDesktop.getDesktopInfo(),
+          updaterState: window.billDesktop.updater ? await window.billDesktop.updater.getState() : null,
         } : null,
         health,
         metaOk: Boolean(meta && meta.version),
@@ -372,7 +403,7 @@ async function loadAndMaybeSmokeTest({ win, uiUrl }) {
     })()
   `);
 
-  if (!probe?.hasAppHtml || !probe?.billDesktop?.isElectron || probe?.health?.status !== 'ok' || !probe?.metaOk) {
+  if (!probe?.hasAppHtml || !probe?.billDesktop?.isElectron || !probe?.billDesktop?.hasUpdater || probe?.health?.status !== 'ok' || !probe?.metaOk) {
     throw new Error(`Smoke test probe failed: ${JSON.stringify(probe)}`);
   }
 
@@ -427,6 +458,11 @@ app.whenReady()
     await loadAndMaybeSmokeTest(created);
     if (SMOKE_TEST) {
       app.quit();
+    } else {
+      const startupTimer = setTimeout(() => {
+        getAppUpdaterController().checkForUpdates({ silent: true }).catch(() => {});
+      }, 5000);
+      startupTimer.unref();
     }
   })
   .catch(async (err) => {

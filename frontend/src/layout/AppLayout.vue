@@ -104,6 +104,17 @@
         </div>
 
         <div class="topbar-right">
+          <!-- Desktop Update Pill -->
+          <div
+            v-if="updatePillInfo"
+            class="status-pill"
+            :class="updatePillInfo.cls"
+            @click="jumpToUpdateSettings"
+          >
+            <span class="status-dot" />
+            <span class="status-label">{{ updatePillInfo.text }}</span>
+          </div>
+
           <!-- LLM Status Pill -->
           <div class="status-pill" :class="llmStatusClass" @click="jumpToLLMSettings">
             <span class="status-dot" />
@@ -206,6 +217,22 @@ const llmStatusClass = computed(() => {
   return 'status-online';
 });
 
+const updatePillInfo = computed(() => {
+  const u = appStore.updateState;
+  if (!u) return null;
+  if (u.status === 'downloaded' && u.latestVersion) {
+    return { cls: 'status-online', text: `更新就绪 v${u.latestVersion}` };
+  }
+  if (u.status === 'downloading') {
+    const pct = Math.round(u.downloadProgress?.percent || 0);
+    return { cls: 'status-update', text: `下载更新 ${pct}%` };
+  }
+  if (u.status === 'available' && u.latestVersion) {
+    return { cls: 'status-update', text: `发现更新 v${u.latestVersion}` };
+  }
+  return null;
+});
+
 function focusSearch() {
   searchInputRef.value?.focus();
 }
@@ -223,6 +250,10 @@ function jumpToLLMSettings() {
   router.push('/settings/llm');
 }
 
+function jumpToUpdateSettings() {
+  router.push('/settings/about');
+}
+
 setupGlobalShortcuts(router, {
   onSearch: focusSearch,
   onHelp: () => {
@@ -236,6 +267,7 @@ setupGlobalShortcuts(router, {
 onMounted(() => {
   appStore.fetchMeta();
   appStore.fetchLLMStatus();
+  appStore.initDesktopUpdater();
 
   // Responsive sidebar collapse on narrow desktop windows
   if (window.innerWidth < 1180) {
@@ -562,6 +594,15 @@ onMounted(() => {
 }
 .status-disabled .status-dot {
   background: var(--warning);
+}
+
+.status-update {
+  background: rgba(47, 107, 255, 0.1);
+  color: var(--primary, #2f6bff);
+  border-color: rgba(47, 107, 255, 0.25);
+}
+.status-update .status-dot {
+  background: var(--primary, #2f6bff);
 }
 
 /* Page Content Viewport */

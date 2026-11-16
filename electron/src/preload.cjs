@@ -13,4 +13,21 @@ contextBridge.exposeInMainWorld('billDesktop', {
   saveDatabaseBackup: (defaultFilename = '') =>
     ipcRenderer.invoke('bill:save-database-backup', { defaultFilename }),
   getDesktopInfo: () => ipcRenderer.invoke('bill:get-desktop-info'),
+  updater: {
+    getState: () => ipcRenderer.invoke('bill:updater-get-state'),
+    checkForUpdates: () => ipcRenderer.invoke('bill:updater-check'),
+    downloadUpdate: () => ipcRenderer.invoke('bill:updater-download'),
+    quitAndInstall: () => ipcRenderer.invoke('bill:updater-quit-and-install'),
+    openReleasePage: () => ipcRenderer.invoke('bill:updater-open-release'),
+    onStateChange: (callback) => {
+      if (typeof callback !== 'function') {
+        return () => {};
+      }
+      const listener = (_event, state) => callback(state);
+      ipcRenderer.on('bill:updater-state', listener);
+      return () => {
+        ipcRenderer.removeListener('bill:updater-state', listener);
+      };
+    },
+  },
 });

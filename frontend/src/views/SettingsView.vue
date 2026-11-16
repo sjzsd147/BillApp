@@ -307,6 +307,87 @@
 
           <el-divider />
 
+          <div class="card-header-flex" style="margin-bottom: 12px">
+            <div class="card-title" style="margin-bottom: 0">软件更新 (GitHub Releases)</div>
+            <el-tag size="small" :type="updaterModeTagType">{{ updaterModeLabel }}</el-tag>
+          </div>
+
+          <div v-if="isDesktopEnv" class="updater-box">
+            <div class="updater-status-row">
+              <span class="updater-status-text">{{ updaterStatusText }}</span>
+              <span v-if="updateState?.checkedAt" class="updater-checked-at">
+                上次检查: {{ formatCheckedAt(updateState.checkedAt) }}
+              </span>
+            </div>
+
+            <div v-if="updateState?.status === 'downloading' && updateState.downloadProgress" class="updater-progress">
+              <el-progress
+                :percentage="Math.round(updateState.downloadProgress.percent)"
+                :stroke-width="10"
+              />
+              <div class="updater-progress-meta">
+                <span>
+                  {{ formatBytes(updateState.downloadProgress.transferred) }} /
+                  {{ formatBytes(updateState.downloadProgress.total) }}
+                </span>
+                <span>{{ formatSpeed(updateState.downloadProgress.bytesPerSecond) }}</span>
+              </div>
+            </div>
+
+            <div v-if="updateState?.releaseNotes" class="updater-notes-box">
+              <div class="example-title">版本更新说明 (v{{ updateState.latestVersion }})</div>
+              <div class="updater-notes-body">{{ updateState.releaseNotes }}</div>
+            </div>
+
+            <el-alert
+              v-if="updateState?.error"
+              :title="updateState.error"
+              :type="updateState.manualDownloadRequired ? 'warning' : 'error'"
+              show-icon
+              :closable="false"
+              style="margin-top: 10px"
+            />
+
+            <div class="data-actions-row" style="margin-top: 12px">
+              <el-button
+                :loading="checkingUpdate"
+                :disabled="updateState?.status === 'downloading'"
+                @click="handleCheckUpdates"
+              >
+                检查更新
+              </el-button>
+              <el-button
+                v-if="canDownloadUpdate"
+                type="primary"
+                @click="handleDownloadUpdate"
+              >
+                下载更新 v{{ updateState?.latestVersion }}
+              </el-button>
+              <el-button
+                v-if="updateState?.status === 'downloaded'"
+                type="success"
+                @click="handleQuitAndInstall"
+              >
+                立即重启并安装
+              </el-button>
+              <el-button @click="handleOpenReleasePage">
+                前往 GitHub Releases
+              </el-button>
+            </div>
+            <div class="form-tip" style="margin-left: 0; margin-top: 8px">
+              仅向 GitHub Releases 查询公开版本元数据，不上传任何个人或账单数据。
+            </div>
+          </div>
+
+          <div v-else class="updater-box">
+            <div class="form-tip" style="margin-left: 0; margin-bottom: 10px">
+              当前处于网页访问模式，桌面端自动更新仅在桌面客户端中可用。
+            </div>
+            <el-button @click="handleOpenReleasePage">前往 GitHub Releases</el-button>
+          </div>
+
+          <el-divider />
+
           <div class="card-title">数据备份与管理</div>
           <div class="data-actions-row">
             <el-button :loading="backingUp" @click="handleBackup">导出数据库备份 (.db)</el-button>
@@ -419,7 +500,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted } from 'vue';
+import { ref, reactive, computed, onMounted, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import { ElMessage, ElNotification } from 'element-plus';
 import { Lock } from '@element-plus/icons-vue';
@@ -433,7 +514,7 @@ import {
 import { testLLM, listLLMModels } from '@/api/llm';
 import { getFxRates, refreshFx, saveFxRate } from '@/api/fx';
 import { useAppStore } from '@/stores/app';
-import { saveDatabaseBackupViaDesktop } from '@/utils/desktop';
+import { isElectronDesktop, saveDatabaseBackupViaDesktop } from '@/utils/desktop';
 import type { SettingsOut, FxRatesResponse, FxRateItem, LLMModelInfo } from '@/types/api';
 
 const route = useRoute();
@@ -458,6 +539,55 @@ const backupNotice = ref<{
 const restoring = ref(false);
 const resetting = ref(false);
 const showResetDialog = ref(false);
+
+const isDesktopEnv = computed(() => isElectronDesktop());
+const updateState = computed(() => appStore.updateState);
+const checkingUpdate = computed(() => updateState.value?.status === 'checking');
+const canDownloadUpdate = computed(() => {
+  const s = updateState.value;
+  return Boolean(s && s.status === 'available' && s.autoInstallSupported && !s.manualDownloadRequired);
+});
+const updaterModeLabel = computed(() => {
+  if (!isDesktopEnv.value) return '网页模式';
+  const mode = updateState.value?.installMode;
+  if (mode === 'nsis') return 'Windows 安装版 · 自动更新';
+  if (mode === 'portable') return 'Windows 便携版 · 手动更新';
+  if (mode === 'appimage') return 'Linux AppImage · 自动更新';
+  if (mode === 'deb' || mode === 'rpm' || mode === 'pacman') return `Linux ${mode.toUpperCase()} · 自动更新`;
+  if (mode === 'mac') {
+    return updateState.value?.autoInstallSupported ? 'macOS · 自动更新' : 'macOS 未签名 · 手动更新';
+  }
+  if (mode === 'dev') return '开发环境';
+  return '桌面客户端';
+});
+const updaterModeTagType = computed(() => {
+  if (!isDesktopEnv.value) return 'info';
+  return updateState.value?.autoInstallSupported ? 'success' : 'warning';
+});
+const updaterStatusText = computed(() => {
+  const s = updateState.value;
+  if (!s || s.status === 'idle') {
+    return `当前版本 v${appStore.version}，尚未检查更新`;
+  }
+  if (s.status === 'checking') {
+    return '正在从 GitHub Releases 检查更新…';
+  }
+  if (s.status === 'not-available') {
+    return `当前已是最新版本 (v${s.currentVersion || appStore.version})`;
+  }
+  if (s.status === 'available') {
+    return s.manualDownloadRequired
+      ? `发现新版本 v${s.latestVersion}（需前往 GitHub 手动下载安装包）`
+      : `发现新版本 v${s.latestVersion}，可立即下载更新`;
+  }
+  if (s.status === 'downloading') {
+    return `正在下载新版本 v${s.latestVersion}…`;
+  }
+  if (s.status === 'downloaded') {
+    return `新版本 v${s.latestVersion} 已下载就绪，重启即可完成安装`;
+  }
+  return `检查更新异常（当前版本 v${s.currentVersion || appStore.version}）`;
+});
 const restoreInputRef = ref<HTMLInputElement | null>(null);
 const resetForm = reactive({
   confirm_text: '',
@@ -890,9 +1020,76 @@ async function handleConfirmReset() {
   }
 }
 
+watch(
+  () => route.params.tab,
+  (tab) => {
+    if (typeof tab === 'string' && tab) {
+      activeTab.value = tab;
+    }
+  }
+);
+
+function formatBytes(bytes: number): string {
+  if (!bytes || bytes <= 0) return '0 B';
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatSpeed(bytesPerSec: number): string {
+  if (!bytesPerSec || bytesPerSec <= 0) return '';
+  if (bytesPerSec < 1024 * 1024) return `${(bytesPerSec / 1024).toFixed(0)} KB/s`;
+  return `${(bytesPerSec / (1024 * 1024)).toFixed(2)} MB/s`;
+}
+
+function formatCheckedAt(iso: string): string {
+  try {
+    return new Date(iso).toLocaleString();
+  } catch {
+    return iso;
+  }
+}
+
+async function handleCheckUpdates() {
+  try {
+    const res = await appStore.checkForUpdates();
+    if (!res) return;
+    if (res.status === 'not-available') {
+      ElMessage.success(`当前已是最新版本 v${res.currentVersion}`);
+    } else if (res.status === 'available') {
+      ElMessage.info(`发现新版本 v${res.latestVersion}`);
+    }
+  } catch (err: any) {
+    ElMessage.error(err?.message || '检查更新失败');
+  }
+}
+
+async function handleDownloadUpdate() {
+  try {
+    await appStore.downloadUpdate();
+  } catch (err: any) {
+    ElMessage.error(err?.message || '下载更新失败');
+  }
+}
+
+async function handleQuitAndInstall() {
+  try {
+    const res = await appStore.quitAndInstallUpdate();
+    if (res && !res.ok && res.error) {
+      ElMessage.error(res.error);
+    }
+  } catch (err: any) {
+    ElMessage.error(err?.message || '安装更新失败');
+  }
+}
+
+async function handleOpenReleasePage() {
+  await appStore.openReleasePage();
+}
+
 onMounted(() => {
   loadSettings();
   loadFxOverview();
+  appStore.initDesktopUpdater();
 });
 </script>
 
@@ -1100,5 +1297,58 @@ onMounted(() => {
   margin-top: 6px;
   font-size: 12px;
   color: var(--text-3);
+}
+
+.updater-box {
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 14px;
+}
+
+.updater-status-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.updater-status-text {
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.updater-checked-at {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.updater-progress {
+  margin-top: 12px;
+}
+
+.updater-progress-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text-3);
+  margin-top: 4px;
+}
+
+.updater-notes-box {
+  margin-top: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+
+.updater-notes-body {
+  font-size: 12.5px;
+  color: var(--text-2);
+  white-space: pre-line;
+  line-height: 1.55;
 }
 </style>

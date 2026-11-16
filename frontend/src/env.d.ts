@@ -20,6 +20,51 @@ interface BillDesktopInfo {
   isPackaged: boolean;
   appVersion: string;
   backendUrl?: string;
+  installMode?: string;
+}
+
+type DesktopUpdateStatus =
+  | 'idle'
+  | 'checking'
+  | 'available'
+  | 'not-available'
+  | 'downloading'
+  | 'downloaded'
+  | 'error';
+
+interface DesktopUpdateProgress {
+  percent: number;
+  bytesPerSecond: number;
+  transferred: number;
+  total: number;
+}
+
+interface DesktopUpdateState {
+  supported: boolean;
+  autoInstallSupported: boolean;
+  installMode: string;
+  currentVersion: string;
+  repositoryUrl: string;
+  releasesUrl: string;
+  status: DesktopUpdateStatus;
+  latestVersion: string | null;
+  releaseDate: string | null;
+  releaseNotes: string | null;
+  releaseUrl: string | null;
+  downloadProgress: DesktopUpdateProgress | null;
+  manualDownloadRequired: boolean;
+  checkedAt: string | null;
+  error: string | null;
+  silent?: boolean;
+}
+
+interface DesktopUpdaterBridge {
+  getState: () => Promise<DesktopUpdateState>;
+  checkForUpdates: () => Promise<DesktopUpdateState>;
+  downloadUpdate: () => Promise<DesktopUpdateState>;
+  quitAndInstall: () => Promise<{ ok: boolean; error?: string; state?: DesktopUpdateState }>;
+  openReleasePage: () => Promise<{ ok: boolean; url?: string; error?: string }>;
+  onStateChange: (callback: (state: DesktopUpdateState) => void) => () => void;
 }
 
 interface BillDesktopBridge {
@@ -32,6 +77,7 @@ interface BillDesktopBridge {
   };
   saveDatabaseBackup: (defaultFilename?: string) => Promise<NativeSaveResult>;
   getDesktopInfo?: () => Promise<BillDesktopInfo>;
+  updater?: DesktopUpdaterBridge;
 }
 
 interface Window {

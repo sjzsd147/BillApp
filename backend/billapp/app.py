@@ -17,6 +17,7 @@ from billapp.classify.categories import CategoryService
 from billapp.core.db import create_connection, get_default_db_path, init_db
 
 logger = logging.getLogger("billapp.app")
+APP_VERSION = "1.2.0"
 
 
 # =========================================================================
@@ -137,7 +138,7 @@ def create_app(db_path: Optional[Union[str, Path]] = None) -> FastAPI:
     """FastAPI application factory supporting configurable SQLite database path."""
     app = FastAPI(
         title="账单综合管理系统 API",
-        version="1.0.0",
+        version=APP_VERSION,
         description="多来源账单综合管理程序后端 REST API",
         lifespan=lifespan,
     )
@@ -189,7 +190,7 @@ def create_app(db_path: Optional[Union[str, Path]] = None) -> FastAPI:
     # System Health and Meta Endpoints
     @app.get("/api/health", tags=["system"])
     async def health_check():
-        return {"status": "ok", "version": "1.0.0"}
+        return {"status": "ok", "version": APP_VERSION}
 
     @app.get("/api/meta", tags=["system"])
     async def get_system_meta(db: sqlite3.Connection = Depends(get_db_conn)):
@@ -201,7 +202,7 @@ def create_app(db_path: Optional[Union[str, Path]] = None) -> FastAPI:
         accounts_list = [dict(r) for r in accounts_rows]
 
         return {
-            "version": "1.0.0",
+            "version": APP_VERSION,
             "categories": [c.model_dump() for c in categories_tree],
             "accounts": accounts_list,
             "pending_review_count": pending_review_count,
