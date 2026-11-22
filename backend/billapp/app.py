@@ -21,7 +21,7 @@ from billapp.classify.categories import CategoryService
 from billapp.core.db import create_connection, get_default_db_path, init_db
 
 logger = logging.getLogger("billapp.app")
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 
 
 # =========================================================================
