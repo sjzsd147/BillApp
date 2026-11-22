@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
@@ -55,7 +56,8 @@ function waitForUrl(url, timeoutMs = 20000) {
 }
 
 async function main() {
-  const backendPort = Number(process.env.BILLAPP_BACKEND_PORT || 0) || (await findFreePort(18100));
+  const backendPort = Number(process.env.BILLAPP_BACKEND_PORT || 0) || (await findFreePort(0));
+  const apiToken = (process.env.BILLAPP_API_TOKEN || '').trim() || crypto.randomBytes(32).toString('hex');
   const pythonExe = resolvePythonExecutable(repoRoot);
   const electronBin = require('electron');
 
@@ -75,6 +77,8 @@ async function main() {
         ...process.env,
         PYTHONPATH: path.join(repoRoot, 'backend'),
         PYTHONUNBUFFERED: '1',
+        BILLAPP_DEV_MODE: '1',
+        BILLAPP_API_TOKEN: apiToken,
       },
       stdio: ['pipe', 'inherit', 'inherit'],
       windowsHide: true,
@@ -89,6 +93,7 @@ async function main() {
     env: {
       ...process.env,
       VITE_API_TARGET: `http://127.0.0.1:${backendPort}`,
+      BILLAPP_API_TOKEN: apiToken,
     },
     stdio: 'inherit',
   });
@@ -102,6 +107,7 @@ async function main() {
       ...process.env,
       BILLAPP_DEV_URL: 'http://127.0.0.1:5173',
       BILLAPP_BACKEND_URL: `http://127.0.0.1:${backendPort}`,
+      BILLAPP_API_TOKEN: apiToken,
     },
     stdio: 'inherit',
   });

@@ -355,11 +355,11 @@ class TestAmountModesEdgeCases:
         with pytest.raises(ValueError, match="Invalid monetary value: '--'"):
             to_cents("--")
 
-    def test_scientific_notation_truncation_bug_demonstration(self):
-        """VULNERABILITY PROBE: to_cents('1e3') corrupts scientific notation by stripping 'e'."""
-        # 1e3 should be 1000.00 (100000 cents), but _CLEAN_AMOUNT_PATTERN strips 'e' -> becomes 13 -> 1300 cents!
-        corrupted = to_cents("1e3")
-        assert corrupted == 1300  # Corrupted: 13.00 instead of 1000.00
+    def test_scientific_notation_parsing_fixed(self):
+        """Regression guard (B-08): to_cents('1e3') parses scientific notation accurately as 1000.00 yuan."""
+        assert to_cents("1e3") == 100000
+        assert to_cents("1.5e2") == 15000
+        assert to_cents("-2.5E+1") == -2500
 
     def test_flag_mode_unexpected_flag_and_whitespace(self):
         """Flag mode handles whitespace padding and falls back to default_direction on unknown flags."""
@@ -608,8 +608,8 @@ class TestRowFilteringAndPreambleExtraction:
 class TestSemanticDirectionOverrides:
     """Stress-test keyword & regex direction overrides (refund & transfer)."""
 
-    def test_refund_keyword_override_on_expense_and_income(self):
-        """Keywords like '退款', '冲正' override direction to 'refund'."""
+    def test_refund_keyword_override_only_on_inbound_credits(self):
+        """Regression guard (B-07): refund keywords promote inbound credits to 'refund' without corrupting outgoing expenses."""
         d = make_profile_dict("signed", negative_means="expense")
         prof = BankProfile(**d)
         importer = ProfileImporter(prof)
@@ -617,14 +617,18 @@ class TestSemanticDirectionOverrides:
         csv_text = (
             "交易日期,交易时间,交易金额,交易对方,交易摘要\n"
             "2026-11-09,10:00:00,35.50,美团,退款\n"
-            "2026-11-09,11:00:00,-20.00,商户,退货冲正\n"
+            "2026-11-09,11:00:00,-20.00,商户,消费含退款保障险\n"
             "2026-11-09,12:00:00,100.00,商户,ONLINE REFUND\n"
+            "2026-11-09,13:00:00,50.00,信用卡中心,退货还款冲正\n"
         )
         probe = FileProbe(csv_text.encode("utf-8"), file_name="refund.csv")
         res = importer.parse(probe)
-        assert len(res.transactions) == 3
-        for t in res.transactions:
-            assert t.direction == "refund"
+        assert len(res.transactions) == 4
+        assert res.transactions[0].direction == "refund"
+        assert res.transactions[1].direction == "expense"
+        assert res.transactions[2].direction == "refund"
+        # Transfer keywords must NOT overwrite an already-classified refund
+        assert res.transactions[3].direction == "refund"
 
     def test_transfer_keyword_override(self):
         """Keywords like '还款', '理财', '提现' override direction to 'transfer'."""

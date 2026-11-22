@@ -33,25 +33,117 @@ class DedupSummary(BaseModel):
     transfers_pending: int = 0
 
 
+def _load_dedup_settings(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Load persisted deduplication thresholds and options from settings table."""
+    defaults: Dict[str, Any] = {
+        "auto_confirm_threshold": 0.85,
+        "pending_threshold": 0.55,
+        "second_window_minutes": 30,
+        "day_window_debit_days": 3,
+        "day_window_credit_days": 5,
+        "llm_arbitrate_enabled": False,
+        "llm_auto_confirm": False,
+        "llm_auto_confirm_threshold": 0.90,
+    }
+    try:
+        row = conn.execute("SELECT value FROM settings WHERE key = 'dedup_settings'").fetchone()
+        if row and row[0]:
+            parsed = json.loads(row[0])
+            if isinstance(parsed, dict):
+                defaults.update(parsed)
+    except Exception:
+        pass
+    return defaults
+
+
 def run_dedup_pipeline(conn: sqlite3.Connection, batch_id: Optional[int] = None) -> DedupSummary:
-    """Execute complete 4-stage deduplication pipeline.
+    """Execute complete 4-stage deduplication pipeline respecting user dedup_settings.
     
     Pipeline stages:
     ① L1 Fingerprint check (enforced at insertion time via UNIQUE(fingerprint))
     ② L2 In-Source Refund Linking
-    ③ L3 Cross-Source Platform-to-Bank Matching
+    ③ L3 Cross-Source Platform-to-Bank Matching (with optional LLM arbitration)
     ④ L4 Internal Transfer Pairing
     """
+    cfg = _load_dedup_settings(conn)
+    auto_threshold = float(cfg.get("auto_confirm_threshold", 0.85))
+    review_threshold = float(cfg.get("pending_threshold", 0.55))
+    second_window_minutes = int(cfg.get("second_window_minutes", 30))
+    day_window_debit_days = int(cfg.get("day_window_debit_days", 3))
+    day_window_credit_days = int(cfg.get("day_window_credit_days", 5))
+    llm_arbitrate_enabled = bool(cfg.get("llm_arbitrate_enabled", False))
+    llm_auto_confirm = bool(cfg.get("llm_auto_confirm", False))
+    llm_auto_threshold = float(cfg.get("llm_auto_confirm_threshold", 0.90))
+
     # Stage 2: L2 In-source refund linking
     refunds_linked = link_in_source_refunds(conn, batch_id=batch_id)
 
     # Stage 3: L3 Cross-source matching
-    dup_matches = match_cross_source(conn)
+    dup_matches = match_cross_source(
+        conn,
+        auto_threshold=auto_threshold,
+        review_threshold=review_threshold,
+        second_window_minutes=second_window_minutes,
+        day_window_debit_days=day_window_debit_days,
+        day_window_credit_days=day_window_credit_days,
+    )
     auto_dups = sum(1 for m in dup_matches if m.get("status") == "auto")
     pending_dups = sum(1 for m in dup_matches if m.get("status") == "pending")
 
+    # Optional LLM arbitration for ambiguous pending cross-source candidates (B-03)
+    if llm_arbitrate_enabled and pending_dups > 0:
+        try:
+            from billapp.llm.client import LLMClient, LLMConfig
+            from billapp.llm.prompts import collect_known_holder_names
+            from billapp.llm.tasks import dedup_arbitration_sync
+
+            llm_cfg = LLMConfig.load_from_db(conn)
+            llm_client = LLMClient(llm_cfg, conn=conn)
+            if llm_client.is_available() and llm_cfg.task_arbitrate_enabled:
+                holders = collect_known_holder_names(conn)
+                effective_auto_confirm = llm_auto_confirm or llm_cfg.auto_confirm_dedup
+                effective_threshold = max(llm_auto_threshold, float(llm_cfg.auto_confirm_threshold or 0.90))
+                for m in dup_matches:
+                    if m.get("status") != "pending":
+                        continue
+                    p_row = conn.execute("SELECT * FROM transactions WHERE id = ?", (m["p_id"],)).fetchone()
+                    s_row = conn.execute("SELECT * FROM transactions WHERE id = ?", (m["b_id"],)).fetchone()
+                    if not p_row or not s_row:
+                        continue
+                    arb = dedup_arbitration_sync(
+                        p_row,
+                        s_row,
+                        score=float(m["score"]),
+                        client=llm_client,
+                        holder_name=holders or None,
+                    )
+                    features = dict(m.get("features") or {})
+                    features["llm_arbitration"] = {
+                        "verdict": arb.verdict,
+                        "confidence": arb.confidence,
+                        "reason": arb.reason,
+                    }
+                    link_id = m.get("link_id")
+                    if link_id:
+                        conn.execute(
+                            "UPDATE match_links SET features_json = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
+                            (json.dumps(features, ensure_ascii=False), link_id),
+                        )
+                        if effective_auto_confirm and arb.verdict == "same" and arb.confidence >= effective_threshold:
+                            if confirm_match_link(conn, link_id):
+                                m["status"] = "confirmed"
+                                auto_dups += 1
+                                pending_dups = max(0, pending_dups - 1)
+        except Exception:
+            pass
+
     # Stage 4: L4 Internal transfer pairing
-    transfer_matches = pair_internal_transfers(conn, batch_id=batch_id)
+    transfer_matches = pair_internal_transfers(
+        conn,
+        batch_id=batch_id,
+        auto_threshold=auto_threshold,
+        review_threshold=review_threshold,
+    )
     auto_transfers = sum(1 for m in transfer_matches if m.get("status") == "auto")
     pending_transfers = sum(1 for m in transfer_matches if m.get("status") == "pending")
 

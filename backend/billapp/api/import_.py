@@ -15,9 +15,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import uuid
 import zipfile
 
+import anyio
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from pydantic import BaseModel, Field
 
+from billapp.api._upload import MAX_STATEMENT_UPLOAD_BYTES, read_upload_limited
 from billapp.app import AppException, NotFoundError, ValidationError, get_db_conn
 from billapp.classify.pipeline import ClassificationPipeline
 from billapp.core.fx import convert_transaction
@@ -37,6 +39,7 @@ from billapp.importers.pdf import (
 from billapp.importers.profile_engine import BankProfile, ProfileImporter
 from billapp.importers.registry import get_registry
 from billapp.llm.client import LLMClient, LLMConfig
+from billapp.llm.prompts import collect_known_holder_names
 from billapp.llm.tasks import (
     _normalize_account_kind,
     parse_statement_with_llm_sync,
@@ -45,8 +48,23 @@ from billapp.llm.tasks import (
 
 router = APIRouter(prefix="/api/import", tags=["import"])
 
-# Volatile RAM-only preview store (15-min TTL, zero disk persistence)
+# Volatile RAM-only preview store (15-min TTL, bounded capacity, zero disk persistence)
 _PREVIEW_STORE: Dict[str, Dict[str, Any]] = {}
+_MAX_PREVIEW_ENTRIES = 20
+_MAX_ZIP_COMPRESSION_RATIO = 100.0
+_ZIP_RATIO_CHECK_MIN_BYTES = 1 * 1024 * 1024
+
+
+def _prune_preview_store() -> None:
+    """Evict expired preview entries and cap total in-memory sessions to prevent memory leaks (S-07)."""
+    now = datetime.now()
+    expired = [k for k, v in _PREVIEW_STORE.items() if now > v["expires_at"]]
+    for k in expired:
+        _PREVIEW_STORE.pop(k, None)
+
+    while len(_PREVIEW_STORE) >= _MAX_PREVIEW_ENTRIES:
+        oldest_key = min(_PREVIEW_STORE.keys(), key=lambda k: _PREVIEW_STORE[k]["expires_at"])
+        _PREVIEW_STORE.pop(oldest_key, None)
 
 
 class _HTMLTableExtractor(HTMLParser):
@@ -133,6 +151,23 @@ def _unwrap_zip_probe(probe: FileProbe) -> Tuple[FileProbe, bool]:
         candidates.sort(key=lambda item: (item[0], item[1]))
         _, _, target_info, target_name = candidates[0]
 
+        # ZIP bomb defenses: enforce uncompressed size ceiling and compression ratio ceiling (S-07)
+        if target_info.file_size > MAX_STATEMENT_UPLOAD_BYTES:
+            raise AppException(
+                status_code=413,
+                code="FILE_TOO_LARGE",
+                message="ZIP 内部账单文件解压后超过 50 MB 安全限制，已拒绝解压",
+            )
+        if (
+            target_info.file_size >= _ZIP_RATIO_CHECK_MIN_BYTES
+            and (target_info.file_size / max(1, target_info.compress_size)) > _MAX_ZIP_COMPRESSION_RATIO
+        ):
+            raise AppException(
+                status_code=400,
+                code="IMPORT_ZIP_BOMB_DETECTED",
+                message="检测到异常压缩比（疑似 ZIP 炸弹），已拒绝解压",
+            )
+
         is_encrypted = bool(target_info.flag_bits & 0x1)
         if is_encrypted and not probe.password:
             return probe, True
@@ -155,7 +190,13 @@ def _unwrap_zip_probe(probe: FileProbe) -> Tuple[FileProbe, bool]:
         for pwd_bytes in pwd_attempts:
             try:
                 with zf.open(target_info, pwd=pwd_bytes) as member:
-                    inner_bytes = member.read()
+                    inner_bytes = member.read(MAX_STATEMENT_UPLOAD_BYTES + 1)
+                if len(inner_bytes) > MAX_STATEMENT_UPLOAD_BYTES:
+                    raise AppException(
+                        status_code=413,
+                        code="FILE_TOO_LARGE",
+                        message="ZIP 内部账单文件解压后超过 50 MB 安全限制，已拒绝解压",
+                    )
                 last_exc = None
                 break
             except NotImplementedError as exc:
@@ -561,21 +602,25 @@ async def extract_raw_statement(
     password: Optional[str] = Form(None),
 ):
     """Extract raw grid rows from ZIP/CSV/Excel/PDF for custom mapping and AI suggestion."""
-    content = await file.read()
+    content = await read_upload_limited(file, MAX_STATEMENT_UPLOAD_BYTES)
     file_name = file.filename or "statement"
-    probe = FileProbe(content, file_name=file_name, password=password)
-    probe, need_pwd = _unwrap_zip_probe(probe)
-    if need_pwd:
-        raise AppException(status_code=400, code="IMPORT_PASSWORD_REQUIRED", message="ZIP 压缩包已加密，请先输入解压密码")
-    file_type, raw_rows = extract_raw_rows_from_probe(probe, max_rows=30)
-    preamble_rows = _extract_preamble_rows_for_mapping(probe)
-    return ExtractRawResponse(
-        file_name=probe.file_name,
-        file_type=file_type,
-        raw_rows=raw_rows,
-        preamble_rows=preamble_rows,
-        total_extracted=len(raw_rows),
-    )
+
+    def _work() -> ExtractRawResponse:
+        probe = FileProbe(content, file_name=file_name, password=password)
+        probe, need_pwd = _unwrap_zip_probe(probe)
+        if need_pwd:
+            raise AppException(status_code=400, code="IMPORT_PASSWORD_REQUIRED", message="ZIP 压缩包已加密，请先输入解压密码")
+        file_type, raw_rows = extract_raw_rows_from_probe(probe, max_rows=30)
+        preamble_rows = _extract_preamble_rows_for_mapping(probe)
+        return ExtractRawResponse(
+            file_name=probe.file_name,
+            file_type=file_type,
+            raw_rows=raw_rows,
+            preamble_rows=preamble_rows,
+            total_extracted=len(raw_rows),
+        )
+
+    return await anyio.to_thread.run_sync(_work)
 
 
 @router.post("/preview", response_model=ImportPreviewItem)
@@ -590,8 +635,27 @@ async def import_preview(
     
     Zero disk persistence: PDF passwords reside purely in volatile RAM.
     """
-    content = await file.read()
+    content = await read_upload_limited(file, MAX_STATEMENT_UPLOAD_BYTES)
     file_name = file.filename or "statement"
+    return await anyio.to_thread.run_sync(
+        _import_preview_sync,
+        content,
+        file_name,
+        password,
+        profile_id,
+        use_llm,
+        db,
+    )
+
+
+def _import_preview_sync(
+    content: bytes,
+    file_name: str,
+    password: Optional[str],
+    profile_id: Optional[str],
+    use_llm: Optional[str],
+    db: sqlite3.Connection,
+) -> ImportPreviewItem:
     sha1 = hashlib.sha1(content).hexdigest()
 
     # 1. SHA1 Duplicate File Check
@@ -661,10 +725,12 @@ async def import_preview(
 
     def _run_llm_full_takeover() -> ParseResult:
         _, raw_lines = _extract_raw_statement_lines(probe)
+        known_holders = collect_known_holder_names(db)
         parsed, _ = parse_statement_with_llm_sync(
             raw_lines=raw_lines,
             client=llm_client,
             file_name=file_name,
+            extra_holders=known_holders or None,
         )
         return parsed
 
@@ -785,7 +851,8 @@ async def import_preview(
     if not parse_result.transactions:
         raise AppException(status_code=400, code="IMPORT_EMPTY", message="未解析到有效交易记录")
 
-    # 5. In-Memory Preview Token Store (15-min TTL)
+    # 5. In-Memory Preview Token Store (15-min TTL, bounded capacity)
+    _prune_preview_store()
     token = uuid.uuid4().hex
     expires_at = datetime.now() + timedelta(minutes=15)
     _PREVIEW_STORE[token] = {
@@ -941,8 +1008,12 @@ def import_commit(
                 ),
             )
             inserted_count += 1
-        except sqlite3.IntegrityError:
-            duplicate_count += 1
+        except sqlite3.IntegrityError as exc:
+            err_msg = str(exc).lower()
+            if "unique constraint failed: transactions.fingerprint" in err_msg:
+                duplicate_count += 1
+            else:
+                raise
 
     # 4. Deduplication Pipeline
     dedup_summary = run_dedup_pipeline(db, batch_id=batch_id)

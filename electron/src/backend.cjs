@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
 const net = require('node:net');
@@ -9,9 +10,10 @@ const { spawn, execFileSync } = require('node:child_process');
 const READY_PREFIX = 'BILLAPP_BACKEND_READY ';
 
 /**
- * Find an available TCP port on 127.0.0.1 starting at `startPort` (or OS ephemeral if <= 0).
+ * Find an available TCP port on 127.0.0.1.
+ * When `startPort <= 0` (default), binds port 0 to obtain an unpredictable OS ephemeral port.
  */
-async function findFreePort(startPort = 18100, host = '127.0.0.1') {
+async function findFreePort(startPort = 0, host = '127.0.0.1') {
   if (startPort > 0) {
     for (let offset = 0; offset < 50; offset += 1) {
       const candidate = startPort + offset;
@@ -119,6 +121,9 @@ function resolveBackendLaunchSpec({
   host = '127.0.0.1',
   dbPath = null,
   frontendDir = null,
+  apiToken = null,
+  masterKey = null,
+  secretBackend = null,
   env = process.env,
   platform = process.platform,
 }) {
@@ -140,6 +145,16 @@ function resolveBackendLaunchSpec({
 
   if (frontendDir) {
     childEnv.BILLAPP_FRONTEND_DIR = frontendDir;
+  }
+  // Pass auth & encryption secrets strictly via environment variables (never CLI args)
+  if (apiToken) {
+    childEnv.BILLAPP_API_TOKEN = apiToken;
+  }
+  if (masterKey) {
+    childEnv.BILLAPP_MASTER_KEY = masterKey;
+  }
+  if (secretBackend) {
+    childEnv.BILLAPP_SECRET_BACKEND = secretBackend;
   }
 
   if (isPackaged) {
@@ -210,7 +225,7 @@ function httpGetJson(url, timeoutMs = 1000) {
 /**
  * Direct loopback HTTP POST returning raw Buffer response (used for database backup).
  */
-function httpPostBuffer(url, timeoutMs = 30000) {
+function httpPostBuffer(url, timeoutMs = 30000, headers = {}) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const req = http.request(
@@ -219,6 +234,7 @@ function httpPostBuffer(url, timeoutMs = 30000) {
         port: parsed.port,
         path: `${parsed.pathname}${parsed.search}`,
         method: 'POST',
+        headers,
         agent: false,
         timeout: timeoutMs,
       },
@@ -343,12 +359,16 @@ async function startBackend({
   requestedPort = 0,
   dbPath = null,
   frontendDir = null,
+  apiToken = null,
+  masterKey = null,
+  secretBackend = null,
   env = process.env,
   platform = process.platform,
   timeoutMs = 20000,
   onLog = null,
 }) {
-  const port = requestedPort > 0 ? requestedPort : await findFreePort(18100, host);
+  const port = requestedPort > 0 ? requestedPort : await findFreePort(0, host);
+  const effectiveApiToken = apiToken || crypto.randomBytes(32).toString('hex');
   const spec = resolveBackendLaunchSpec({
     isPackaged,
     resourcesPath,
@@ -357,6 +377,9 @@ async function startBackend({
     host,
     dbPath,
     frontendDir,
+    apiToken: effectiveApiToken,
+    masterKey,
+    secretBackend,
     env,
     platform,
   });
@@ -433,6 +456,7 @@ async function startBackend({
     host,
     port: effectivePort,
     url: baseUrl,
+    apiToken: effectiveApiToken,
     dbPath: (readyInfo && readyInfo.db_path) || dbPath,
     frontendDist: (readyInfo && readyInfo.frontend_dist) || frontendDir,
     child,

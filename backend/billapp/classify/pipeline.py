@@ -246,8 +246,15 @@ class ClassificationPipeline:
         # -------------------------------------------------------------
         if self.llm_client and hasattr(self.llm_client, "is_available") and self.llm_client.is_available():
             try:
+                from billapp.llm.prompts import collect_known_holder_names
                 from billapp.llm.tasks import classify_fallback_sync
-                llm_res = classify_fallback_sync([txn], self.llm_client, self.key_to_id)
+                holders = collect_known_holder_names(self.conn)
+                llm_res = classify_fallback_sync(
+                    [txn],
+                    self.llm_client,
+                    self.key_to_id,
+                    holder_name=holders or None,
+                )
                 if llm_res and llm_res[0].category_id is not None and llm_res[0].confidence >= 0.70:
                     res = llm_res[0]
                     res.category_key = self.id_to_key.get(res.category_id)
@@ -301,9 +308,16 @@ class ClassificationPipeline:
         # Run chunked LLM classification for pending items if LLM available
         if pending_llm_indices and self.llm_client and hasattr(self.llm_client, "is_available") and self.llm_client.is_available():
             try:
+                from billapp.llm.prompts import collect_known_holder_names
                 from billapp.llm.tasks import classify_fallback_sync
+                holders = collect_known_holder_names(self.conn)
                 pending_txns = [transactions[i] for i in pending_llm_indices]
-                llm_results = classify_fallback_sync(pending_txns, self.llm_client, self.key_to_id)
+                llm_results = classify_fallback_sync(
+                    pending_txns,
+                    self.llm_client,
+                    self.key_to_id,
+                    holder_name=holders or None,
+                )
 
                 for sub_idx, orig_idx in enumerate(pending_llm_indices):
                     if sub_idx < len(llm_results):

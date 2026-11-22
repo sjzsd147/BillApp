@@ -384,9 +384,10 @@ class TestReDoSNestedQuantifierRejection:
     )
     def test_safe_patterns_compile_and_match_successfully(self, safe_pattern: str):
         """Standard valid production regex patterns must compile and match correctly."""
+        import regex as regex_lib
         compiled = compile_safe_regex(safe_pattern)
         assert compiled is not None
-        assert isinstance(compiled, re.Pattern)
+        assert isinstance(compiled, (re.Pattern, regex_lib.Pattern))
 
     def test_rule_with_redos_pattern_fails_safe_without_hanging(self):
         """A Rule with ReDoS regex safely returns False on rule_matches without hanging."""

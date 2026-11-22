@@ -7,9 +7,11 @@ import re
 import sqlite3
 from typing import Any, Dict, List, Optional
 
+import anyio
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from pydantic import BaseModel, Field
 
+from billapp.api._upload import MAX_STATEMENT_UPLOAD_BYTES, read_upload_limited
 from billapp.app import AppException, ConflictError, NotFoundError, ValidationError, get_db_conn
 from billapp.importers.base import FileProbe
 from billapp.importers.profile_engine import (
@@ -254,12 +256,12 @@ async def test_profile(
             errors=[f"YAML配置错误: {exc}"],
         )
 
-    content = await file.read()
+    content = await read_upload_limited(file, MAX_STATEMENT_UPLOAD_BYTES)
     probe = FileProbe(content, file_name=file.filename or "")
     importer = ProfileImporter(profile)
 
     try:
-        result = importer.parse(probe)
+        result = await anyio.to_thread.run_sync(importer.parse, probe)
         return ProfileTestResponse(
             success=True,
             parsed_count=len(result.transactions),

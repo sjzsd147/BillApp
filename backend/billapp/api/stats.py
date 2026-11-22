@@ -58,6 +58,7 @@ def get_stats_trend(
     to_date: Optional[str] = Query(None, alias="end_date"),
     account_id: Optional[int] = Query(None),
     fund_account_id: Optional[int] = Query(None),
+    include_transfer: bool = Query(False),
     db: sqlite3.Connection = Depends(get_db_conn),
 ):
     s_date = start_date or from_date
@@ -69,6 +70,7 @@ def get_stats_trend(
         end_date=e_date,
         account_id=account_id,
         fund_account_id=fund_account_id,
+        include_transfer=include_transfer,
     )
 
 
@@ -81,6 +83,7 @@ def get_stats_category(
     to_date: Optional[str] = Query(None, alias="end_date"),
     account_id: Optional[int] = Query(None),
     fund_account_id: Optional[int] = Query(None),
+    include_transfer: bool = Query(False),
     db: sqlite3.Connection = Depends(get_db_conn),
 ):
     s_date = start_date or from_date
@@ -92,6 +95,7 @@ def get_stats_category(
         end_date=e_date,
         account_id=account_id,
         fund_account_id=fund_account_id,
+        include_transfer=include_transfer,
     )
 
 
@@ -104,6 +108,7 @@ def get_stats_merchant(
     to_date: Optional[str] = Query(None, alias="end_date"),
     account_id: Optional[int] = Query(None),
     fund_account_id: Optional[int] = Query(None),
+    include_transfer: bool = Query(False),
     db: sqlite3.Connection = Depends(get_db_conn),
 ):
     s_date = start_date or from_date
@@ -115,6 +120,7 @@ def get_stats_merchant(
         end_date=e_date,
         account_id=account_id,
         fund_account_id=fund_account_id,
+        include_transfer=include_transfer,
     )
 
 
@@ -128,6 +134,7 @@ def get_stats_heatmap(
     to_date: Optional[str] = Query(None, alias="end_date"),
     account_id: Optional[int] = Query(None),
     fund_account_id: Optional[int] = Query(None),
+    include_transfer: bool = Query(False),
     db: sqlite3.Connection = Depends(get_db_conn),
 ):
     s_date = start_date or from_date
@@ -140,6 +147,7 @@ def get_stats_heatmap(
         end_date=e_date,
         account_id=account_id,
         fund_account_id=fund_account_id,
+        include_transfer=include_transfer,
     )
 
 
@@ -150,6 +158,7 @@ def get_stats_account(
     end_date: Optional[str] = Query(None, alias="to"),
     from_date: Optional[str] = Query(None, alias="start_date"),
     to_date: Optional[str] = Query(None, alias="end_date"),
+    include_transfer: bool = Query(False),
     db: sqlite3.Connection = Depends(get_db_conn),
 ):
     s_date = start_date or from_date
@@ -159,4 +168,5 @@ def get_stats_account(
         by=by,
         start_date=s_date,
         end_date=e_date,
+        include_transfer=include_transfer,
     )

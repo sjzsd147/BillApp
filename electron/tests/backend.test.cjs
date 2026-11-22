@@ -72,9 +72,11 @@ test('resolveBackendLaunchSpec handles packaged Win/macOS/Linux sidecars and dev
   assert.ok(devSpec.args.includes('/tmp/bill.db'));
 });
 
-test('findFreePort and startBackend / stop lifecycle work cleanly end-to-end', async () => {
+test('findFreePort and startBackend / stop lifecycle enforce token auth and ephemeral port', async () => {
   const freePort = await findFreePort(19200);
   assert.ok(freePort >= 19200);
+  const ephemeralPort = await findFreePort(0);
+  assert.ok(ephemeralPort > 0);
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'billapp-electron-test-'));
   const dbPath = path.join(tmpDir, 'test.db');
@@ -91,12 +93,43 @@ test('findFreePort and startBackend / stop lifecycle work cleanly end-to-end', a
 
   try {
     assert.equal(handle.isRunning(), true);
+    assert.ok(typeof handle.apiToken === 'string' && handle.apiToken.length === 64);
     const health = await httpGetJson(`${handle.url}/api/health`);
     assert.equal(health.status, 'ok');
     assert.equal(fs.existsSync(dbPath), true);
+
+    // Unauthenticated access to /api/meta must fail with HTTP 401
+    await assert.rejects(() => httpGetJson(`${handle.url}/api/meta`), /HTTP 401/);
+
+    // Authenticated POST /api/backup with X-BillApp-Token succeeds
+    const { httpPostBuffer } = require('../src/backend.cjs');
+    const bak = await httpPostBuffer(`${handle.url}/api/backup`, 10000, {
+      'X-BillApp-Token': handle.apiToken,
+    });
+    assert.equal(bak.statusCode, 200);
+    assert.equal(bak.buffer.subarray(0, 15).toString('utf8'), 'SQLite format 3');
   } finally {
     await handle.stop();
     assert.equal(handle.isRunning(), false);
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+test('resolveBackendLaunchSpec passes secrets only via env and never CLI args', () => {
+  const repoRoot = path.resolve(__dirname, '..', '..');
+  const spec = resolveBackendLaunchSpec({
+    isPackaged: true,
+    resourcesPath: '/opt/billapp/resources',
+    repoRoot,
+    port: 19005,
+    apiToken: 'secret-token-abc',
+    masterKey: 'secret-master-xyz',
+    secretBackend: 'electron_safe_storage',
+    platform: 'linux',
+  });
+  assert.equal(spec.env.BILLAPP_API_TOKEN, 'secret-token-abc');
+  assert.equal(spec.env.BILLAPP_MASTER_KEY, 'secret-master-xyz');
+  assert.equal(spec.env.BILLAPP_SECRET_BACKEND, 'electron_safe_storage');
+  assert.equal(spec.args.join(' ').includes('secret-token-abc'), false);
+  assert.equal(spec.args.join(' ').includes('secret-master-xyz'), false);
 });

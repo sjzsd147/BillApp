@@ -312,7 +312,7 @@ async function fetchDashboardData() {
 
 function renderTrendChart(trends: TrendItem[]) {
   const periods = trends.map((t) => t.period);
-  const expenseSeries = trends.map((t) => (t.net_cents ?? t.expense_cents) / 100);
+  const expenseSeries = trends.map((t) => t.expense_cents / 100);
   const incomeSeries = trends.map((t) => t.income_cents / 100);
 
   setTrendOption({

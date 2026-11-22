@@ -12,53 +12,103 @@ Strictly adheres to Milestone 6 specifications and Frontend Design Document v1.2
 from __future__ import annotations
 
 from datetime import datetime
-import json
 import logging
+import math
+import re
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
-import urllib.error
-import urllib.request
+from urllib.parse import quote, urlparse
+
+import httpx
+
+from billapp.importers.common import normalize_currency
 
 logger = logging.getLogger("billapp.core.fx")
 
 # Primary and fallback endpoints for free public exchange rates (ECB based)
 FRANKFURTER_API_URL = "https://api.frankfurter.app/{date}?from={currency}&to=CNY"
 FRANKFURTER_BACKUP_URL = "https://api.frankfurter.dev/v1/{date}?from={currency}&to=CNY"
+_ALLOWED_FX_HOSTS = {"api.frankfurter.app", "api.frankfurter.dev"}
 ONLINE_FETCH_TIMEOUT_SECONDS = 3.0
+MAX_FX_RATE = 1_000_000.0
+
+_ISO_CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def validate_fx_currency(currency: str) -> str:
+    """Validate strict 3-letter ISO-4217 currency code (e.g. USD, EUR)."""
+    curr = (currency or "").strip().upper()
+    if not _ISO_CURRENCY_RE.fullmatch(curr):
+        raise ValueError(f"Invalid ISO currency code: {currency!r}")
+    return curr
+
+
+def validate_fx_date(date_str: str) -> str:
+    """Validate strict YYYY-MM-DD calendar date."""
+    date_part = (date_str or "").strip()[:10]
+    if not _ISO_DATE_RE.fullmatch(date_part):
+        raise ValueError(f"Invalid effective date format (expected YYYY-MM-DD): {date_str!r}")
+    try:
+        datetime.strptime(date_part, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"Invalid calendar date: {date_part!r}") from exc
+    return date_part
+
+
+def validate_fx_rate(rate: float) -> float:
+    """Validate finite, positive, bounded FX rate."""
+    try:
+        val = float(rate)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid FX rate: {rate!r}") from exc
+    if not math.isfinite(val) or val <= 0 or val > MAX_FX_RATE:
+        raise ValueError(f"FX rate must be finite and within (0, {MAX_FX_RATE:g}]: {rate!r}")
+    return round(val, 6)
 
 
 def fetch_online_fx_rate(currency: str, date_str: str) -> Optional[float]:
     """Query online rate from free public FX API (Frankfurter ECB).
     
-    Non-blocking: times out after 3s, gracefully returns None if network fails,
-    offline, or currency not supported. Never throws or halts system execution.
+    Non-blocking: times out after 3s, disables redirects, strictly validates ISO
+    currency and YYYY-MM-DD date, and gracefully returns None if offline or unsupported.
     """
-    curr = currency.strip().upper()
+    curr_norm = normalize_currency(currency, default="")
+    try:
+        curr = validate_fx_currency(curr_norm)
+        date_part = validate_fx_date(date_str)
+    except ValueError as exc:
+        logger.debug("Skipping online FX fetch due to invalid input: %s", exc)
+        return None
+
     if curr == "CNY":
         return 1.0
 
-    # Ensure valid YYYY-MM-DD date format
-    date_part = date_str[:10]
-
+    safe_date = quote(date_part, safe="")
+    safe_curr = quote(curr, safe="")
     urls = [
-        FRANKFURTER_API_URL.format(date=date_part, currency=curr),
-        FRANKFURTER_BACKUP_URL.format(date=date_part, currency=curr),
+        FRANKFURTER_API_URL.format(date=safe_date, currency=safe_curr),
+        FRANKFURTER_BACKUP_URL.format(date=safe_date, currency=safe_curr),
     ]
 
+    headers = {"User-Agent": "BillApp/1.0 (Desktop; OpenSource Bill Management)"}
     for url in urls:
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or (parsed.hostname or "").lower() not in _ALLOWED_FX_HOSTS:
+            continue
         try:
-            req = urllib.request.Request(
+            resp = httpx.get(
                 url,
-                headers={"User-Agent": "BillApp/1.0 (Desktop; OpenSource Bill Management)"},
+                headers=headers,
+                timeout=ONLINE_FETCH_TIMEOUT_SECONDS,
+                follow_redirects=False,
             )
-            with urllib.request.urlopen(req, timeout=ONLINE_FETCH_TIMEOUT_SECONDS) as response:
-                if response.status == 200:
-                    data = json.loads(response.read().decode("utf-8"))
-                    rates = data.get("rates", {})
-                    cny_rate = rates.get("CNY")
-                    if cny_rate is not None:
-                        # Rate with 4-6 decimals
-                        return round(float(cny_rate), 6)
+            if resp.status_code == 200:
+                data = resp.json()
+                rates = data.get("rates", {}) if isinstance(data, dict) else {}
+                cny_rate = rates.get("CNY")
+                if cny_rate is not None:
+                    return validate_fx_rate(float(cny_rate))
         except Exception as exc:
             logger.debug("Failed online FX fetch from %s: %s", url, exc)
             continue
@@ -119,7 +169,7 @@ def convert_transaction(
     If rate cannot be found / offline:
         returns (None, None, None, 'none')
     """
-    curr = currency.strip().upper() if currency else "CNY"
+    curr = normalize_currency(currency, default="CNY") if currency else "CNY"
     if curr == "CNY":
         return amount_cents, None, None, None
 
@@ -174,9 +224,9 @@ def record_manual_rate(
     (amount_cny IS NULL or fx_rate_source = 'none'). Existing 'online' or 'manual'
     transactions remain untouched.
     """
-    curr = currency.strip().upper()
-    date_part = effective_date[:10]
-    rounded_rate = round(float(rate), 6)
+    curr = validate_fx_currency(currency)
+    date_part = validate_fx_date(effective_date)
+    rounded_rate = validate_fx_rate(rate)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     conn.execute(

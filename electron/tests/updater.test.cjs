@@ -211,3 +211,29 @@ test('Windows portable and dev modes query GitHub releases safely and require ma
   assert.equal(state.manualDownloadRequired, true);
   assert.equal(state.releaseNotes, 'Release v1.3.0');
 });
+
+test('openReleasePage blocks URL traversal, non-GitHub hosts, and userinfo spoofing (S-12)', async () => {
+  let opened = null;
+  const controller = createAppUpdater({
+    app: { isPackaged: true, getVersion: () => '1.2.0' },
+    platform: 'win32',
+    openUrl: async (url) => {
+      opened = url;
+    },
+  });
+
+  for (const badUrl of [
+    'https://github.com/sjzsd147/BillApp/releases/../../../evil/repo',
+    'https://github.com@evil.com/sjzsd147/BillApp/releases',
+    'http://github.com/sjzsd147/BillApp/releases',
+    'https://evil.example/sjzsd147/BillApp/releases',
+  ]) {
+    const res = await controller.openReleasePage(badUrl);
+    assert.equal(res.ok, false);
+    assert.equal(opened, null);
+  }
+
+  const okRes = await controller.openReleasePage('https://github.com/sjzsd147/BillApp/releases/tag/v1.3.0');
+  assert.equal(okRes.ok, true);
+  assert.equal(opened, 'https://github.com/sjzsd147/BillApp/releases/tag/v1.3.0');
+});

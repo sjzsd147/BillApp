@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import re
@@ -20,12 +21,74 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
 import httpx
 
-from billapp.core.secrets import decrypt_secret, encrypt_secret
+from billapp.core.secrets import SecretDecryptionError, decrypt_secret, encrypt_secret
 
 logger = logging.getLogger(__name__)
+
+_BLOCKED_LLM_HOSTS = {
+    "metadata.google.internal",
+    "metadata.goog",
+    "metadata",
+    "instance-data",
+    "instance-data.ec2.internal",
+}
+
+
+def normalize_url_origin(url: str) -> Tuple[str, str, int]:
+    """Return canonical (scheme, lowercase_host, effective_port) for origin comparison."""
+    parsed = urlparse((url or "").strip())
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    if parsed.port is not None:
+        port = parsed.port
+    elif scheme == "https":
+        port = 443
+    elif scheme == "http":
+        port = 80
+    else:
+        port = 0
+    return scheme, host, port
+
+
+def validate_llm_base_url(base_url: str) -> str:
+    """Validate LLM Base URL against scheme, userinfo, and metadata/link-local SSRF vectors."""
+    raw = (base_url or "").strip()
+    if not raw:
+        raise ValueError("API 服务地址 (Base URL) 不能为空")
+
+    parsed = urlparse(raw)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise ValueError("API 服务地址仅支持 http 或 https 协议")
+
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("API 服务地址不允许包含内嵌认证凭据 (@)")
+
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        raise ValueError("API 服务地址缺少有效主机名")
+
+    if host in _BLOCKED_LLM_HOSTS:
+        raise ValueError(f"已拦截禁止访问的元数据主机地址: {host}")
+
+    # Validate literal IP addresses (allow loopback for local Ollama/vLLM; block link-local/IMDS/unspecified)
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+
+    if ip is not None:
+        if ip.is_link_local or ip.is_unspecified or ip.is_multicast:
+            raise ValueError(f"已拦截禁止访问的链路本地或非法 IP 地址: {host}")
+        # AWS IPv6 IMDS fd00:ec2::254
+        if str(ip) == "fd00:ec2::254":
+            raise ValueError(f"已拦截禁止访问的云元数据地址: {host}")
+
+    return raw
 
 
 # =========================================================================
@@ -49,21 +112,40 @@ class LLMConfig:
     task_full_parse_enabled: bool = True
     auto_confirm_dedup: bool = False
     auto_confirm_threshold: float = 0.90
+    api_key_decryption_failed: bool = False
 
     @classmethod
     def load_from_db(cls, conn: sqlite3.Connection) -> LLMConfig:
-        """Load LLM configuration from SQLite settings table."""
+        """Load LLM configuration from SQLite settings table, preserving config even if API key decryption fails."""
         row = conn.execute("SELECT value FROM settings WHERE key = 'llm_config'").fetchone()
         if not row:
             return cls()
         try:
             data = json.loads(row[0])
-            api_key_enc = data.get("api_key_encrypted", "")
-            plain_key = decrypt_secret(api_key_enc) if api_key_enc else data.get("api_key", "")
+            if not isinstance(data, dict):
+                return cls()
+        except Exception as exc:
+            logger.warning("Failed to parse llm_config JSON from settings: %s", exc)
+            return cls()
+
+        api_key_enc = data.get("api_key_encrypted", "")
+        plain_key = ""
+        decryption_failed = False
+        if api_key_enc:
+            try:
+                plain_key = decrypt_secret(api_key_enc)
+            except SecretDecryptionError as exc:
+                logger.warning("Failed to decrypt saved LLM API key (preserving other config): %s", exc)
+                plain_key = ""
+                decryption_failed = True
+        elif data.get("api_key"):
+            plain_key = str(data.get("api_key", ""))
+
+        try:
             return cls(
-                base_url=data.get("base_url", ""),
+                base_url=str(data.get("base_url", "") or ""),
                 api_key=plain_key,
-                model=data.get("model", "deepseek-chat"),
+                model=str(data.get("model", "deepseek-chat") or "deepseek-chat"),
                 temperature=float(data.get("temperature", 0.1)),
                 timeout_sec=float(data.get("timeout_sec", 60.0)),
                 max_retries=int(data.get("max_retries", 2)),
@@ -76,9 +158,10 @@ class LLMConfig:
                 task_full_parse_enabled=bool(data.get("task_full_parse_enabled", True)),
                 auto_confirm_dedup=bool(data.get("auto_confirm_dedup", False)),
                 auto_confirm_threshold=float(data.get("auto_confirm_threshold", 0.90)),
+                api_key_decryption_failed=decryption_failed,
             )
         except Exception as exc:
-            logger.warning("Failed to parse llm_config from settings: %s", exc)
+            logger.warning("Failed to construct LLMConfig from settings: %s", exc)
             return cls()
 
     def save_to_db(self, conn: sqlite3.Connection) -> None:
@@ -327,6 +410,7 @@ class LLMClient:
                 self.total_completion_tokens += c_tok
                 return data
 
+        validate_llm_base_url(self.config.base_url)
         url = self.normalize_url(self.config.base_url)
         headers = {
             "Content-Type": "application/json",
@@ -346,7 +430,11 @@ class LLMClient:
         last_error: Optional[Exception] = None
 
         req_timeout = httpx.Timeout(self.config.timeout_sec, connect=min(float(self.config.timeout_sec), 10.0))
-        async with httpx.AsyncClient(transport=self.transport, timeout=req_timeout) as client:
+        async with httpx.AsyncClient(
+            transport=self.transport,
+            timeout=req_timeout,
+            follow_redirects=False,
+        ) as client:
             while attempts <= self.config.max_retries:
                 attempts += 1
                 try:
@@ -435,6 +523,7 @@ class LLMClient:
                 self.total_completion_tokens += c_tok
                 return data
 
+        validate_llm_base_url(self.config.base_url)
         url = self.normalize_url(self.config.base_url)
         headers = {
             "Content-Type": "application/json",
@@ -454,7 +543,11 @@ class LLMClient:
         last_error: Optional[Exception] = None
 
         req_timeout = httpx.Timeout(self.config.timeout_sec, connect=min(float(self.config.timeout_sec), 10.0))
-        with httpx.Client(transport=self.transport, timeout=req_timeout) as client:
+        with httpx.Client(
+            transport=self.transport,
+            timeout=req_timeout,
+            follow_redirects=False,
+        ) as client:
             while attempts <= self.config.max_retries:
                 attempts += 1
                 try:
@@ -523,6 +616,11 @@ class LLMClient:
         if not self.config.base_url:
             return {"ok": False, "error": "Base URL not set"}
 
+        try:
+            validate_llm_base_url(self.config.base_url)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+
         url = self.normalize_url(self.config.base_url)
         headers = {
             "Content-Type": "application/json",
@@ -536,7 +634,7 @@ class LLMClient:
 
         start_time = time.perf_counter()
         try:
-            with httpx.Client(transport=self.transport, timeout=10.0) as client:
+            with httpx.Client(transport=self.transport, timeout=10.0, follow_redirects=False) as client:
                 resp = client.post(url, headers=headers, json=payload)
                 resp.raise_for_status()
                 latency_ms = round((time.perf_counter() - start_time) * 1000)
@@ -558,6 +656,11 @@ class LLMClient:
         if not self.config.base_url.strip():
             return {"ok": False, "models": [], "error": "Base URL not set"}
 
+        try:
+            validate_llm_base_url(self.config.base_url)
+        except ValueError as exc:
+            return {"ok": False, "models": [], "error": str(exc)}
+
         url = self.normalize_models_url(self.config.base_url)
         headers: Dict[str, str] = {"Accept": "application/json"}
         if self.config.api_key.strip():
@@ -565,7 +668,7 @@ class LLMClient:
 
         timeout = min(max(float(self.config.timeout_sec or 10.0), 5.0), 15.0)
         try:
-            with httpx.Client(transport=self.transport, timeout=timeout) as client:
+            with httpx.Client(transport=self.transport, timeout=timeout, follow_redirects=False) as client:
                 resp = client.get(url, headers=headers)
                 resp.raise_for_status()
                 payload = resp.json()

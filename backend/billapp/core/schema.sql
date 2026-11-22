@@ -164,7 +164,7 @@ CREATE INDEX IF NOT EXISTS idx_rules_category ON rules(category_id);
 -- 8. LLM 缓存表 (llm_cache)
 CREATE TABLE IF NOT EXISTS llm_cache (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_type TEXT NOT NULL CHECK(task_type IN ('classify', 'review', 'arbitrate', 'merchant_norm', 'suggest_profile')),
+    task_type TEXT NOT NULL CHECK(task_type IN ('classify', 'review', 'arbitrate', 'merchant_norm', 'suggest_profile', 'full_parse')),
     input_hash TEXT NOT NULL UNIQUE,        -- SHA256 of input prompt
     response_json TEXT NOT NULL,
     model TEXT NOT NULL,

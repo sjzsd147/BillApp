@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Any, Dict, List, Literal, Optional
 
@@ -97,13 +98,13 @@ class TransactionListResponse(BaseModel):
 class TransactionPatchRequest(BaseModel):
     category_id: Optional[int] = None
     note: Optional[str] = None
-    excluded: Optional[int] = None
+    excluded: Optional[Literal[0, 1]] = None
 
 
 class BulkPatchRequest(BaseModel):
     ids: List[int]
     category_id: Optional[int] = None
-    excluded: Optional[int] = None
+    excluded: Optional[Literal[0, 1]] = None
     note: Optional[str] = None
 
 
@@ -185,6 +186,22 @@ def list_transactions(
             where_clauses.append("t.duplicate_of IS NOT NULL")
         else:
             where_clauses.append("t.duplicate_of IS NULL")
+    if status:
+        status_clean = status.strip()
+        status_lower = status_clean.lower()
+        if status_lower == "duplicate":
+            where_clauses.append("t.duplicate_of IS NOT NULL")
+        elif status_lower == "refund":
+            where_clauses.append("(t.direction = 'refund' OR t.refund_of IS NOT NULL OR t.refunded_cents > 0)")
+        elif status_lower == "transfer":
+            where_clauses.append("(t.direction = 'transfer' OR t.transfer_peer IS NOT NULL)")
+        elif status_lower == "excluded":
+            where_clauses.append("t.excluded = 1")
+        elif status_lower == "normal":
+            where_clauses.append("(t.duplicate_of IS NULL AND t.excluded = 0)")
+        else:
+            where_clauses.append("t.status = ?")
+            params.append(status_clean)
     if excluded is not None:
         where_clauses.append("t.excluded = ?")
         params.append(excluded)
@@ -456,22 +473,34 @@ def update_transaction(
             (payload.category_id, txn_id),
         )
 
-        cand = learn_rule_from_edit(db, txn_id, payload.category_id)
-        if cand and cand.applicable_count > 0:
-            rule_proposal = {
-                "candidate_rule": {
-                    "name": cand.name,
-                    "category_id": cand.category_id,
-                    "field": cand.field,
-                    "pattern_type": cand.pattern_type,
-                    "pattern_value": cand.pattern_value,
-                    "priority": cand.priority,
-                },
-                "matched_total": cand.matched_total,
-                "applicable_count": cand.applicable_count,
-                "sample_applicable_txn_ids": cand.sample_applicable_txn_ids,
-                "prompt_message": f"已将该交易分类为「{cat.name}」。检测到 {cand.applicable_count} 条包含「{cand.pattern_value}」的历史交易，是否保存为自动分类规则并批量应用？",
-            }
+        # Respect general_settings.learning_suggestions_enabled (B-03)
+        learning_enabled = True
+        try:
+            gen_row = db.execute("SELECT value FROM settings WHERE key = 'general_settings'").fetchone()
+            if gen_row and gen_row["value"]:
+                gen_cfg = json.loads(gen_row["value"])
+                if isinstance(gen_cfg, dict) and "learning_suggestions_enabled" in gen_cfg:
+                    learning_enabled = bool(gen_cfg["learning_suggestions_enabled"])
+        except Exception:
+            learning_enabled = True
+
+        if learning_enabled:
+            cand = learn_rule_from_edit(db, txn_id, payload.category_id)
+            if cand and cand.applicable_count > 0:
+                rule_proposal = {
+                    "candidate_rule": {
+                        "name": cand.name,
+                        "category_id": cand.category_id,
+                        "field": cand.field,
+                        "pattern_type": cand.pattern_type,
+                        "pattern_value": cand.pattern_value,
+                        "priority": cand.priority,
+                    },
+                    "matched_total": cand.matched_total,
+                    "applicable_count": cand.applicable_count,
+                    "sample_applicable_txn_ids": cand.sample_applicable_txn_ids,
+                    "prompt_message": f"已将该交易分类为「{cat.name}」。检测到 {cand.applicable_count} 条包含「{cand.pattern_value}」的历史交易，是否保存为自动分类规则并批量应用？",
+                }
 
     if payload.note is not None:
         db.execute("UPDATE transactions SET note = ? WHERE id = ?", (payload.note, txn_id))
@@ -499,12 +528,93 @@ def delete_transaction(
     txn_id: int,
     db: sqlite3.Connection = Depends(get_db_conn),
 ):
-    """Delete a single transaction."""
-    existing = db.execute("SELECT id FROM transactions WHERE id = ?", (txn_id,)).fetchone()
-    if not existing:
+    """Delete a single transaction atomically, reverting refund offsets, transfer peers, duplicate groups, and batch counts (B-02)."""
+    target = db.execute(
+        """
+        SELECT id, batch_id, amount_cents, direction, refund_of, transfer_peer, duplicate_of
+        FROM transactions
+        WHERE id = ?
+        """,
+        (txn_id,),
+    ).fetchone()
+    if not target:
         raise NotFoundError(f"交易记录 #{txn_id} 不存在")
 
-    db.execute("DELETE FROM transactions WHERE id = ?", (txn_id,))
+    with db:
+        # 1. If deleting a linked refund, restore refunded_cents on original expense
+        if target["refund_of"] is not None:
+            db.execute(
+                """
+                UPDATE transactions
+                SET refunded_cents = MAX(0, refunded_cents - ?)
+                WHERE id = ?
+                """,
+                (target["amount_cents"], target["refund_of"]),
+            )
+
+        # 2. Clear refund_of references on any refunds pointing to this transaction
+        db.execute("UPDATE transactions SET refund_of = NULL WHERE refund_of = ?", (txn_id,))
+
+        # 3. Revert transfer peer direction and transfer_peer link using match_links metadata
+        transfer_links = db.execute(
+            """
+            SELECT id, primary_id, secondary_id, features_json
+            FROM match_links
+            WHERE kind = 'transfer' AND (primary_id = ? OR secondary_id = ?)
+            """,
+            (txn_id, txn_id),
+        ).fetchall()
+        for link in transfer_links:
+            feat = {}
+            if link["features_json"]:
+                try:
+                    feat = json.loads(link["features_json"])
+                except Exception:
+                    feat = {}
+            if link["primary_id"] == txn_id:
+                peer_id = link["secondary_id"]
+                orig_dir = feat.get("orig_dir_in")
+            else:
+                peer_id = link["primary_id"]
+                orig_dir = feat.get("orig_dir_out")
+            if orig_dir:
+                db.execute(
+                    "UPDATE transactions SET transfer_peer = NULL, direction = ? WHERE id = ?",
+                    (orig_dir, peer_id),
+                )
+            else:
+                db.execute(
+                    "UPDATE transactions SET transfer_peer = NULL WHERE id = ?",
+                    (peer_id,),
+                )
+        db.execute("UPDATE transactions SET transfer_peer = NULL WHERE transfer_peer = ?", (txn_id,))
+
+        # 4. Prevent hidden duplicates from resurrecting into active stats when deleting their primary record
+        db.execute(
+            "UPDATE transactions SET duplicate_of = NULL, excluded = 1 WHERE duplicate_of = ?",
+            (txn_id,),
+        )
+
+        # 5. Clean up associated match_links & match_blocklist rows
+        db.execute(
+            "DELETE FROM match_links WHERE primary_id = ? OR secondary_id = ?",
+            (txn_id, txn_id),
+        )
+        db.execute(
+            "DELETE FROM match_blocklist WHERE a_id = ? OR b_id = ?",
+            (txn_id, txn_id),
+        )
+
+        # 6. Delete the transaction row itself
+        db.execute("DELETE FROM transactions WHERE id = ?", (txn_id,))
+
+        # 7. Sync import_batches.row_count
+        if target["batch_id"] is not None:
+            db.execute(
+                "UPDATE import_batches SET row_count = MAX(0, row_count - 1) WHERE id = ?",
+                (target["batch_id"],),
+            )
+
     return {"ok": True, "deleted_id": txn_id}
 
 

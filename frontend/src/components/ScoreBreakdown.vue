@@ -61,10 +61,10 @@
         <span class="label">名称:</span>
         <span class="val">{{ breakdown.name.toFixed(2) }}</span>
       </div>
-      <div v-if="breakdown.penalty > 0" class="item item-penalty">
+      <div v-if="breakdown.penalty !== 0" class="item item-penalty">
         <span class="dot dot-penalty" />
         <span class="label">渠道冲突罚分:</span>
-        <span class="val">-{{ breakdown.penalty.toFixed(2) }}</span>
+        <span class="val">-{{ Math.abs(breakdown.penalty).toFixed(2) }}</span>
       </div>
     </div>
   </div>

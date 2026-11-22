@@ -17,6 +17,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 import sqlite3
 
+from billapp.importers.common import parse_iso_datetime
+
 CHANNEL_PREFIXES = (
     "支付宝-", "支付宝—", "支付宝_",
     "财付通-", "财付通—", "财付通_",
@@ -146,6 +148,9 @@ def compute_match_score_with_breakdown(
     b_direction: str = "expense",
     b_card_kind: Optional[str] = None,
     is_blocked: bool = False,
+    second_window_minutes: int = 30,
+    day_window_debit_days: int = 3,
+    day_window_credit_days: int = 5,
 ) -> Tuple[float, Dict[str, float]]:
     """Compute cross-source L3 candidate matching score and frontend breakdown.
     
@@ -196,13 +201,14 @@ def compute_match_score_with_breakdown(
         or (p_time.time() == datetime.min.time() and b_time.time() == datetime.min.time())
     )
 
+    max_sec_window = max(60, int(second_window_minutes) * 60)
     if not is_date_only:
         sec_diff = abs((p_time - b_time).total_seconds())
-        if sec_diff > 1800:  # 30 minutes hard ceiling for second/minute precision
+        if sec_diff > max_sec_window:
             return 0.0, zero_breakdown
     else:
         day_diff = abs((p_time.date() - b_time.date()).days)
-        max_days = 5 if b_card_kind == "bank_credit" else 3
+        max_days = int(day_window_credit_days) if b_card_kind == "bank_credit" else int(day_window_debit_days)
         if day_diff > max_days:
             return 0.0, zero_breakdown
 
@@ -226,7 +232,7 @@ def compute_match_score_with_breakdown(
             time_score = 0.30
         elif sec_diff <= 600:
             time_score = 0.20
-        elif sec_diff <= 1800:
+        elif sec_diff <= max_sec_window:
             time_score = 0.10
     else:
         day_diff = abs((p_time.date() - b_time.date()).days)
@@ -234,7 +240,7 @@ def compute_match_score_with_breakdown(
             time_score = 0.15
         elif day_diff == 1:
             time_score = 0.10
-        elif day_diff <= 3:
+        elif day_diff <= max_days:
             time_score = 0.05
 
     # Channel match scoring
@@ -323,6 +329,9 @@ def match_cross_source(
     time_window_days: int = 7,
     auto_threshold: float = 0.85,
     review_threshold: float = 0.55,
+    second_window_minutes: int = 30,
+    day_window_debit_days: int = 3,
+    day_window_credit_days: int = 5,
 ) -> List[Dict[str, Any]]:
     """Match platform transactions (Alipay, WeChat) against bank statements.
     
@@ -376,7 +385,9 @@ def match_cross_source(
         p_amt = p["amount_cents"]
         p_cur = p["currency"]
         p_dir = p["direction"]
-        p_time = datetime.fromisoformat(p["txn_time"])
+        p_time = parse_iso_datetime(p["txn_time"])
+        if p_time is None:
+            continue
         p_tail = p["p_tail"]
         p_bank = p["p_bank"]
         p_party = p["counterparty"] or ""
@@ -397,7 +408,9 @@ def match_cross_source(
             if p_dir != b_dir and not (p_dir in ("expense", "neutral") and b_dir in ("expense", "neutral")):
                 continue
 
-            b_time = datetime.fromisoformat(b["txn_time"])
+            b_time = parse_iso_datetime(b["txn_time"])
+            if b_time is None:
+                continue
             b_tail = b["b_tail"]
             b_bank = b["b_bank"]
             b_card_kind = b["b_card_kind"]
@@ -427,6 +440,9 @@ def match_cross_source(
                 b_direction=b_dir,
                 b_card_kind=b_card_kind,
                 is_blocked=False,
+                second_window_minutes=second_window_minutes,
+                day_window_debit_days=day_window_debit_days,
+                day_window_credit_days=day_window_credit_days,
             )
 
             if score >= review_threshold:
@@ -474,6 +490,7 @@ def match_cross_source(
         ).fetchone()
 
         if existing:
+            c["link_id"] = existing["id"]
             if existing["status"] not in ("confirmed", "rejected"):
                 conn.execute(
                     """
@@ -484,13 +501,14 @@ def match_cross_source(
                     (c["score"], features_json, status, existing["id"]),
                 )
         else:
-            conn.execute(
+            cur = conn.execute(
                 """
                 INSERT INTO match_links (kind, primary_id, secondary_id, score, features_json, status, created_at, updated_at)
                 VALUES ('duplicate', ?, ?, ?, ?, ?, datetime('now', 'localtime'), datetime('now', 'localtime'))
                 """,
                 (c["p_id"], c["b_id"], c["score"], features_json, status),
             )
+            c["link_id"] = cur.lastrowid
 
         if status == "auto":
             conn.execute(

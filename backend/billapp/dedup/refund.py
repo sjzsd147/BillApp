@@ -275,7 +275,7 @@ def link_in_source_refunds(conn: sqlite3.Connection, batch_id: Optional[int] = N
             if cand["id"] in consumed_ids:
                 continue
             cand_cents = cand["amount_cents"] - cand["refunded_cents"]
-            if cand["amount_cents"] != ref_cents and cand_cents < ref_cents:
+            if cand_cents < ref_cents:
                 continue
 
             cand_cp = cand["counterparty"] or ""

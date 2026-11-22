@@ -41,23 +41,29 @@ class WeChatImporter(Importer):
             return 0.0
 
         if probe.is_excel():
+            wb = None
             try:
-                wb = openpyxl.load_workbook(io.BytesIO(probe.content), read_only=True)
+                wb = openpyxl.load_workbook(io.BytesIO(probe.content), read_only=True, data_only=True)
                 found = False
                 for ws in wb.worksheets:
                     sample_text = ""
-                    for r in range(1, 25):
-                        val = ws.cell(r, 1).value
+                    for row_tuple in ws.iter_rows(min_row=1, max_row=25, max_col=1, values_only=True):
+                        val = row_tuple[0] if row_tuple else None
                         if val:
                             sample_text += str(val) + " "
                     if "微信支付" in sample_text or "微信昵称" in sample_text:
                         found = True
                         break
-                wb.close()
                 if found:
                     return 1.0
             except Exception:
                 pass
+            finally:
+                if wb is not None:
+                    try:
+                        wb.close()
+                    except Exception:
+                        pass
             return 0.0
 
         # Check CSV
@@ -82,115 +88,130 @@ class WeChatImporter(Importer):
         return self._parse_csv(probe)
 
     def _parse_xlsx(self, probe: FileProbe) -> ParseResult:
-        wb = openpyxl.load_workbook(io.BytesIO(probe.content), data_only=True)
+        max_rows = 100_000
+        max_cols = 200
+        wb = openpyxl.load_workbook(io.BytesIO(probe.content), read_only=True, data_only=True)
+        try:
+            target_ws = None
+            header_row_idx = -1
+            header_cells: List[str] = []
+            holder_name: Optional[str] = None
+            period_start: Optional[str] = None
+            period_end: Optional[str] = None
+            total_declared_count: Optional[int] = None
+            inc_declared_count: Optional[int] = None
+            inc_declared_cents: Optional[int] = None
+            exp_declared_count: Optional[int] = None
+            exp_declared_cents: Optional[int] = None
+            neu_declared_count: Optional[int] = None
+            neu_declared_cents: Optional[int] = None
 
-        target_ws = None
-        header_row_idx = -1
-        holder_name: Optional[str] = None
-        period_start: Optional[str] = None
-        period_end: Optional[str] = None
-        total_declared_count: Optional[int] = None
-        inc_declared_count: Optional[int] = None
-        inc_declared_cents: Optional[int] = None
-        exp_declared_count: Optional[int] = None
-        exp_declared_cents: Optional[int] = None
-        neu_declared_count: Optional[int] = None
-        neu_declared_cents: Optional[int] = None
+            for ws_candidate in wb.worksheets:
+                h_idx = -1
+                cand_headers: List[str] = []
+                cand_holder = None
+                cand_start = None
+                cand_end = None
+                cand_tot = None
+                cand_inc_cnt = None
+                cand_inc_cents = None
+                cand_exp_cnt = None
+                cand_exp_cents = None
+                cand_neu_cnt = None
+                cand_neu_cents = None
 
-        for ws_candidate in wb.worksheets:
-            h_idx = -1
-            cand_holder = None
-            cand_start = None
-            cand_end = None
-            cand_tot = None
-            cand_inc_cnt = None
-            cand_inc_cents = None
-            cand_exp_cnt = None
-            cand_exp_cents = None
-            cand_neu_cnt = None
-            cand_neu_cents = None
+                for r_idx, row_tuple in enumerate(
+                    ws_candidate.iter_rows(min_row=1, max_row=25, max_col=min(20, max_cols), values_only=True),
+                    start=1,
+                ):
+                    cell_vals = [str(c or "").strip() for c in row_tuple]
+                    val = cell_vals[0] if cell_vals else ""
+                    if val:
+                        if "微信昵称：" in val:
+                            m = re.search(r"微信昵称：\s*\[(.*?)\]", val)
+                            if m:
+                                cand_holder = m.group(1).strip()
+                        elif "起始时间：" in val and "终止时间：" in val:
+                            m = re.search(r"起始时间：\s*\[(.*?)\]\s*终止时间：\s*\[(.*?)\]", val)
+                            if m:
+                                cand_start, _ = parse_datetime(m.group(1))
+                                cand_end, _ = parse_datetime(m.group(2))
+                        elif re.search(r"共\s*(\d+)\s*笔记录", val):
+                            m = re.search(r"共\s*(\d+)\s*笔记录", val)
+                            if m:
+                                cand_tot = int(m.group(1))
+                        elif "收入：" in val:
+                            m = re.search(r"收入：\s*(\d+)\s*笔\s*([\d\.,]+)\s*元", val)
+                            if m:
+                                cand_inc_cnt = int(m.group(1))
+                                cand_inc_cents = to_cents(m.group(2))
+                        elif "支出：" in val:
+                            m = re.search(r"支出：\s*(\d+)\s*笔\s*([\d\.,]+)\s*元", val)
+                            if m:
+                                cand_exp_cnt = int(m.group(1))
+                                cand_exp_cents = to_cents(m.group(2))
+                        elif "中性交易：" in val:
+                            m = re.search(r"中性交易：\s*(\d+)\s*笔\s*([\d\.,]+)\s*元", val)
+                            if m:
+                                cand_neu_cnt = int(m.group(1))
+                                cand_neu_cents = to_cents(m.group(2))
 
-            for r in range(1, 25):
-                val = str(ws_candidate.cell(r, 1).value or "").strip()
-                if not val:
-                    continue
+                    if "交易时间" in cell_vals and "交易类型" in cell_vals and "收/支" in cell_vals:
+                        h_idx = r_idx
+                        cand_headers = cell_vals
+                        break
 
-                if "微信昵称：" in val:
-                    m = re.search(r"微信昵称：\s*\[(.*?)\]", val)
-                    if m:
-                        cand_holder = m.group(1).strip()
-                elif "起始时间：" in val and "终止时间：" in val:
-                    m = re.search(r"起始时间：\s*\[(.*?)\]\s*终止时间：\s*\[(.*?)\]", val)
-                    if m:
-                        cand_start, _ = parse_datetime(m.group(1))
-                        cand_end, _ = parse_datetime(m.group(2))
-                elif re.search(r"共\s*(\d+)\s*笔记录", val):
-                    m = re.search(r"共\s*(\d+)\s*笔记录", val)
-                    if m:
-                        cand_tot = int(m.group(1))
-                elif "收入：" in val:
-                    m = re.search(r"收入：\s*(\d+)\s*笔\s*([\d\.,]+)\s*元", val)
-                    if m:
-                        cand_inc_cnt = int(m.group(1))
-                        cand_inc_cents = to_cents(m.group(2))
-                elif "支出：" in val:
-                    m = re.search(r"支出：\s*(\d+)\s*笔\s*([\d\.,]+)\s*元", val)
-                    if m:
-                        cand_exp_cnt = int(m.group(1))
-                        cand_exp_cents = to_cents(m.group(2))
-                elif "中性交易：" in val:
-                    m = re.search(r"中性交易：\s*(\d+)\s*笔\s*([\d\.,]+)\s*元", val)
-                    if m:
-                        cand_neu_cnt = int(m.group(1))
-                        cand_neu_cents = to_cents(m.group(2))
-
-                cell_vals = [str(ws_candidate.cell(r, c).value or "").strip() for c in range(1, 12)]
-                if "交易时间" in cell_vals and "交易类型" in cell_vals and "收/支" in cell_vals:
-                    h_idx = r
+                if h_idx != -1:
+                    target_ws = ws_candidate
+                    header_row_idx = h_idx
+                    header_cells = cand_headers
+                    holder_name = cand_holder
+                    period_start = cand_start
+                    period_end = cand_end
+                    total_declared_count = cand_tot
+                    inc_declared_count = cand_inc_cnt
+                    inc_declared_cents = cand_inc_cents
+                    exp_declared_count = cand_exp_cnt
+                    exp_declared_cents = cand_exp_cents
+                    neu_declared_count = cand_neu_cnt
+                    neu_declared_cents = cand_neu_cents
                     break
 
-            if h_idx != -1:
-                target_ws = ws_candidate
-                header_row_idx = h_idx
-                holder_name = cand_holder
-                period_start = cand_start
-                period_end = cand_end
-                total_declared_count = cand_tot
-                inc_declared_count = cand_inc_cnt
-                inc_declared_cents = cand_inc_cents
-                exp_declared_count = cand_exp_cnt
-                exp_declared_cents = cand_exp_cents
-                neu_declared_count = cand_neu_cnt
-                neu_declared_cents = cand_neu_cents
-                break
+            if target_ws is None or header_row_idx == -1:
+                raise ValueError("Failed to locate WeChat table header row in XLSX")
 
-        if target_ws is None or header_row_idx == -1:
+            ws = target_ws
+
+            # Map header columns (0-based indices)
+            col_map: Dict[str, int] = {}
+            for c_idx, name in enumerate(header_cells):
+                if name:
+                    col_map[name] = c_idx
+
+            max_needed_col = min(max_cols, max(col_map.values(), default=0) + 1)
+            time_col_idx = col_map.get("交易时间", 0)
+
+            # Extract rows safely with bounded row & column streaming
+            matrix_rows: List[Dict[str, str]] = []
+            for row_tuple in ws.iter_rows(
+                min_row=header_row_idx + 1,
+                max_row=header_row_idx + max_rows,
+                max_col=max_needed_col,
+                values_only=True,
+            ):
+                if not row_tuple or time_col_idx >= len(row_tuple):
+                    continue
+                time_val = str(row_tuple[time_col_idx] or "").strip()
+                if not time_val:
+                    continue
+
+                row_dict: Dict[str, str] = {}
+                for col_name, c_idx in col_map.items():
+                    val_cell = row_tuple[c_idx] if c_idx < len(row_tuple) else None
+                    row_dict[col_name] = str(val_cell or "").strip()
+                matrix_rows.append(row_dict)
+        finally:
             wb.close()
-            raise ValueError("Failed to locate WeChat table header row in XLSX")
-
-        ws = target_ws
-
-        # Map header columns
-        col_names = [str(ws.cell(header_row_idx, c).value or "").strip() for c in range(1, 12)]
-        col_map: Dict[str, int] = {}
-        for c_idx, name in enumerate(col_names, start=1):
-            if name:
-                col_map[name] = c_idx
-
-        # Extract rows
-        matrix_rows: List[Dict[str, str]] = []
-        for r in range(header_row_idx + 1, ws.max_row + 1):
-            time_val = str(ws.cell(r, col_map.get("交易时间", 1)).value or "").strip()
-            if not time_val:
-                continue
-
-            row_dict: Dict[str, str] = {}
-            for col_name, c_idx in col_map.items():
-                val_cell = ws.cell(r, c_idx).value
-                row_dict[col_name] = str(val_cell or "").strip()
-            matrix_rows.append(row_dict)
-
-        wb.close()
 
         return self._build_result(
             matrix_rows=matrix_rows,

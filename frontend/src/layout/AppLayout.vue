@@ -266,6 +266,7 @@ setupGlobalShortcuts(router, {
 
 onMounted(() => {
   appStore.fetchMeta();
+  appStore.fetchGeneralSettings();
   appStore.fetchLLMStatus();
   appStore.initDesktopUpdater();
 

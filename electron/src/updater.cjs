@@ -673,9 +673,31 @@ function createAppUpdater({
     };
   }
 
-  async function openReleasePage() {
-    const targetUrl = state.releaseUrl || releasesUrl;
-    if (!targetUrl.startsWith(`https://github.com/${owner}/${repo}/releases`)) {
+  function isValidReleaseUrl(targetUrl) {
+    try {
+      const raw = String(targetUrl || '').trim();
+      const parsed = new URL(raw);
+      if (parsed.protocol !== 'https:' || parsed.origin !== 'https://github.com') {
+        return false;
+      }
+      if (parsed.username || parsed.password) {
+        return false;
+      }
+      // Reject any traversal segments before URL normalization
+      if (raw.includes('..') || raw.includes('\\')) {
+        return false;
+      }
+      const normPath = path.posix.normalize(parsed.pathname);
+      const expectedPrefix = `/${owner}/${repo}/releases`;
+      return normPath === expectedPrefix || normPath.startsWith(`${expectedPrefix}/`);
+    } catch {
+      return false;
+    }
+  }
+
+  async function openReleasePage(overrideUrl) {
+    const targetUrl = overrideUrl || state.releaseUrl || releasesUrl;
+    if (!isValidReleaseUrl(targetUrl)) {
       return { ok: false, error: '非法发布页地址' };
     }
     if (typeof openUrl === 'function') {

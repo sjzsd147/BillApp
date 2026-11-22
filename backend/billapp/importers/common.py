@@ -88,6 +88,104 @@ def parse_datetime(raw_dt: Union[str, datetime, date, None]) -> Tuple[str, str]:
     return dt_str, "day"
 
 
+def parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    """Safely parse ISO datetime string without raising on malformed dates."""
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        pass
+    # Fallback for common bank date formats if raw string slipped through
+    normalized, _ = parse_datetime(raw)
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+_CURRENCY_ALIAS_MAP: dict[str, str] = {
+    "人民币": "CNY",
+    "人民币元": "CNY",
+    "RMB": "CNY",
+    "CNY": "CNY",
+    "CNH": "CNY",
+    "美元": "USD",
+    "美金": "USD",
+    "美圆": "USD",
+    "USD": "USD",
+    "欧元": "EUR",
+    "EUR": "EUR",
+    "港币": "HKD",
+    "港元": "HKD",
+    "HKD": "HKD",
+    "日元": "JPY",
+    "日圆": "JPY",
+    "JPY": "JPY",
+    "英镑": "GBP",
+    "GBP": "GBP",
+    "澳大利亚元": "AUD",
+    "澳元": "AUD",
+    "AUD": "AUD",
+    "加拿大元": "CAD",
+    "加元": "CAD",
+    "CAD": "CAD",
+    "新加坡元": "SGD",
+    "新币": "SGD",
+    "SGD": "SGD",
+    "瑞士法郎": "CHF",
+    "瑞郎": "CHF",
+    "CHF": "CHF",
+    "韩元": "KRW",
+    "韩国元": "KRW",
+    "KRW": "KRW",
+    "泰铢": "THB",
+    "THB": "THB",
+    "新台币": "TWD",
+    "台币": "TWD",
+    "TWD": "TWD",
+    "新西兰元": "NZD",
+    "纽元": "NZD",
+    "NZD": "NZD",
+    "澳门元": "MOP",
+    "MOP": "MOP",
+    "林吉特": "MYR",
+    "MYR": "MYR",
+    "卢布": "RUB",
+    "RUB": "RUB",
+}
+
+_ISO_CURRENCY_RE = re.compile(r"\b([A-Z]{3})\b")
+
+
+def normalize_currency(raw: Optional[str], default: str = "CNY") -> str:
+    """Normalize Chinese or ISO currency names into standard 3-letter ISO-4217 codes."""
+    if not raw:
+        return default
+    cleaned = str(raw).strip()
+    if not cleaned:
+        return default
+
+    upper = cleaned.upper()
+    if upper in _CURRENCY_ALIAS_MAP:
+        return _CURRENCY_ALIAS_MAP[upper]
+    if cleaned in _CURRENCY_ALIAS_MAP:
+        return _CURRENCY_ALIAS_MAP[cleaned]
+
+    for alias, iso in _CURRENCY_ALIAS_MAP.items():
+        if alias in cleaned or alias in upper:
+            return iso
+
+    m = _ISO_CURRENCY_RE.search(upper)
+    if m:
+        return m.group(1)
+
+    return default
+
+
 def parse_funding_channel(cell: Optional[str]) -> Optional[Tuple[str, str, str]]:
     """Parse funding channel from strings like '工商银行信用卡(8801)&工商银行天天减'
     or '余额宝&工商银行储蓄卡(8801)'.

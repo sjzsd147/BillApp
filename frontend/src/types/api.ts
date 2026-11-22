@@ -833,6 +833,9 @@ export interface LLMSettingsOut {
   auto_confirm_threshold: number;
   api_key_masked: string;
   has_api_key: boolean;
+  api_key_decryption_failed?: boolean;
+  secret_storage_backend?: string;
+  secret_storage_label?: string;
 }
 
 export interface LLMSettingsUpdate {

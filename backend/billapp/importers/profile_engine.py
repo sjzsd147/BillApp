@@ -22,18 +22,28 @@ from billapp.core.models import (
     TransactionCreate,
 )
 from billapp.core.money import to_cents, to_display
+from billapp.core.safe_regex import (
+    DEFAULT_REGEX_TIMEOUT,
+    PROFILE_MAX_PATTERN_LEN,
+    compile_safe_regex,
+    safe_search,
+    validate_regex_pattern,
+)
 from billapp.dedup.fingerprint import assign_fingerprints
 from billapp.importers.base import FileProbe, Importer
 from billapp.importers.common import (
     detect_encoding,
     extract_channel_and_normalize,
+    normalize_currency,
     parse_datetime,
     sanitize_order_id,
 )
 
 AmountModeType = Literal["signed", "split", "flag"]
-AccountKindType = Literal["debit", "credit"]
+AccountKindType = Literal["debit", "credit", "wallet"]
 FileType = Literal["csv", "xlsx", "pdf", "auto"]
+MAX_PROFILE_EXCEL_ROWS = 100_000
+MAX_PROFILE_EXCEL_COLS = 200
 
 
 def _normalize_date_sep(raw: str) -> str:
@@ -52,21 +62,8 @@ def _normalize_currency_token(raw: Optional[str]) -> Optional[str]:
     u = raw.strip().upper()
     if not u or "ALL" in u or "全币种" in raw:
         return None
-    if "人民币" in raw or "RMB" in u or "CNY" in u:
-        return "CNY"
-    if "美元" in raw or "USD" in u:
-        return "USD"
-    if "港币" in raw or "港元" in raw or "HKD" in u:
-        return "HKD"
-    if "欧元" in raw or "EUR" in u:
-        return "EUR"
-    if "日元" in raw or "JPY" in u:
-        return "JPY"
-    if "英镑" in raw or "GBP" in u:
-        return "GBP"
-    if re.fullmatch(r"[A-Z]{3}", u):
-        return u
-    return None
+    norm = normalize_currency(raw, default="")
+    return norm or None
 
 
 def extract_preamble_metadata_fallback(preamble_text: str) -> Dict[str, Optional[str]]:
@@ -177,10 +174,11 @@ class ColumnMappingConfig(BaseModel):
     card_tail: Optional[FieldMapping] = Field(default_factory=lambda: FieldMapping(optional=True))
     order_id: Optional[FieldMapping] = Field(default_factory=lambda: FieldMapping(optional=True))
     status: Optional[FieldMapping] = Field(default_factory=lambda: FieldMapping(optional=True))
+    channel: Optional[FieldMapping] = Field(default_factory=lambda: FieldMapping(optional=True))
 
     @field_validator(
         "date", "time", "amount", "expense_amount", "income_amount", "direction",
-        "counterparty", "description", "balance", "currency", "card_tail", "order_id", "status",
+        "counterparty", "description", "balance", "currency", "card_tail", "order_id", "status", "channel",
         mode="before",
     )
     @classmethod
@@ -253,6 +251,20 @@ class TableDetectionConfig(BaseModel):
     )
     stop_pattern: Optional[str] = "^(合计|小计|总计|重要提示|注：)"
 
+    @field_validator("header_row_pattern", "stop_pattern")
+    @classmethod
+    def validate_optional_regex(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return v
+        return validate_regex_pattern(v, max_len=PROFILE_MAX_PATTERN_LEN)
+
+    @field_validator("skip_row_patterns")
+    @classmethod
+    def validate_skip_patterns(cls, patterns: List[str]) -> List[str]:
+        for p in patterns:
+            validate_regex_pattern(p, max_len=PROFILE_MAX_PATTERN_LEN)
+        return patterns
+
 
 class PreambleRegexRule(BaseModel):
     """Rule for extracting single metadata field via regex."""
@@ -261,6 +273,11 @@ class PreambleRegexRule(BaseModel):
     group: int = 1
     default: Optional[str] = None
 
+    @field_validator("pattern")
+    @classmethod
+    def validate_pattern(cls, v: str) -> str:
+        return validate_regex_pattern(v, max_len=PROFILE_MAX_PATTERN_LEN)
+
 
 class PeriodRegexRule(BaseModel):
     """Rule for extracting start and end dates of statement period."""
@@ -268,6 +285,11 @@ class PeriodRegexRule(BaseModel):
     pattern: str
     start_group: int = 1
     end_group: int = 2
+
+    @field_validator("pattern")
+    @classmethod
+    def validate_pattern(cls, v: str) -> str:
+        return validate_regex_pattern(v, max_len=PROFILE_MAX_PATTERN_LEN)
 
 
 class MetadataExtractionConfig(BaseModel):
@@ -305,6 +327,13 @@ class DirectionRulesConfig(BaseModel):
         }
     )
 
+    @field_validator("refund", "transfer")
+    @classmethod
+    def validate_direction_regexes(cls, v: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        for rgx in v.get("regex", []) or []:
+            validate_regex_pattern(rgx, max_len=PROFILE_MAX_PATTERN_LEN)
+        return v
+
 
 class BankProfile(BaseModel):
     """Declarative Bank Statement Profile Model."""
@@ -329,8 +358,12 @@ class BankProfile(BaseModel):
 
     @property
     def account_kind_full(self) -> str:
-        """Translate 'debit'/'credit' to database kind 'bank_debit'/'bank_credit'."""
-        return "bank_credit" if self.account_kind == "credit" else "bank_debit"
+        """Translate 'debit'/'credit'/'wallet' to database kind."""
+        if self.account_kind == "credit":
+            return "bank_credit"
+        if self.account_kind == "wallet":
+            return "wallet"
+        return "bank_debit"
 
     @classmethod
     def from_yaml(cls, yaml_content: str) -> BankProfile:
@@ -411,7 +444,11 @@ class ProfileImporter(Importer):
             else:
                 score += 0.4 * (matched_kw / len(kw))
         elif self.profile.table_detection.header_row_pattern:
-            if re.search(self.profile.table_detection.header_row_pattern, sample_text):
+            if safe_search(
+                self.profile.table_detection.header_row_pattern,
+                sample_text,
+                max_len=PROFILE_MAX_PATTERN_LEN,
+            ):
                 score += 0.4
         else:
             cand = self.profile.column_mapping.date.header
@@ -472,9 +509,12 @@ class ProfileImporter(Importer):
         start_row = header_idx + self.profile.table_detection.data_start_offset
         total_rows = len(grid) - self.profile.table_detection.skip_footer_rows
 
-        skip_regexes = [re.compile(p) for p in self.profile.table_detection.skip_row_patterns]
+        skip_regexes = [
+            compile_safe_regex(p, max_len=PROFILE_MAX_PATTERN_LEN)
+            for p in self.profile.table_detection.skip_row_patterns
+        ]
         stop_regex = (
-            re.compile(self.profile.table_detection.stop_pattern)
+            compile_safe_regex(self.profile.table_detection.stop_pattern, max_len=PROFILE_MAX_PATTERN_LEN)
             if self.profile.table_detection.stop_pattern
             else None
         )
@@ -486,10 +526,10 @@ class ProfileImporter(Importer):
 
             joined_line = " ".join(str(c).strip() for c in row if c is not None)
 
-            if stop_regex and stop_regex.search(joined_line):
+            if stop_regex and safe_search(stop_regex, joined_line, timeout=DEFAULT_REGEX_TIMEOUT):
                 break
 
-            if any(rgx.search(joined_line) for rgx in skip_regexes):
+            if any(safe_search(rgx, joined_line, timeout=DEFAULT_REGEX_TIMEOUT) for rgx in skip_regexes):
                 continue
 
             txn = self._parse_single_row(
@@ -540,14 +580,22 @@ class ProfileImporter(Importer):
         return [list(row) for row in reader]
 
     def _read_excel_grid(self, probe: FileProbe, max_rows: Optional[int] = None) -> List[List[Any]]:
-        wb = openpyxl.load_workbook(io.BytesIO(probe.content), data_only=True)
-        ws = wb.active
-        grid: List[List[Any]] = []
-        for r, row in enumerate(ws.iter_rows(values_only=True)):
-            if max_rows and r >= max_rows:
-                break
-            grid.append(list(row))
-        return grid
+        row_limit = min(max_rows, MAX_PROFILE_EXCEL_ROWS) if max_rows else MAX_PROFILE_EXCEL_ROWS
+        wb = openpyxl.load_workbook(io.BytesIO(probe.content), read_only=True, data_only=True)
+        try:
+            ws = wb.active
+            if ws is None:
+                return []
+            grid: List[List[Any]] = []
+            for r, row in enumerate(
+                ws.iter_rows(max_row=row_limit, max_col=MAX_PROFILE_EXCEL_COLS, values_only=True)
+            ):
+                if r >= row_limit:
+                    break
+                grid.append(list(row))
+            return grid
+        finally:
+            wb.close()
 
     def _read_pdf_grid(self, probe: FileProbe) -> List[List[Any]]:
         from billapp.importers.pdf import extract_pdf_tables
@@ -563,12 +611,16 @@ class ProfileImporter(Importer):
         if td.header_row_index is not None and 0 <= td.header_row_index < len(grid):
             return td.header_row_index
 
-        pattern = re.compile(td.header_row_pattern) if td.header_row_pattern else None
+        pattern = (
+            compile_safe_regex(td.header_row_pattern, max_len=PROFILE_MAX_PATTERN_LEN)
+            if td.header_row_pattern
+            else None
+        )
         keywords = td.header_row_keywords or []
 
         for idx, row in enumerate(grid[:50]):
             joined = " ".join(str(c).strip() for c in row if c is not None)
-            if pattern and pattern.search(joined):
+            if pattern and safe_search(pattern, joined, timeout=DEFAULT_REGEX_TIMEOUT):
                 return idx
             if keywords and all(kw in joined for kw in keywords):
                 return idx
@@ -594,21 +646,21 @@ class ProfileImporter(Importer):
 
         meta = self.profile.metadata_extraction
         if meta.card_tail:
-            m = re.search(meta.card_tail.pattern, preamble_text)
+            m = safe_search(meta.card_tail.pattern, preamble_text, max_len=PROFILE_MAX_PATTERN_LEN)
             if m:
                 card_tail = m.group(meta.card_tail.group).strip()
             elif meta.card_tail.default:
                 card_tail = meta.card_tail.default
 
         if meta.holder_name:
-            m = re.search(meta.holder_name.pattern, preamble_text)
+            m = safe_search(meta.holder_name.pattern, preamble_text, max_len=PROFILE_MAX_PATTERN_LEN)
             if m:
                 holder_name = m.group(meta.holder_name.group).strip()
             elif meta.holder_name.default:
                 holder_name = meta.holder_name.default
 
         if meta.period:
-            m = re.search(meta.period.pattern, preamble_text)
+            m = safe_search(meta.period.pattern, preamble_text, max_len=PROFILE_MAX_PATTERN_LEN)
             if m:
                 period_start = m.group(meta.period.start_group).strip()
                 period_end = m.group(meta.period.end_group).strip()
@@ -697,7 +749,7 @@ class ProfileImporter(Importer):
             if resolved["amount"] is None or resolved["direction"] is None:
                 raise ValueError(f"Flag mode requires amount and direction columns in header: {header_row}")
 
-        for attr in ("counterparty", "description", "balance", "currency", "card_tail", "order_id", "status"):
+        for attr in ("counterparty", "description", "balance", "currency", "card_tail", "order_id", "status", "channel"):
             fld = getattr(self.profile.column_mapping, attr, None)
             resolved[attr] = find_col(fld)
 
@@ -794,20 +846,24 @@ class ProfileImporter(Importer):
         order_id = sanitize_order_id(get_val("order_id"))
         status = get_val("status")
 
-        # 4. Keyword and regex direction overrides
+        # 4. Keyword and regex direction overrides (using safe ReDoS-protected regex)
         check_text = f"{description or ''} {counterparty or ''}"
         refund_rules = self.profile.direction_rules.refund
-        if direction in ("income", "expense"):
+        # Refunds represent inbound credits; avoid flipping normal outgoing expenses to refund
+        if direction == "income":
             if any(kw in check_text for kw in refund_rules.get("keywords", [])) or \
-               any(re.search(rgx, check_text) for rgx in refund_rules.get("regex", [])):
+               any(safe_search(rgx, check_text, max_len=PROFILE_MAX_PATTERN_LEN) for rgx in refund_rules.get("regex", [])):
                 direction = "refund"
 
         transfer_rules = self.profile.direction_rules.transfer
-        if any(kw in check_text for kw in transfer_rules.get("keywords", [])) or \
-           any(re.search(rgx, check_text) for rgx in transfer_rules.get("regex", [])):
-            direction = "transfer"
+        if direction != "refund":
+            if any(kw in check_text for kw in transfer_rules.get("keywords", [])) or \
+               any(safe_search(rgx, check_text, max_len=PROFILE_MAX_PATTERN_LEN) for rgx in transfer_rules.get("regex", [])):
+                direction = "transfer"
 
-        channel, merchant_norm = extract_channel_and_normalize(counterparty)
+        detected_channel, merchant_norm = extract_channel_and_normalize(counterparty)
+        explicit_channel = get_val("channel")
+        channel = explicit_channel or detected_channel
 
         eff_bank = effective_bank or self.profile.bank
         eff_kind = effective_kind or self.profile.account_kind_full

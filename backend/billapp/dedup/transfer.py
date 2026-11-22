@@ -17,6 +17,8 @@ import sqlite3
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from billapp.importers.common import parse_iso_datetime
+
 
 KNOWN_BANKS = (
     "建设银行", "招商银行", "中国银行", "工商银行", "农业银行",
@@ -258,7 +260,9 @@ def pair_internal_transfers(
         o_id = o["id"]
         o_amt = o["amount_cents"]
         o_cur = o["currency"]
-        o_time = datetime.fromisoformat(o["txn_time"])
+        o_time = parse_iso_datetime(o["txn_time"])
+        if o_time is None:
+            continue
 
         for i in in_records:
             i_id = i["id"]
@@ -271,7 +275,9 @@ def pair_internal_transfers(
             if o["account_id"] and i["account_id"] and o["account_id"] == i["account_id"]:
                 continue
 
-            i_time = datetime.fromisoformat(i["txn_time"])
+            i_time = parse_iso_datetime(i["txn_time"])
+            if i_time is None:
+                continue
             delta_sec = (i_time - o_time).total_seconds()
 
             o_prec = o["time_precision"] if "time_precision" in o.keys() else "second"

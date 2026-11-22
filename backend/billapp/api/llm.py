@@ -12,7 +12,13 @@ from pydantic import BaseModel, Field
 from billapp.app import get_db_conn
 from billapp.classify.categories import CategoryService
 from billapp.classify.rules import _get_val
-from billapp.llm.client import LLMClient, LLMConfig
+from billapp.llm.client import (
+    LLMClient,
+    LLMConfig,
+    normalize_url_origin,
+    validate_llm_base_url,
+)
+from billapp.llm.prompts import collect_known_holder_names
 from billapp.llm.tasks import classify_fallback_sync, review_classification_sync
 
 router = APIRouter(prefix="/api/llm", tags=["llm"])
@@ -188,10 +194,11 @@ def classify_with_llm(
         for r in cat_tree
     ]
 
+    holder_names = collect_known_holder_names(db, payload.holder_name)
     try:
         extra_kwargs: Dict[str, Any] = {
             "key_to_id": key_to_id,
-            "holder_name": payload.holder_name,
+            "holder_name": holder_names or payload.holder_name,
             "taxonomy": live_taxonomy or None,
             "name_to_id": name_to_id,
             "raise_on_error": True,
@@ -307,9 +314,10 @@ def review_with_llm(
     all_categories = CategoryService.list_all(db)
     key_to_id = {c.key: c.id for c in all_categories if c.key}
 
+    holder_names = collect_known_holder_names(db, payload.holder_name)
     try:
         review_results = review_classification_sync(
-            txns, client, key_to_id=key_to_id, holder_name=payload.holder_name
+            txns, client, key_to_id=key_to_id, holder_name=holder_names or payload.holder_name
         )
     except Exception as exc:
         return LLMReviewResponse(
@@ -345,9 +353,25 @@ def test_llm_connection(
 ):
     """Test connectivity to configured LLM endpoint via lightweight probe."""
     config = LLMConfig.load_from_db(db)
+    saved_base_url = config.base_url.strip()
+    had_saved_key = bool(config.api_key.strip())
 
     if payload.base_url:
-        config.base_url = payload.base_url
+        req_url = payload.base_url.strip()
+        try:
+            validate_llm_base_url(req_url)
+        except ValueError as exc:
+            return LLMTestResponse(ok=False, error=str(exc))
+
+        # Prevent exfiltrating persisted API key to a different base_url origin (S-02)
+        if not payload.api_key and had_saved_key:
+            if not saved_base_url or normalize_url_origin(req_url) != normalize_url_origin(saved_base_url):
+                return LLMTestResponse(
+                    ok=False,
+                    error="检测到 API 服务地址 (Base URL) 与已保存地址不一致，出于安全保护禁止复用原 API Key，请重新输入 API Key 后再测试",
+                )
+        config.base_url = req_url
+
     if payload.api_key:
         config.api_key = payload.api_key
     if payload.model:
@@ -357,6 +381,11 @@ def test_llm_connection(
 
     if not config.base_url.strip():
         return LLMTestResponse(ok=False, error="Base URL not configured")
+
+    try:
+        validate_llm_base_url(config.base_url)
+    except ValueError as exc:
+        return LLMTestResponse(ok=False, error=str(exc))
 
     client = LLMClient(config, conn=db)
     result = client.test_connection()
@@ -375,9 +404,25 @@ def list_llm_models(
 ):
     """Fetch available model list from the configured OpenAI-compatible endpoint."""
     config = LLMConfig.load_from_db(db)
+    saved_base_url = config.base_url.strip()
+    had_saved_key = bool(config.api_key.strip())
 
     if payload.base_url:
-        config.base_url = payload.base_url
+        req_url = payload.base_url.strip()
+        try:
+            validate_llm_base_url(req_url)
+        except ValueError as exc:
+            return LLMModelsResponse(ok=False, error=str(exc))
+
+        # Prevent exfiltrating persisted API key to a different base_url origin (S-02)
+        if not payload.api_key and had_saved_key:
+            if not saved_base_url or normalize_url_origin(req_url) != normalize_url_origin(saved_base_url):
+                return LLMModelsResponse(
+                    ok=False,
+                    error="检测到 API 服务地址 (Base URL) 与已保存地址不一致，出于安全保护禁止复用原 API Key，请重新输入 API Key 后再获取模型列表",
+                )
+        config.base_url = req_url
+
     if payload.api_key:
         config.api_key = payload.api_key
     if payload.timeout_sec:
@@ -385,6 +430,11 @@ def list_llm_models(
 
     if not config.base_url.strip():
         return LLMModelsResponse(ok=False, error="Base URL not configured")
+
+    try:
+        validate_llm_base_url(config.base_url)
+    except ValueError as exc:
+        return LLMModelsResponse(ok=False, error=str(exc))
 
     client = LLMClient(config, conn=db)
     result = client.list_models()

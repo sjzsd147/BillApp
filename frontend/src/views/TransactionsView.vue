@@ -156,7 +156,8 @@
         :data="txnStore.items"
         border
         :fit="false"
-        size="default"
+        :size="appStore.tableDensity === 'compact' ? 'small' : 'default'"
+        :class="{ 'table-density-compact': appStore.tableDensity === 'compact' }"
         style="width: 100%"
         @selection-change="handleSelectionChange"
         @header-dragend="handleColumnDragEnd"
@@ -1503,5 +1504,13 @@ onBeforeUnmount(() => {
   color: var(--text-2);
   font-size: 12px;
   word-break: break-all;
+}
+
+:deep(.table-density-compact .el-table__cell) {
+  padding: 4px 0;
+}
+
+:deep(.table-density-compact .cell) {
+  line-height: 20px;
 }
 </style>

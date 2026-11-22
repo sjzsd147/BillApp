@@ -8,16 +8,23 @@ import os
 from pathlib import Path
 import sqlite3
 import tempfile
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Literal, Optional, Tuple
 
+import anyio
 from fastapi import APIRouter, Depends, File, Request, Response, UploadFile, status
 from pydantic import BaseModel, Field
 
-from billapp.app import ValidationError, get_db_conn
+from billapp.api._upload import MAX_BACKUP_UPLOAD_BYTES, read_upload_limited
+from billapp.app import AppException, ValidationError, get_db_conn
 from billapp.classify.categories import CategoryService
 from billapp.core.db import get_default_db_path, migrate_db
-from billapp.core.secrets import encrypt_secret, mask_secret
-from billapp.llm.client import LLMConfig
+from billapp.core.secrets import (
+    SecretStorageError,
+    encrypt_secret,
+    get_secret_storage_info,
+    mask_secret,
+)
+from billapp.llm.client import LLMConfig, validate_llm_base_url
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 data_router = APIRouter(prefix="/api", tags=["data"])
@@ -65,6 +72,9 @@ class LLMSettingsOut(BaseModel):
     auto_confirm_threshold: float = 0.90
     api_key_masked: str = ""
     has_api_key: bool = False
+    api_key_decryption_failed: bool = False
+    secret_storage_backend: str = ""
+    secret_storage_label: str = ""
 
 
 class LLMSettingsUpdate(BaseModel):
@@ -140,6 +150,7 @@ def get_settings(
     refund_data = _get_setting_json(db, "refund_settings", {})
 
     llm_conf = LLMConfig.load_from_db(db)
+    storage_info = get_secret_storage_info()
 
     # Database file stats from active application state
     raw_db_path = getattr(request.app.state, "db_path", None)
@@ -171,6 +182,9 @@ def get_settings(
             auto_confirm_threshold=llm_conf.auto_confirm_threshold,
             api_key_masked=mask_secret(llm_conf.api_key) if llm_conf.api_key else "",
             has_api_key=bool(llm_conf.api_key and llm_conf.api_key.strip()),
+            api_key_decryption_failed=llm_conf.api_key_decryption_failed,
+            secret_storage_backend=storage_info["backend"],
+            secret_storage_label=storage_info["label"],
         ),
         db_path=db_path,
         db_size_bytes=db_size,
@@ -196,7 +210,13 @@ def update_settings(
     if payload.llm is not None:
         conf = LLMConfig.load_from_db(db)
         if payload.llm.base_url is not None:
-            conf.base_url = payload.llm.base_url
+            cleaned_url = payload.llm.base_url.strip()
+            if cleaned_url:
+                try:
+                    validate_llm_base_url(cleaned_url)
+                except ValueError as exc:
+                    raise ValidationError(message=str(exc)) from exc
+            conf.base_url = cleaned_url
         if payload.llm.model is not None:
             conf.model = payload.llm.model
         if payload.llm.temperature is not None:
@@ -228,7 +248,14 @@ def update_settings(
             if raw_key and not raw_key.startswith("****") and not raw_key.startswith("sk-****"):
                 conf.api_key = raw_key
 
-        conf.save_to_db(db)
+        try:
+            conf.save_to_db(db)
+        except SecretStorageError as exc:
+            raise AppException(
+                status_code=500,
+                code="SECRET_STORAGE_ERROR",
+                message=str(exc),
+            ) from exc
 
     return get_settings(request, db)
 
@@ -254,10 +281,77 @@ class ResetDataResponse(BaseModel):
     message: str
 
 
+_REQUIRED_RESTORE_TABLES: Dict[str, set[str]] = {
+    "import_batches": {"id", "file_name", "file_sha1", "source", "row_count"},
+    "accounts": {"id", "kind", "bank", "currency"},
+    "transactions": {"id", "batch_id", "source", "account_id", "txn_time", "amount_cents", "direction", "fingerprint"},
+    "categories": {"id", "name", "direction"},
+    "rules": {"id", "name", "category_id", "priority", "field", "pattern_type", "pattern_value"},
+    "match_links": {"id", "kind", "primary_id", "secondary_id", "score", "status"},
+    "match_blocklist": {"a_id", "b_id", "kind"},
+    "bank_profiles": {"id", "name", "yaml_content"},
+    "settings": {"key", "value"},
+    "fx_rates": {"id", "currency", "rate", "effective_date", "source"},
+    "llm_cache": {"id", "task_type", "input_hash", "response_json", "model"},
+}
+
+
+def _redact_backup_secrets(conn: sqlite3.Connection) -> None:
+    """Strip LLM API key credentials from exported backup SQLite snapshot (S-03)."""
+    try:
+        row = conn.execute("SELECT value FROM settings WHERE key = 'llm_config'").fetchone()
+        if row and row[0]:
+            data = json.loads(row[0])
+            if isinstance(data, dict):
+                changed = False
+                for secret_field in ("api_key_encrypted", "api_key"):
+                    if data.get(secret_field):
+                        data[secret_field] = ""
+                        changed = True
+                if changed:
+                    conn.execute(
+                        "UPDATE settings SET value = ?, updated_at = datetime('now', 'localtime') WHERE key = 'llm_config'",
+                        (json.dumps(data, ensure_ascii=False),),
+                    )
+                    conn.commit()
+    except Exception:
+        pass
+
+
+def _sanitize_restored_settings(conn: sqlite3.Connection) -> None:
+    """Sanitize restored llm_config to prevent URL hijacking or plaintext key injection (S-06)."""
+    try:
+        row = conn.execute("SELECT value FROM settings WHERE key = 'llm_config'").fetchone()
+        if not row or not row[0]:
+            return
+        data = json.loads(row[0])
+        if not isinstance(data, dict):
+            return
+        changed = False
+        if "api_key" in data and data["api_key"]:
+            data["api_key"] = ""
+            changed = True
+        raw_url = str(data.get("base_url") or "").strip()
+        if raw_url:
+            try:
+                validate_llm_base_url(raw_url)
+            except ValueError:
+                data["base_url"] = ""
+                data["api_key_encrypted"] = ""
+                data["enabled"] = False
+                changed = True
+        if changed:
+            conn.execute(
+                "UPDATE settings SET value = ?, updated_at = datetime('now', 'localtime') WHERE key = 'llm_config'",
+                (json.dumps(data, ensure_ascii=False),),
+            )
+    except Exception:
+        pass
+
+
 @data_router.post("/backup")
-@data_router.get("/backup")
 def backup_database(db: sqlite3.Connection = Depends(get_db_conn)):
-    """Create a consistent SQLite snapshot using sqlite3 backup API and return as .db download."""
+    """Create a consistent, secret-redacted SQLite snapshot using sqlite3 backup API (POST-only)."""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     filename = f"billapp-backup-{timestamp}.db"
 
@@ -267,6 +361,7 @@ def backup_database(db: sqlite3.Connection = Depends(get_db_conn)):
         dst_conn = sqlite3.connect(tmp_path)
         try:
             db.backup(dst_conn)
+            _redact_backup_secrets(dst_conn)
             dst_conn.commit()
         finally:
             dst_conn.close()
@@ -285,19 +380,15 @@ def backup_database(db: sqlite3.Connection = Depends(get_db_conn)):
     )
 
 
-@data_router.post("/restore", response_model=RestoreResponse)
-async def restore_database(
-    file: UploadFile = File(...),
-    db: sqlite3.Connection = Depends(get_db_conn),
-):
-    """Validate and restore an uploaded SQLite backup database safely via sqlite3.backup."""
-    content = await file.read()
-    if len(content) < 100 or not content.startswith(b"SQLite format 3\x00"):
-        raise ValidationError(message="上传文件不是有效的 SQLite 数据库备份")
-
+def _perform_database_restore(content: bytes, db: sqlite3.Connection) -> Tuple[int, int]:
+    """Validate uploaded SQLite snapshot and restore atomically with automatic rollback on failure."""
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".db")
     os.close(tmp_fd)
+    bak_fd, rollback_path = tempfile.mkstemp(suffix=".bak.db")
+    os.close(bak_fd)
     src_conn: Optional[sqlite3.Connection] = None
+    rollback_created = False
+
     try:
         Path(tmp_path).write_bytes(content)
         try:
@@ -306,19 +397,71 @@ async def restore_database(
             if not integrity or integrity[0] != "ok":
                 raise ValidationError(message="备份文件完整性校验未通过")
 
-            tables = {
-                row[0]
-                for row in src_conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-            }
-            required = {"import_batches", "accounts", "transactions", "categories"}
-            if not required.issubset(tables):
-                raise ValidationError(message="备份文件缺少账单助手核心数据表")
+            # Reject potentially malicious SQLite triggers, views, or virtual tables (S-06)
+            master_rows = src_conn.execute(
+                "SELECT type, name, sql FROM sqlite_master"
+            ).fetchall()
+            tables: set[str] = set()
+            for obj_type, obj_name, obj_sql in master_rows:
+                t_lower = str(obj_type or "").lower()
+                sql_upper = str(obj_sql or "").upper()
+                if t_lower in ("trigger", "view"):
+                    raise ValidationError(
+                        message=f"备份文件包含不允许的数据库对象 ({t_lower}: {obj_name})，已拒绝恢复"
+                    )
+                if "VIRTUAL TABLE" in sql_upper:
+                    raise ValidationError(
+                        message=f"备份文件包含不允许的虚拟表 ({obj_name})，已拒绝恢复"
+                    )
+                if t_lower == "table":
+                    tables.add(str(obj_name))
 
-            # Commit any open read/write state on target before online backup restore
+            # Validate all 11 core tables and essential columns
+            missing_tables = set(_REQUIRED_RESTORE_TABLES.keys()) - tables
+            if missing_tables:
+                raise ValidationError(
+                    message=f"备份文件缺少核心数据表: {', '.join(sorted(missing_tables))}"
+                )
+
+            for tbl_name, required_cols in _REQUIRED_RESTORE_TABLES.items():
+                col_rows = src_conn.execute(f"PRAGMA table_info({tbl_name})").fetchall()
+                existing_cols = {str(r[1]) for r in col_rows}
+                missing_cols = required_cols - existing_cols
+                if missing_cols:
+                    raise ValidationError(
+                        message=f"备份文件表 {tbl_name} 缺少必要字段: {', '.join(sorted(missing_cols))}"
+                    )
+
+            # Create rollback snapshot of live database before overwriting
             db.commit()
-            src_conn.backup(db)
+            rb_conn = sqlite3.connect(rollback_path)
+            try:
+                db.backup(rb_conn)
+                rb_conn.commit()
+                rollback_created = True
+            finally:
+                rb_conn.close()
+
+            # Overwrite target DB and run post-restore sanitization & migrations
+            try:
+                src_conn.backup(db)
+                _sanitize_restored_settings(db)
+                migrate_db(db)
+                CategoryService.init_builtin_categories(db)
+                db.commit()
+            except Exception as restore_exc:
+                # Roll back live DB automatically from pre-restore snapshot
+                if rollback_created:
+                    try:
+                        rb_restore = sqlite3.connect(rollback_path)
+                        try:
+                            rb_restore.backup(db)
+                            db.commit()
+                        finally:
+                            rb_restore.close()
+                    except Exception:
+                        pass
+                raise ValidationError(message=f"数据库恢复失败并已自动回滚: {restore_exc}") from restore_exc
         except ValidationError:
             raise
         except sqlite3.DatabaseError as exc:
@@ -330,22 +473,33 @@ async def restore_database(
                 except Exception:
                     pass
 
-        migrate_db(db)
-        CategoryService.init_builtin_categories(db)
-        db.commit()
-
         txn_count = db.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
         acc_count = db.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+        return int(txn_count), int(acc_count)
     finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        for p in (tmp_path, rollback_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+@data_router.post("/restore", response_model=RestoreResponse)
+async def restore_database(
+    file: UploadFile = File(...),
+    db: sqlite3.Connection = Depends(get_db_conn),
+):
+    """Validate and restore an uploaded SQLite backup database safely via sqlite3.backup."""
+    content = await read_upload_limited(file, MAX_BACKUP_UPLOAD_BYTES)
+    if len(content) < 100 or not content.startswith(b"SQLite format 3\x00"):
+        raise ValidationError(message="上传文件不是有效的 SQLite 数据库备份")
+
+    txn_count, acc_count = await anyio.to_thread.run_sync(_perform_database_restore, content, db)
 
     return RestoreResponse(
         success=True,
-        transactions_count=int(txn_count),
-        accounts_count=int(acc_count),
+        transactions_count=txn_count,
+        accounts_count=acc_count,
     )
 
 

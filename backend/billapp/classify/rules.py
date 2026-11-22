@@ -72,52 +72,23 @@ class RuleCandidate:
 # Safe Regex & Pattern Matching Engine
 # =========================================================================
 
-_REGEX_CACHE: Dict[str, Optional[re.Pattern]] = {}
+from billapp.core.safe_regex import (
+    DEFAULT_REGEX_TIMEOUT,
+    compile_safe_regex as _compile_safe_regex_core,
+    safe_search as _safe_regex_search,
+)
 
 
-def compile_safe_regex(pattern: str, raise_on_error: bool = False) -> Optional[re.Pattern]:
-    """Compile regex with size bounds, ReDoS heuristics, and error suppression."""
+def compile_safe_regex(pattern: str, raise_on_error: bool = False):
+    """Compile regex with size bounds, deep ReDoS analysis, bounded LRU cache, and timeout support."""
     if not pattern:
         return None
-    if pattern in _REGEX_CACHE:
-        cached = _REGEX_CACHE[pattern]
-        if cached is None and raise_on_error:
-            raise ValueError("Potentially catastrophic regex pattern (ReDoS) or invalid regex")
-        return cached
-
-    # Guard against ReDoS via oversized patterns
-    if len(pattern) > 200:
-        logger.warning("Regex pattern exceeds 200 characters; rejecting pattern: %s", pattern[:30])
-        _REGEX_CACHE[pattern] = None
-        if raise_on_error:
-            raise ValueError("Regex pattern exceeds 200 characters")
-        return None
-
-    # Guard against ReDoS via nested quantifiers (e.g. (a+)+, (\w+)+, (x+x+)+)
-    if re.search(r"\([^)]*(?:\+|\*|\{\d*,?\d*\})[^)]*\)\s*(?:\+|\*|\{\d*,?\d*\})", pattern):
-        logger.warning("Potentially catastrophic regex pattern (ReDoS) rejected: %s", pattern)
-        _REGEX_CACHE[pattern] = None
-        if raise_on_error:
-            raise ValueError("Potentially catastrophic regex pattern (ReDoS)")
-        return None
-
-    # Guard against ReDoS via repeated alternations (e.g. (a|aa)+, (a|aa)+$, (x|y)*)
-    if re.search(r"\([^)]*\|[^)]*\)\s*(?:\+|\*|\{\d*,?\d*\})", pattern):
-        logger.warning("Potentially catastrophic regex pattern (ReDoS alternation) rejected: %s", pattern)
-        _REGEX_CACHE[pattern] = None
-        if raise_on_error:
-            raise ValueError("Potentially catastrophic regex pattern (ReDoS alternation)")
-        return None
-
     try:
-        compiled = re.compile(pattern, re.IGNORECASE)
-        _REGEX_CACHE[pattern] = compiled
-        return compiled
-    except re.error as err:
-        logger.debug("Invalid regex pattern '%s': %s", pattern, err)
-        _REGEX_CACHE[pattern] = None
+        return _compile_safe_regex_core(pattern, flags=re.IGNORECASE, max_len=200)
+    except ValueError as err:
+        logger.warning("Unsafe or invalid regex pattern rejected (%s): %s", err, pattern[:40])
         if raise_on_error:
-            raise ValueError(f"Invalid regex pattern: {err}")
+            raise
         return None
 
 
@@ -137,8 +108,10 @@ def match_pattern(pattern_type: str, pattern: str, text: str) -> bool:
     elif ptype == "prefix":
         return t_clean.startswith(p_clean)
     elif ptype == "regex":
-        regex = compile_safe_regex(pattern)
-        return bool(regex.search(text)) if regex is not None else False
+        compiled = compile_safe_regex(pattern)
+        if compiled is None:
+            return False
+        return bool(_safe_regex_search(compiled, text, timeout=DEFAULT_REGEX_TIMEOUT))
 
     return False
 
@@ -275,7 +248,7 @@ def clean_merchant_for_learning(counterparty: Optional[str], merchant_norm: Opti
 
     # If reduced to less than 2 characters, fallback to original counterparty or first 8 chars
     if len(text) < 2:
-        clean_cp = counterparty.strip()
+        clean_cp = (counterparty or "").strip()
         clean_cp = re.sub(r"^(支付宝|财付通|网银在线|美团支付|微信支付|云闪付|银联)[-_/]", "", clean_cp)
         return clean_cp[:8] if len(clean_cp) > 8 else clean_cp
 

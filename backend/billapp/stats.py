@@ -497,6 +497,16 @@ def calculate_stats_summary(
     )
 
 
+def _transfer_filter_sql(include_transfer: bool) -> str:
+    if include_transfer:
+        return ""
+    return """
+      AND t.transfer_peer IS NULL
+      AND (c.key IS NULL OR c.key != 'financial.internal_transfer')
+      AND (c.name IS NULL OR c.name NOT IN ('内部转账', '资金互转'))
+    """
+
+
 def calculate_stats_trend(
     conn: sqlite3.Connection,
     granularity: str = "monthly",  # 'monthly' or 'daily'
@@ -504,11 +514,13 @@ def calculate_stats_trend(
     end_date: Optional[str] = None,
     account_id: Optional[int] = None,
     fund_account_id: Optional[int] = None,
+    include_transfer: bool = False,
 ) -> List[TrendItem]:
     """Calculate monthly or daily net expense and income time series."""
     where_base, base_params = build_stats_filters(
         start_date, end_date, account_id, fund_account_id, alias="t"
     )
+    transfer_cond = _transfer_filter_sql(include_transfer)
 
     fmt = "%Y-%m" if granularity == "monthly" else "%Y-%m-%d"
     refund_mode = get_refund_mode(conn)
@@ -523,9 +535,7 @@ def calculate_stats_trend(
             LEFT JOIN categories c ON t.category_id = c.id
             WHERE {where_base}
               AND t.direction = 'expense'
-              AND t.transfer_peer IS NULL
-              AND (c.key IS NULL OR c.key != 'financial.internal_transfer')
-              AND (c.name IS NULL OR c.name NOT IN ('内部转账', '资金互转'))
+              {transfer_cond}
             GROUP BY period
             ORDER BY period ASC
         """
@@ -553,9 +563,7 @@ def calculate_stats_trend(
             LEFT JOIN categories c ON t.category_id = c.id
             WHERE {where_base}
               AND t.direction = 'expense'
-              AND t.transfer_peer IS NULL
-              AND (c.key IS NULL OR c.key != 'financial.internal_transfer')
-              AND (c.name IS NULL OR c.name NOT IN ('内部转账', '资金互转'))
+              {transfer_cond}
             GROUP BY period
             ORDER BY period ASC
         """
@@ -584,9 +592,7 @@ def calculate_stats_trend(
         LEFT JOIN categories c ON t.category_id = c.id
         WHERE {where_base}
           AND t.direction = 'income'
-          AND t.transfer_peer IS NULL
-          AND (c.key IS NULL OR c.key != 'financial.internal_transfer')
-          AND (c.name IS NULL OR c.name NOT IN ('内部转账', '资金互转'))
+          {transfer_cond}
         GROUP BY period
         ORDER BY period ASC
     """
@@ -624,11 +630,13 @@ def calculate_stats_category(
     end_date: Optional[str] = None,
     account_id: Optional[int] = None,
     fund_account_id: Optional[int] = None,
+    include_transfer: bool = False,
 ) -> CategoryStatsResponse:
     """Calculate 2-tier hierarchical category breakdown for ECharts Sunburst / Donut."""
     where_base, base_params = build_stats_filters(
         start_date, end_date, account_id, fund_account_id, alias="t"
     )
+    transfer_cond = _transfer_filter_sql(include_transfer)
 
     # 1. Fetch category taxonomy
     cat_rows = conn.execute(
@@ -646,9 +654,7 @@ def calculate_stats_category(
             LEFT JOIN categories c ON t.category_id = c.id
             WHERE {where_base}
               AND t.direction = 'expense'
-              AND t.transfer_peer IS NULL
-              AND (c.key IS NULL OR c.key != 'financial.internal_transfer')
-              AND (c.name IS NULL OR c.name NOT IN ('内部转账', '资金互转'))
+              {transfer_cond}
             GROUP BY t.category_id
         """
     else:
@@ -660,9 +666,7 @@ def calculate_stats_category(
             LEFT JOIN categories c ON t.category_id = c.id
             WHERE {where_base}
               AND t.direction = 'income'
-              AND t.transfer_peer IS NULL
-              AND (c.key IS NULL OR c.key != 'financial.internal_transfer')
-              AND (c.name IS NULL OR c.name NOT IN ('内部转账', '资金互转'))
+              {transfer_cond}
             GROUP BY t.category_id
         """
 
@@ -756,11 +760,13 @@ def calculate_stats_merchant(
     end_date: Optional[str] = None,
     account_id: Optional[int] = None,
     fund_account_id: Optional[int] = None,
+    include_transfer: bool = False,
 ) -> MerchantStatsResponse:
     """Calculate top N merchants by net expense with tail aggregation."""
     where_base, base_params = build_stats_filters(
         start_date, end_date, account_id, fund_account_id, alias="t"
     )
+    transfer_cond = _transfer_filter_sql(include_transfer)
 
     sql = f"""
         SELECT COALESCE(NULLIF(t.merchant_norm, ''), NULLIF(t.counterparty, ''), '其他') AS merchant_name,
@@ -770,9 +776,7 @@ def calculate_stats_merchant(
         LEFT JOIN categories c ON t.category_id = c.id
         WHERE {where_base}
           AND t.direction = 'expense'
-          AND t.transfer_peer IS NULL
-          AND (c.key IS NULL OR c.key != 'financial.internal_transfer')
-          AND (c.name IS NULL OR c.name NOT IN ('内部转账', '资金互转'))
+          {transfer_cond}
         GROUP BY merchant_name
         ORDER BY expense_cents DESC
     """
@@ -813,8 +817,10 @@ def calculate_stats_heatmap(
     end_date: Optional[str] = None,
     account_id: Optional[int] = None,
     fund_account_id: Optional[int] = None,
+    include_transfer: bool = False,
 ) -> HeatmapResponse:
     """Calculate expense heatmap: daily calendar or 7x24 weekday-hour."""
+    transfer_cond = _transfer_filter_sql(include_transfer)
     if mode == "weekday_hour":
         where_base, base_params = build_stats_filters(
             start_date, end_date, account_id, fund_account_id, alias="t"
@@ -829,10 +835,8 @@ def calculate_stats_heatmap(
             LEFT JOIN categories c ON t.category_id = c.id
             WHERE {where_base}
               AND t.direction = 'expense'
-              AND t.transfer_peer IS NULL
               AND t.time_precision != 'day'
-              AND (c.key IS NULL OR c.key != 'financial.internal_transfer')
-              AND (c.name IS NULL OR c.name NOT IN ('内部转账', '资金互转'))
+              {transfer_cond}
             GROUP BY wday_raw, hour_num
         """
         rows = conn.execute(sql, base_params).fetchall()
@@ -866,9 +870,7 @@ def calculate_stats_heatmap(
         LEFT JOIN categories c ON t.category_id = c.id
         WHERE {where_base}
           AND t.direction = 'expense'
-          AND t.transfer_peer IS NULL
-          AND (c.key IS NULL OR c.key != 'financial.internal_transfer')
-          AND (c.name IS NULL OR c.name NOT IN ('内部转账', '资金互转'))
+          {transfer_cond}
         GROUP BY date_str
         ORDER BY date_str ASC
     """
@@ -889,11 +891,13 @@ def calculate_stats_account(
     by: str = "account",  # 'account' or 'fund_account'
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    include_transfer: bool = False,
 ) -> AccountStatsResponse:
     """Calculate inflow, outflow, and net balance distribution per account."""
     where_base, base_params = build_stats_filters(
         start_date, end_date, alias="t"
     )
+    transfer_cond = _transfer_filter_sql(include_transfer)
 
     target_col = "t.fund_account_id" if by == "fund_account" else "t.account_id"
 
@@ -903,7 +907,9 @@ def calculate_stats_account(
                COALESCE(SUM(CASE WHEN t.direction = 'income' THEN {SQL_CNY_AMOUNT} ELSE 0 END), 0) AS total_in,
                COUNT(*) AS txn_count
         FROM transactions t
+        LEFT JOIN categories c ON t.category_id = c.id
         WHERE {where_base}
+          {transfer_cond}
         GROUP BY effective_acc_id
     """
     rows = conn.execute(sql, base_params).fetchall()

@@ -71,6 +71,37 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     """)
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_fx_rates_curr_date ON fx_rates(currency, effective_date)")
 
+    # Ensure llm_cache CHECK constraint supports 'full_parse' (B-04)
+    llm_tbl = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='llm_cache'"
+    ).fetchone()
+    if llm_tbl and llm_tbl[0] and "'full_parse'" not in llm_tbl[0]:
+        conn.execute(
+            """
+            CREATE TABLE llm_cache_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_type TEXT NOT NULL CHECK(task_type IN ('classify', 'review', 'arbitrate', 'merchant_norm', 'suggest_profile', 'full_parse')),
+                input_hash TEXT NOT NULL UNIQUE,
+                response_json TEXT NOT NULL,
+                model TEXT NOT NULL,
+                prompt_tokens INT DEFAULT 0,
+                completion_tokens INT DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO llm_cache_new
+                (id, task_type, input_hash, response_json, model, prompt_tokens, completion_tokens, created_at)
+            SELECT id, task_type, input_hash, response_json, model, prompt_tokens, completion_tokens, created_at
+            FROM llm_cache
+            """
+        )
+        conn.execute("DROP TABLE llm_cache")
+        conn.execute("ALTER TABLE llm_cache_new RENAME TO llm_cache")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_cache_hash ON llm_cache(input_hash)")
+
 
 def init_db(
     db_path: Optional[str | Path] = None,

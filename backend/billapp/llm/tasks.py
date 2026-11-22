@@ -944,11 +944,15 @@ _VALID_DIRECTIONS = {"expense", "income", "transfer", "refund", "neutral"}
 _VALID_CHANNELS = {"alipay", "tenpay", "jdpay", "meituan", "unionpay"}
 
 
+MAX_LLM_PARSE_CHUNKS = 20
+
+
 def parse_statement_with_llm_sync(
     raw_lines: List[str],
     client: LLMClient,
     file_name: Optional[str] = None,
     chunk_size: int = 45,
+    extra_holders: Optional[List[str]] = None,
 ) -> Tuple[ParseResult, Dict[str, Any]]:
     """Have the LLM take over full statement parsing (top account + all transaction lines)."""
     if not client.is_available():
@@ -959,8 +963,13 @@ def parse_statement_with_llm_sync(
     top_context = "\n".join((raw_lines or [])[:25]) + (f"\n{file_name}" if file_name else "")
     fb = extract_preamble_metadata_fallback(top_context)
     local_holder = fb.get("holder_name")
+    all_holders: List[str] = []
+    if local_holder:
+        all_holders.append(local_holder)
+    if extra_holders:
+        all_holders.extend(extra_holders)
 
-    masked_lines = prepare_statement_lines_for_llm(raw_lines, local_holder=local_holder)
+    masked_lines = prepare_statement_lines_for_llm(raw_lines, local_holder=all_holders or None)
     if not masked_lines:
         raise ValueError("未能从文件中提取可识别的文本内容")
 
@@ -972,6 +981,11 @@ def parse_statement_with_llm_sync(
             masked_lines[i : i + chunk_size]
             for i in range(0, len(masked_lines), chunk_size)
         ]
+
+    truncated_chunks = 0
+    if len(chunks) > MAX_LLM_PARSE_CHUNKS:
+        truncated_chunks = len(chunks) - MAX_LLM_PARSE_CHUNKS
+        chunks = chunks[:MAX_LLM_PARSE_CHUNKS]
 
     llm_bank: Optional[str] = None
     llm_kind: Optional[AccountKind] = None
@@ -1181,6 +1195,11 @@ def parse_statement_with_llm_sync(
             ),
         ),
     ]
+
+    if truncated_chunks > 0:
+        warnings.append(
+            f"账单内容较长，为控制 AI 调用成本已截断后续 {truncated_chunks} 个分段（上限 {MAX_LLM_PARSE_CHUNKS} 段），建议拆分为按月账单导入"
+        )
 
     parse_result = ParseResult(
         accounts=accounts,

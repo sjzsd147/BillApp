@@ -176,9 +176,17 @@
           <div class="card-notice">
             <el-icon><Lock /></el-icon>
             <span>
-              API Key 均保存在本机，且由 Windows DPAPI 加密防护。所有功能在未配置 AI 或离线时仍可 100% 正常运行。
+              API Key 均保存在本机，当前加密后端：{{ settings.llm.secret_storage_label || '本机安全加密存储' }}。所有功能在未配置 AI 或离线时仍可 100% 正常运行。
             </span>
           </div>
+          <el-alert
+            v-if="settings.llm.api_key_decryption_failed"
+            type="warning"
+            show-icon
+            :closable="false"
+            style="margin-bottom: 14px"
+            title="检测到已保存的 API Key 无法在本机解密（可能来自跨设备备份恢复），原有服务地址与模型配置已保留，请重新输入 API Key 并保存。"
+          />
 
           <el-form label-position="top">
             <el-form-item label="启用 AI 智能辅助">
@@ -686,6 +694,7 @@ async function loadSettings() {
     Object.assign(settings.llm, res.llm);
     settings.db_path = res.db_path;
     settings.db_size_bytes = res.db_size_bytes;
+    appStore.applyGeneralSettings(res.general);
   } catch (e) {
     console.error('Failed to load settings', e);
   } finally {
@@ -696,11 +705,12 @@ async function loadSettings() {
 async function saveSettings() {
   saving.value = true;
   try {
-    await updateSettings({
+    const res = await updateSettings({
       general: settings.general,
       dedup: settings.dedup,
       refund: settings.refund,
     });
+    appStore.applyGeneralSettings(res.general);
     ElMessage.success('设置已成功保存');
   } catch (err: any) {
     ElMessage.error(err.message || '保存设置失败');

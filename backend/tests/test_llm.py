@@ -63,17 +63,18 @@ class TestDPAPISecretStorage:
         encrypted = encrypt_secret(secret)
         assert is_encrypted_secret(encrypted)
         assert encrypted != secret
-        assert encrypted.startswith("dpapi:") or encrypted.startswith("b64:")
+        assert encrypted.startswith("dpapi:") or encrypted.startswith("encv1:")
 
         decrypted = decrypt_secret(encrypted)
         assert decrypted == secret
 
-    def test_fallback_base64_roundtrip(self):
+    def test_legacy_base64_migration_decrypt(self):
+        import base64
         secret = "fallback-open-key-9999"
-        encrypted = encrypt_secret(secret, force_b64=True)
-        assert encrypted.startswith("b64:")
+        legacy_stored = "b64:" + base64.b64encode(secret.encode("utf-8")).decode("ascii")
+        assert is_encrypted_secret(legacy_stored)
 
-        decrypted = decrypt_secret(encrypted)
+        decrypted = decrypt_secret(legacy_stored)
         assert decrypted == secret
 
     def test_mask_secret(self):

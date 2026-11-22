@@ -15,6 +15,7 @@ import ctypes
 import json
 import logging
 import os
+import secrets
 import signal
 import socket
 import tempfile
@@ -236,7 +237,7 @@ def main() -> None:
     logger.info("=== BillApp backend starting (frozen=%s, argv=%s) ===", getattr(sys, "frozen", False), sys.argv)
 
     parser = argparse.ArgumentParser(description="BillApp Backend Sidecar & Launcher")
-    parser.add_argument("--port", type=int, default=8000, help="Server port (0 for OS ephemeral, default: 8000)")
+    parser.add_argument("--port", type=int, default=0, help="Server port (0 for random OS ephemeral port, default: 0)")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Server host (default: 127.0.0.1)")
     parser.add_argument("--db", type=str, default=None, help="Custom SQLite database path")
     parser.add_argument("--frontend-dir", type=str, default=None, help="Override static frontend distribution path")
@@ -264,22 +265,32 @@ def main() -> None:
     server: Optional[uvicorn.Server] = None
     server_thread: Optional[threading.Thread] = None
     try:
-        if args.port <= 0 or args.port == 8000:
-            port = find_free_port(args.port)
+        if args.port <= 0:
+            port = find_free_port(0)
         else:
             port = args.port
+
+        # Ensure per-launch local session authentication token (never passed via CLI argv)
+        api_token = (os.environ.get("BILLAPP_API_TOKEN") or "").strip() or None
+        boot_token: Optional[str] = None
+        if standalone_browser and not args.dev and not api_token:
+            api_token = secrets.token_hex(32)
+            boot_token = secrets.token_urlsafe(24)
+        elif args.dev:
+            os.environ["BILLAPP_DEV_MODE"] = "1"
 
         resolved_db = args.db or str(get_default_db_path())
         dist_dir = get_frontend_dist_dir()
         logger.info(
-            "Creating app: host=%s, port=%s, db=%s, dist_dir=%s (exists=%s)",
+            "Creating app: host=%s, port=%s, db=%s, dist_dir=%s (exists=%s), token_enabled=%s",
             args.host,
             port,
             resolved_db,
             dist_dir,
             dist_dir.is_dir(),
+            bool(api_token),
         )
-        app = create_app(db_path=resolved_db)
+        app = create_app(db_path=resolved_db, api_token=api_token, bootstrap_token=boot_token)
 
         config = uvicorn.Config(
             app=app,
@@ -334,11 +345,16 @@ def main() -> None:
         if standalone_browser:
             if args.dev:
                 app_url = "http://127.0.0.1:5173"
+                logger.info("Opening default browser at %s", app_url)
             elif args.frontend_url:
                 app_url = args.frontend_url
+                logger.info("Opening default browser at %s", app_url)
+            elif boot_token:
+                app_url = f"{base_url}/?boot_token={boot_token}"
+                logger.info("Opening default browser at %s (with one-time session bootstrap)", base_url)
             else:
                 app_url = base_url
-            logger.info("Opening default browser at %s", app_url)
+                logger.info("Opening default browser at %s", app_url)
             webbrowser.open(app_url)
 
         try:

@@ -18,6 +18,7 @@ from billapp.dedup.fingerprint import assign_fingerprints
 from billapp.importers.base import FileProbe, Importer
 from billapp.importers.common import (
     extract_channel_and_normalize,
+    normalize_currency,
     parse_datetime,
 )
 from billapp.importers.pdf import (
@@ -166,9 +167,9 @@ class ICBCCreditImporter(Importer):
                     m_tail = re.search(r"(\d{4})$", card_raw.strip()) or re.search(r"(\d{4})", card_raw.strip())
                     card_tail = m_tail.group(1) if m_tail else "0000"
 
-                    # Currency handling
-                    is_usd = "美元" in (post_curr or tx_curr) or "USD" in (post_curr or tx_curr)
-                    currency = "USD" if is_usd else "CNY"
+                    # Currency handling (supports CNY, USD, EUR, HKD, JPY, GBP, etc.)
+                    raw_curr = post_curr or tx_curr
+                    currency = normalize_currency(raw_curr, default="CNY")
 
                     # Amount parsing
                     amt_clean = post_amt_s or tx_amt_s
@@ -205,7 +206,7 @@ class ICBCCreditImporter(Importer):
                         else:
                             direction = "income"
 
-                    amount_cents = to_cents(amt_dec)
+                    amount_cents = to_cents(abs(amt_dec))
                     iso_time, precision = parse_datetime(dt_clean)
 
                     raw_counterparty = cp_name or merchant or "工商银行"

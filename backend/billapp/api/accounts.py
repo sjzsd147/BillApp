@@ -67,12 +67,19 @@ def list_accounts(
             (SELECT COUNT(*) FROM transactions WHERE fund_account_id = a.id) AS funded_count,
             COALESCE((
                 SELECT SUM(CASE 
-                    WHEN direction = 'income' THEN amount_cents
-                    WHEN direction = 'expense' THEN -(amount_cents - refunded_cents)
+                    WHEN direction = 'income' THEN COALESCE(amount_cny, amount_cents)
+                    WHEN direction = 'expense' THEN CASE
+                        WHEN fx_rate IS NOT NULL AND currency != 'CNY' THEN -ROUND((amount_cents - refunded_cents) * fx_rate)
+                        ELSE -(COALESCE(amount_cny, amount_cents) - refunded_cents)
+                    END
                     ELSE 0 
                 END)
                 FROM transactions
-                WHERE account_id = a.id AND duplicate_of IS NULL AND excluded = 0
+                WHERE account_id = a.id
+                  AND duplicate_of IS NULL
+                  AND excluded = 0
+                  AND transfer_peer IS NULL
+                  AND (currency = 'CNY' OR currency IS NULL OR amount_cny IS NOT NULL)
             ), 0) AS computed_balance_cents,
             (SELECT MIN(txn_time) FROM transactions WHERE account_id = a.id) AS first_txn_time,
             (SELECT MAX(txn_time) FROM transactions WHERE account_id = a.id) AS last_txn_time

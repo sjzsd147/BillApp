@@ -18,6 +18,7 @@ from billapp.dedup.fingerprint import assign_fingerprints
 from billapp.importers.base import FileProbe, Importer
 from billapp.importers.common import (
     extract_channel_and_normalize,
+    normalize_currency,
     parse_datetime,
 )
 from billapp.importers.pdf import (
@@ -167,7 +168,7 @@ class BOCDebitImporter(Importer):
                         amount_cents = to_cents(abs(amt_dec))
                         dt_input = f"{post_date} {post_time}".strip() if post_time else post_date
                         iso_time, precision = parse_datetime(dt_input)
-                        currency = "CNY" if ("人民币" in curr_str or not curr_str) else curr_str
+                        currency = normalize_currency(curr_str, default="CNY")
 
                         raw_counterparty = cp_name or note or cp_bank or "中国银行"
                         detected_ch, merchant_norm = extract_channel_and_normalize(raw_counterparty)

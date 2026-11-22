@@ -55,7 +55,7 @@
           <!-- Tab 1: User Rules -->
           <el-tab-pane label="我的自定义规则" name="user_rules">
             <div class="tab-toolbar">
-              <span class="tip-text">按优先级（由大到小）依次匹配，命中后停止后续规则匹配。</span>
+              <span class="tip-text">按优先级（由小到大）依次匹配，命中后停止后续规则匹配。</span>
               <div class="actions">
                 <el-button size="small" @click="openTesterDrawer">测试规则匹配</el-button>
                 <el-button type="primary" size="small" @click="openCreateRuleDialog">
@@ -183,7 +183,7 @@
         <el-form-item label="目标分类 *">
           <CategoryPicker v-model="ruleForm.category_id" />
         </el-form-item>
-        <el-form-item label="优先级 (数值越大越先执行)">
+        <el-form-item label="优先级 (数值越小越先执行)">
           <el-input-number v-model="ruleForm.priority" :min="1" :max="999" />
         </el-form-item>
       </el-form>

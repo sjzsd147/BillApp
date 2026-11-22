@@ -1,8 +1,9 @@
 'use strict';
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-const { app, BrowserWindow, Menu, dialog, ipcMain, net, shell } = require('electron');
+const { app, BrowserWindow, Menu, dialog, ipcMain, net, safeStorage, session, shell } = require('electron');
 const { startBackend, httpPostBuffer, parseDbCliArg } = require('./backend.cjs');
 const { createAppUpdater } = require('./updater.cjs');
 
@@ -11,14 +12,18 @@ app.setName('BillApp');
 app.commandLine.appendSwitch('proxy-bypass-list', '<-loopback>,127.0.0.1,localhost');
 
 const WINDOW_TITLE = '账单助手 - BillApp';
-const SMOKE_TEST = process.argv.includes('--smoke-test') || process.env.BILLAPP_ELECTRON_SMOKETEST === '1';
-const ALLOW_MULTI = SMOKE_TEST || process.env.BILLAPP_ALLOW_MULTI_INSTANCE === '1';
+const SMOKE_TEST =
+  process.argv.includes('--smoke-test') || (!app.isPackaged && process.env.BILLAPP_ELECTRON_SMOKETEST === '1');
+const ALLOW_MULTI =
+  SMOKE_TEST || (!app.isPackaged && process.env.BILLAPP_ALLOW_MULTI_INSTANCE === '1');
 
 let mainWindow = null;
 let backendHandle = null;
 let isQuitting = false;
 let stopInFlight = null;
 let appUpdaterController = null;
+let trustedOrigins = [];
+let sessionSecurityConfigured = false;
 
 if (!ALLOW_MULTI) {
   const gotLock = app.requestSingleInstanceLock();
@@ -51,10 +56,126 @@ function resolveIconPath() {
   return undefined;
 }
 
+function sanitizeDownloadFilename(rawName, fallback = 'billapp-export.dat') {
+  const base = path.basename(String(rawName || '').trim()).replace(/[\r\n\0<>:"/\\|?*]+/g, '_');
+  if (!base || base === '.' || base === '..') {
+    return fallback;
+  }
+  return base;
+}
+
+function getOrCreateSafeStorageMasterKey() {
+  try {
+    if (!safeStorage || typeof safeStorage.isEncryptionAvailable !== 'function' || !safeStorage.isEncryptionAvailable()) {
+      return { masterKey: null, secretBackend: null };
+    }
+    const keyFile = path.join(app.getPath('userData'), 'secret-key.bin');
+    if (fs.existsSync(keyFile)) {
+      const cipherBuf = fs.readFileSync(keyFile);
+      const decrypted = safeStorage.decryptString(cipherBuf).trim();
+      if (decrypted) {
+        return { masterKey: decrypted, secretBackend: 'electron_safe_storage' };
+      }
+    }
+    const freshKey = crypto.randomBytes(32).toString('hex');
+    const encrypted = safeStorage.encryptString(freshKey);
+    fs.mkdirSync(path.dirname(keyFile), { recursive: true });
+    fs.writeFileSync(keyFile, encrypted, { mode: 0o600 });
+    return { masterKey: freshKey, secretBackend: 'electron_safe_storage' };
+  } catch (err) {
+    console.warn('[security] Electron safeStorage unavailable; falling back to backend keystore:', err?.message || err);
+    return { masterKey: null, secretBackend: null };
+  }
+}
+
+function assertTrustedIpcSender(event) {
+  const frameUrl = event?.senderFrame?.url || '';
+  if (!frameUrl || !isAllowedUiUrl(frameUrl, trustedOrigins)) {
+    throw new Error('Blocked IPC request from untrusted origin');
+  }
+  if (mainWindow && !mainWindow.isDestroyed() && event.sender !== mainWindow.webContents) {
+    throw new Error('Blocked IPC request from unexpected WebContents');
+  }
+}
+
+function configureSessionSecurity(sess, allowedOrigins) {
+  trustedOrigins = Array.from(new Set(allowedOrigins));
+  if (sessionSecurityConfigured) {
+    return;
+  }
+  sessionSecurityConfigured = true;
+
+  // Deny all browser permission requests (camera, mic, geolocation, clipboard, notifications, etc.)
+  sess.setPermissionRequestHandler((_wc, _permission, callback) => {
+    callback(false);
+  });
+  if (typeof sess.setPermissionCheckHandler === 'function') {
+    sess.setPermissionCheckHandler(() => false);
+  }
+
+  // Inject local per-session API auth token ONLY to trusted local backend/UI origins
+  sess.webRequest.onBeforeSendHeaders((details, callback) => {
+    const headers = { ...details.requestHeaders };
+    if (backendHandle && backendHandle.apiToken) {
+      try {
+        const parsed = new URL(details.url);
+        const backendOrigin = new URL(backendHandle.url).origin;
+        const isBackendTarget = parsed.origin === backendOrigin;
+        const isDevProxyTarget =
+          !app.isPackaged &&
+          trustedOrigins.includes(parsed.origin) &&
+          (parsed.pathname.startsWith('/api/') ||
+            parsed.pathname === '/openapi.json' ||
+            parsed.pathname === '/docs');
+        if (isBackendTarget || isDevProxyTarget) {
+          headers['X-BillApp-Token'] = backendHandle.apiToken;
+        }
+      } catch {
+        // ignore invalid URL
+      }
+    }
+    callback({ requestHeaders: headers });
+  });
+
+  // Inject strict Content-Security-Policy for local UI documents
+  sess.webRequest.onHeadersReceived((details, callback) => {
+    const responseHeaders = { ...(details.responseHeaders || {}) };
+    try {
+      const parsed = new URL(details.url);
+      if (trustedOrigins.includes(parsed.origin) && details.resourceType === 'mainFrame') {
+        const backendOrigin = backendHandle ? new URL(backendHandle.url).origin : parsed.origin;
+        const connectSources = ["'self'", backendOrigin];
+        if (!app.isPackaged) {
+          connectSources.push('ws://127.0.0.1:*', 'ws://localhost:*');
+        }
+        const csp = [
+          "default-src 'self'",
+          "script-src 'self'",
+          "style-src 'self' 'unsafe-inline'",
+          "img-src 'self' data: blob:",
+          "font-src 'self' data:",
+          `connect-src ${Array.from(new Set(connectSources)).join(' ')}`,
+          "object-src 'none'",
+          "base-uri 'self'",
+          "frame-ancestors 'none'",
+          "form-action 'self'",
+        ].join('; ');
+        responseHeaders['Content-Security-Policy'] = [csp];
+      }
+    } catch {
+      // ignore invalid URL
+    }
+    callback({ responseHeaders });
+  });
+}
+
 function getUiEntryUrl() {
-  const devUrl = (process.env.BILLAPP_DEV_URL || '').trim();
-  if (devUrl) {
-    return devUrl;
+  // Never trust BILLAPP_DEV_URL in packaged production builds (S-04)
+  if (!app.isPackaged) {
+    const devUrl = (process.env.BILLAPP_DEV_URL || '').trim();
+    if (devUrl) {
+      return devUrl;
+    }
   }
   if (!backendHandle) {
     throw new Error('Backend server is not running.');
@@ -134,6 +255,7 @@ function createMainWindow() {
   if (backendHandle) {
     allowedOrigins.push(new URL(backendHandle.url).origin);
   }
+  configureSessionSecurity(session.defaultSession, allowedOrigins);
 
   const win = new BrowserWindow({
     width: 1280,
@@ -150,6 +272,7 @@ function createMainWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      webviewTag: false,
     },
   });
 
@@ -160,10 +283,10 @@ function createMainWindow() {
   win.webContents.setWindowOpenHandler(({ url }) => {
     try {
       const parsed = new URL(url);
-      // Convert API export/backup window.open calls cleanly into native downloads
+      // Convert API export window.open calls cleanly into native downloads
       if (
         allowedOrigins.includes(parsed.origin) &&
-        (parsed.pathname.startsWith('/api/export') || parsed.pathname.startsWith('/api/backup'))
+        parsed.pathname.startsWith('/api/export')
       ) {
         win.webContents.downloadURL(url);
         return { action: 'deny' };
@@ -184,12 +307,14 @@ function createMainWindow() {
   });
 
   win.webContents.session.on('will-download', (_event, item) => {
-    const filename = item.getFilename() || 'billapp-export.xlsx';
-    const testDir = (process.env.BILLAPP_TEST_DOWNLOAD_DIR || '').trim();
-    if (testDir) {
-      fs.mkdirSync(testDir, { recursive: true });
-      item.setSavePath(path.join(testDir, filename));
-      return;
+    const filename = sanitizeDownloadFilename(item.getFilename(), 'billapp-export.xlsx');
+    if (!app.isPackaged) {
+      const testDir = (process.env.BILLAPP_TEST_DOWNLOAD_DIR || '').trim();
+      if (testDir) {
+        fs.mkdirSync(testDir, { recursive: true });
+        item.setSavePath(path.join(testDir, filename));
+        return;
+      }
     }
     const downloadsDir = app.getPath('downloads');
     item.setSaveDialogOptions({
@@ -204,7 +329,7 @@ function createMainWindow() {
     }
   });
 
-  if (process.env.BILLAPP_OPEN_DEVTOOLS === '1' && !SMOKE_TEST) {
+  if (!app.isPackaged && process.env.BILLAPP_OPEN_DEVTOOLS === '1' && !SMOKE_TEST) {
     win.webContents.openDevTools({ mode: 'detach' });
   }
 
@@ -233,30 +358,47 @@ function getAppUpdaterController() {
 function registerIpcHandlers() {
   const updater = getAppUpdaterController();
 
-  ipcMain.handle('bill:get-desktop-info', () => ({
-    platform: process.platform,
-    isPackaged: app.isPackaged,
-    appVersion: app.getVersion(),
-    backendUrl: backendHandle ? backendHandle.url : undefined,
-    installMode: updater.getState().installMode,
-  }));
+  ipcMain.handle('bill:get-desktop-info', (event) => {
+    assertTrustedIpcSender(event);
+    return {
+      platform: process.platform,
+      isPackaged: app.isPackaged,
+      appVersion: app.getVersion(),
+      backendUrl: backendHandle ? backendHandle.url : undefined,
+      installMode: updater.getState().installMode,
+    };
+  });
 
-  ipcMain.handle('bill:updater-get-state', () => updater.getState());
-  ipcMain.handle('bill:updater-check', () => updater.checkForUpdates({ silent: false }));
-  ipcMain.handle('bill:updater-download', () => updater.downloadUpdate());
-  ipcMain.handle('bill:updater-quit-and-install', () => updater.quitAndInstall());
-  ipcMain.handle('bill:updater-open-release', () => updater.openReleasePage());
+  ipcMain.handle('bill:updater-get-state', (event) => {
+    assertTrustedIpcSender(event);
+    return updater.getState();
+  });
+  ipcMain.handle('bill:updater-check', (event) => {
+    assertTrustedIpcSender(event);
+    return updater.checkForUpdates({ silent: false });
+  });
+  ipcMain.handle('bill:updater-download', (event) => {
+    assertTrustedIpcSender(event);
+    return updater.downloadUpdate();
+  });
+  ipcMain.handle('bill:updater-quit-and-install', (event) => {
+    assertTrustedIpcSender(event);
+    return updater.quitAndInstall();
+  });
+  ipcMain.handle('bill:updater-open-release', (event) => {
+    assertTrustedIpcSender(event);
+    return updater.openReleasePage();
+  });
 
-  ipcMain.handle('bill:save-database-backup', async (_event, payload = {}) => {
+  ipcMain.handle('bill:save-database-backup', async (event, payload = {}) => {
+    assertTrustedIpcSender(event);
     if (!backendHandle) {
       return { ok: false, cancelled: false, error: '后台服务尚未就绪' };
     }
 
-    let filename = String(payload?.defaultFilename || '').trim();
-    if (!filename) {
-      const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
-      filename = `billapp-backup-${stamp}.db`;
-    }
+    const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+    const defaultFallback = `billapp-backup-${stamp}.db`;
+    let filename = sanitizeDownloadFilename(payload?.defaultFilename, defaultFallback);
     if (!filename.toLowerCase().endsWith('.db')) {
       filename = `${filename}.db`;
     }
@@ -287,7 +429,10 @@ function registerIpcHandlers() {
     }
 
     try {
-      const { buffer } = await httpPostBuffer(`${backendHandle.url}/api/backup`, 30000);
+      const headers = backendHandle.apiToken
+        ? { 'X-BillApp-Token': backendHandle.apiToken }
+        : {};
+      const { buffer } = await httpPostBuffer(`${backendHandle.url}/api/backup`, 30000, headers);
       await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
       await fs.promises.writeFile(targetPath, buffer);
       return {
@@ -312,23 +457,28 @@ async function ensureBackendStarted() {
     return backendHandle;
   }
 
-  const externalUrl = (process.env.BILLAPP_BACKEND_URL || '').trim();
-  if (externalUrl) {
-    const parsed = new URL(externalUrl);
-    backendHandle = {
-      host: parsed.hostname,
-      port: Number(parsed.port) || 8000,
-      url: externalUrl.replace(/\/+$/, ''),
-      dbPath: parseDbCliArg() || process.env.BILLAPP_DB_PATH || null,
-      frontendDist: resolveFrontendDistDir(),
-      stop: async () => {},
-      isRunning: () => true,
-    };
-    return backendHandle;
+  // Never trust external BILLAPP_BACKEND_URL override in packaged builds (S-04)
+  if (!app.isPackaged) {
+    const externalUrl = (process.env.BILLAPP_BACKEND_URL || '').trim();
+    if (externalUrl) {
+      const parsed = new URL(externalUrl);
+      backendHandle = {
+        host: parsed.hostname,
+        port: Number(parsed.port) || 8000,
+        url: externalUrl.replace(/\/+$/, ''),
+        apiToken: (process.env.BILLAPP_API_TOKEN || '').trim() || null,
+        dbPath: parseDbCliArg() || process.env.BILLAPP_DB_PATH || null,
+        frontendDist: resolveFrontendDistDir(),
+        stop: async () => {},
+        isRunning: () => true,
+      };
+      return backendHandle;
+    }
   }
 
   const dbPath = parseDbCliArg() || (process.env.BILLAPP_DB_PATH || '').trim() || null;
-  const requestedPort = Number(process.env.BILLAPP_BACKEND_PORT || 0) || 0;
+  const requestedPort = !app.isPackaged ? Number(process.env.BILLAPP_BACKEND_PORT || 0) || 0 : 0;
+  const { masterKey, secretBackend } = getOrCreateSafeStorageMasterKey();
 
   backendHandle = await startBackend({
     isPackaged: app.isPackaged,
@@ -337,6 +487,8 @@ async function ensureBackendStarted() {
     requestedPort,
     dbPath,
     frontendDir: resolveFrontendDistDir(),
+    masterKey,
+    secretBackend,
   });
   return backendHandle;
 }
@@ -409,6 +561,12 @@ async function loadAndMaybeSmokeTest({ win, uiUrl }) {
 
   console.log(`BILLAPP_ELECTRON_SMOKETEST_OK ${JSON.stringify(probe)}`);
 }
+
+app.on('web-contents-created', (_event, contents) => {
+  contents.on('will-attach-webview', (event) => {
+    event.preventDefault();
+  });
+});
 
 app.on('second-instance', () => {
   if (mainWindow) {

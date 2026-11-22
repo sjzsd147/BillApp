@@ -2,6 +2,7 @@ import { defineStore } from 'pinia';
 import { ref } from 'vue';
 import { getSystemMeta } from '@/api/meta';
 import { getLLMStatus } from '@/api/llm';
+import { getSettings } from '@/api/settings';
 import {
   checkForUpdatesViaDesktop,
   downloadUpdateViaDesktop,
@@ -10,7 +11,7 @@ import {
   openReleasePageViaDesktop,
   subscribeDesktopUpdater,
 } from '@/utils/desktop';
-import type { CategoryItemOut, MetaAccount, LLMStatusResponse } from '@/types/api';
+import type { CategoryItemOut, GeneralSettings, MetaAccount, LLMStatusResponse } from '@/types/api';
 
 export const useAppStore = defineStore('app', () => {
   const version = ref('1.2.1');
@@ -23,6 +24,11 @@ export const useAppStore = defineStore('app', () => {
 
   // Global search input state
   const globalSearchQuery = ref('');
+
+  // Global UI preferences synced from /api/settings (S-11, B-03)
+  const amountPrivacy = ref(false);
+  const tableDensity = ref<'standard' | 'compact'>('standard');
+  const learningSuggestionsEnabled = ref(true);
 
   // Global LLM status
   const llmStatus = ref<LLMStatusResponse | null>(null);
@@ -46,6 +52,28 @@ export const useAppStore = defineStore('app', () => {
       console.error('Failed to load system meta', e);
     } finally {
       loading.value = false;
+    }
+  }
+
+  function applyGeneralSettings(general?: Partial<GeneralSettings> | null) {
+    if (!general) return;
+    if (typeof general.amount_privacy === 'boolean') {
+      amountPrivacy.value = general.amount_privacy;
+    }
+    if (general.table_density === 'compact' || general.table_density === 'standard') {
+      tableDensity.value = general.table_density;
+    }
+    if (typeof general.learning_suggestions_enabled === 'boolean') {
+      learningSuggestionsEnabled.value = general.learning_suggestions_enabled;
+    }
+  }
+
+  async function fetchGeneralSettings() {
+    try {
+      const settings = await getSettings();
+      applyGeneralSettings(settings.general);
+    } catch (e) {
+      console.error('Failed to load general settings', e);
     }
   }
 
@@ -133,9 +161,14 @@ export const useAppStore = defineStore('app', () => {
     initialized,
     loading,
     globalSearchQuery,
+    amountPrivacy,
+    tableDensity,
+    learningSuggestionsEnabled,
     llmStatus,
     updateState,
     fetchMeta,
+    fetchGeneralSettings,
+    applyGeneralSettings,
     fetchLLMStatus,
     initDesktopUpdater,
     checkForUpdates,

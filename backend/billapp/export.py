@@ -15,9 +15,15 @@ from billapp.stats import build_stats_filters
 
 
 def sanitize_cell_value(val: Any) -> Any:
-    """Sanitize string values starting with formula prefix tokens (=, +, -, @) to prevent CSV/Excel formula injection."""
-    if isinstance(val, str) and val and val[0] in ("=", "+", "-", "@"):
-        return f"'{val}"
+    """Sanitize string values that could trigger CSV/Excel formula injection.
+
+    Neutralizes leading '=', '+', '-', '@', tab/newline/CR characters, as well
+    as leading whitespace followed by any formula trigger character.
+    """
+    if isinstance(val, str) and val:
+        stripped = val.lstrip(" \t\r\n")
+        if val[0] in ("\t", "\r", "\n") or (stripped and stripped[0] in ("=", "+", "-", "@")):
+            return f"'{val}"
     return val
 
 
@@ -105,7 +111,7 @@ def generate_excel_export(
                t.amount_cents, t.refunded_cents, t.pay_method, t.duplicate_of, t.refund_of,
                t.transfer_peer, t.excluded, t.note, t.currency,
                t.amount_cny, t.fx_rate, t.fx_rate_at, t.fx_rate_source,
-               c.name AS cat_name, p.name AS parent_cat_name,
+               c.key AS cat_key, c.name AS cat_name, p.name AS parent_cat_name,
                a.bank, a.tail, a.alias
         FROM transactions t
         LEFT JOIN categories c ON t.category_id = c.id
@@ -178,22 +184,22 @@ def generate_excel_export(
 
         row_vals = [
             idx,
-            r["txn_time"],
-            source_labels.get(r["source"], r["source"]),
+            sanitize_cell_value(r["txn_time"] or ""),
+            sanitize_cell_value(source_labels.get(r["source"], r["source"]) or ""),
             sanitize_cell_value(r["counterparty"] or ""),
             sanitize_cell_value(r["description"] or ""),
-            direction_labels.get(r["direction"], r["direction"]),
+            sanitize_cell_value(direction_labels.get(r["direction"], r["direction"]) or ""),
             amt_yuan,
             ref_yuan,
             net_yuan,
-            root_cat,
-            sub_cat,
+            sanitize_cell_value(root_cat),
+            sanitize_cell_value(sub_cat),
             sanitize_cell_value(acc_label),
             sanitize_cell_value(r["pay_method"] or ""),
-            status_tag,
-            excluded_str,
+            sanitize_cell_value(status_tag),
+            sanitize_cell_value(excluded_str),
             sanitize_cell_value(r["note"] or ""),
-            curr_code,
+            sanitize_cell_value(curr_code),
             fx_rate_val,
             cny_equiv_yuan,
         ]
@@ -217,11 +223,17 @@ def generate_excel_export(
             else:
                 cell.alignment = align_left
 
-        # Collect for Sheet 2 aggregation if valid expense (excluding missing FX transactions)
+        # Collect for Sheet 2 aggregation if valid expense (excluding internal transfers and missing FX)
+        is_internal_transfer = (
+            r["transfer_peer"] is not None
+            or r["cat_key"] == "financial.internal_transfer"
+            or r["cat_name"] in ("内部转账", "资金互转")
+        )
         if (
             r["direction"] == "expense"
             and r["duplicate_of"] is None
             and r["excluded"] == 0
+            and not is_internal_transfer
         ):
             if r["currency"] == "CNY" or r["currency"] is None:
                 month_str = r["txn_time"][:7]  # 'YYYY-MM'
@@ -291,7 +303,7 @@ def generate_excel_export(
         ]
         sum_formula = f"=SUM({first_month_col_letter}{cur_p_row}:{last_month_col_letter}{cur_p_row})"
 
-        p_row_vals = [root_cat, sub_cat] + month_vals + [sum_formula]
+        p_row_vals = [sanitize_cell_value(root_cat), sanitize_cell_value(sub_cat)] + month_vals + [sum_formula]
         ws2.append(p_row_vals)
 
         for c_idx in range(1, len(p_row_vals) + 1):

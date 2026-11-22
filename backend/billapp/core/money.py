@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import re
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Union
 
 CURRENCY_SYMBOLS: dict[str, str] = {
@@ -16,14 +17,17 @@ CURRENCY_SYMBOLS: dict[str, str] = {
 }
 
 _CLEAN_AMOUNT_PATTERN = re.compile(r"[^\d.\-+]")
+_CURRENCY_STRIP_PATTERN = re.compile(r"[\s¥￥$€£,，元块]")
+_SCI_DECIMAL_PATTERN = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
 
 
 def to_cents(value: Union[str, int, float, Decimal, None]) -> int:
     """Convert arbitrary currency representation to exact integer cents.
 
     Handles strings with currency symbols ('¥123.45', '$14.97'), commas ('1,029.80'),
-    signed floats, and Decimals. Guarantees no floating-point rounding errors by using
-    Decimal with ROUND_HALF_UP.
+    scientific notation ('1e3' -> 100000), signed floats, and Decimals.
+    Rejects booleans and non-finite floats (NaN/Infinity). Guarantees no
+    floating-point rounding errors by using Decimal with ROUND_HALF_UP.
 
     Examples:
         to_cents("123.45") -> 12345
@@ -33,9 +37,18 @@ def to_cents(value: Union[str, int, float, Decimal, None]) -> int:
     """
     if value is None:
         return 0
+    if isinstance(value, bool):
+        raise ValueError(f"Invalid monetary value (boolean not allowed): {value!r}")
     if isinstance(value, int):
         return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"Invalid non-finite monetary value: {value!r}")
+        dec = Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return int(dec * 100)
     if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError(f"Invalid non-finite monetary value: {value!r}")
         d = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         return int(d * 100)
 
@@ -43,13 +56,28 @@ def to_cents(value: Union[str, int, float, Decimal, None]) -> int:
     if not val_str:
         return 0
 
-    # Remove currency symbols, commas, spaces, '元'
+    # First check direct numeric / scientific notation after stripping currency markers & commas
+    sci_candidate = _CURRENCY_STRIP_PATTERN.sub("", val_str)
+    if sci_candidate and _SCI_DECIMAL_PATTERN.match(sci_candidate):
+        try:
+            dec = Decimal(sci_candidate)
+            if not dec.is_finite():
+                raise ValueError(f"Invalid non-finite monetary value: {value!r}")
+            dec = dec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            return int(dec * 100)
+        except InvalidOperation as e:
+            raise ValueError(f"Invalid monetary value: {value!r}") from e
+
+    # Remove currency symbols, commas, spaces, '元', labels
     cleaned = _CLEAN_AMOUNT_PATTERN.sub("", val_str)
     if not cleaned or cleaned in ("-", "+", "."):
         return 0
 
     try:
-        dec = Decimal(cleaned).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        dec = Decimal(cleaned)
+        if not dec.is_finite():
+            raise ValueError(f"Invalid non-finite monetary value: {value!r}")
+        dec = dec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         return int(dec * 100)
     except Exception as e:
         raise ValueError(f"Invalid monetary value: {value!r}") from e

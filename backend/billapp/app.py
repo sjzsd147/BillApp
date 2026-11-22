@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import hmac
 import logging
+import math
+import os
 from pathlib import Path
 import sqlite3
 from typing import Any, Generator, Optional, Union
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from billapp.classify.categories import CategoryService
 from billapp.core.db import create_connection, get_default_db_path, init_db
@@ -134,8 +138,48 @@ async def lifespan(app: FastAPI):
 # Application Factory
 # =========================================================================
 
-def create_app(db_path: Optional[Union[str, Path]] = None) -> FastAPI:
-    """FastAPI application factory supporting configurable SQLite database path."""
+def _extract_host_hostname(host_header: str) -> str:
+    """Extract lowercase hostname from an HTTP Host header (supporting IPv6 brackets and ports)."""
+    raw = (host_header or "").strip().lower()
+    if not raw:
+        return ""
+    if raw.startswith("["):
+        end = raw.find("]")
+        if end != -1:
+            return raw[1:end]
+        return raw
+    if ":" in raw:
+        return raw.rsplit(":", 1)[0]
+    return raw
+
+
+def _resolve_allowed_origins() -> list[str]:
+    """Build explicit local CORS allowlist without wildcards."""
+    origins: list[str] = []
+    env_origins = os.environ.get("BILLAPP_ALLOWED_ORIGINS", "").strip()
+    if env_origins:
+        for item in env_origins.split(","):
+            cleaned = item.strip().rstrip("/")
+            if cleaned and cleaned != "*":
+                origins.append(cleaned)
+    if os.environ.get("BILLAPP_DEV_MODE", "").strip().lower() in ("1", "true", "yes"):
+        for dev_origin in (
+            "http://127.0.0.1:5173",
+            "http://localhost:5173",
+            "http://127.0.0.1:8000",
+            "http://localhost:8000",
+        ):
+            if dev_origin not in origins:
+                origins.append(dev_origin)
+    return origins
+
+
+def create_app(
+    db_path: Optional[Union[str, Path]] = None,
+    api_token: Optional[str] = None,
+    bootstrap_token: Optional[str] = None,
+) -> FastAPI:
+    """FastAPI application factory supporting configurable SQLite database path and local token auth."""
     app = FastAPI(
         title="账单综合管理系统 API",
         version=APP_VERSION,
@@ -144,20 +188,112 @@ def create_app(db_path: Optional[Union[str, Path]] = None) -> FastAPI:
     )
     app.state.db_path = db_path if db_path is not None else get_default_db_path()
 
-    # CORS configuration
+    effective_api_token = (
+        api_token if api_token is not None else (os.environ.get("BILLAPP_API_TOKEN") or "").strip() or None
+    )
+    effective_boot_token = (
+        bootstrap_token
+        if bootstrap_token is not None
+        else (os.environ.get("BILLAPP_BOOTSTRAP_TOKEN") or "").strip() or None
+    )
+    app.state.api_token = effective_api_token
+    app.state.bootstrap_token = effective_boot_token
+
+    allowed_origins = _resolve_allowed_origins()
+    allowed_origin_set = set(allowed_origins)
+
+    # Strict CORS configuration: never allow wildcard "*"
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
-            "http://localhost:8000",
-            "http://127.0.0.1:8000",
-            "*",
-        ],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=allowed_origins,
+        allow_credentials=bool(allowed_origins),
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type", "X-BillApp-Token", "Accept"],
     )
+
+    # Local security middleware: Host DNS-rebinding defense, Origin CSRF defense, and Token auth
+    @app.middleware("http")
+    async def local_security_middleware(request: Request, call_next):
+        token = getattr(app.state, "api_token", None)
+
+        # 1. Host header allowlist (blocks DNS rebinding)
+        host_header = (request.headers.get("host") or "").strip()
+        hostname = _extract_host_hostname(host_header)
+        allowed_hosts = {"127.0.0.1", "localhost", "::1"}
+        if token is None:
+            allowed_hosts.add("testserver")
+        if hostname not in allowed_hosts:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "code": "INVALID_HOST",
+                    "message": "拒绝非本机 Host 请求头",
+                    "details": hostname,
+                },
+            )
+
+        # 2. Cross-origin check for state-changing requests
+        if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            origin = (request.headers.get("origin") or "").strip().rstrip("/")
+            if origin:
+                parsed = urlparse(origin)
+                origin_norm = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}" if parsed.scheme and parsed.netloc else ""
+                same_origin_http = f"http://{host_header.lower()}"
+                same_origin_https = f"https://{host_header.lower()}"
+                if origin_norm not in allowed_origin_set and origin_norm not in (same_origin_http, same_origin_https):
+                    return JSONResponse(
+                        status_code=403,
+                        content={
+                            "code": "FORBIDDEN_ORIGIN",
+                            "message": "已拦截跨站写操作请求",
+                            "details": origin,
+                        },
+                    )
+
+        # 3. Standalone browser one-time bootstrap token -> HttpOnly SameSite=Strict session cookie
+        if (
+            token
+            and request.method == "GET"
+            and request.url.path == "/"
+            and "boot_token" in request.query_params
+        ):
+            boot_expected = getattr(app.state, "bootstrap_token", None)
+            provided_boot = request.query_params.get("boot_token", "")
+            if boot_expected and hmac.compare_digest(provided_boot, boot_expected):
+                app.state.bootstrap_token = None
+                resp = RedirectResponse(url="/", status_code=302)
+                resp.set_cookie(
+                    key="billapp_session",
+                    value=token,
+                    httponly=True,
+                    samesite="strict",
+                    path="/",
+                )
+                return resp
+
+        # 4. Enforce local API token on /api/* (except /api/health) and OpenAPI docs
+        path = request.url.path
+        protected = (
+            (path.startswith("/api/") and path != "/api/health")
+            or path in ("/docs", "/redoc", "/openapi.json")
+        )
+        if token and request.method != "OPTIONS" and protected:
+            hdr_token = (request.headers.get("x-billapp-token") or "").strip()
+            cookie_token = (request.cookies.get("billapp_session") or "").strip()
+            authorized = (
+                (bool(hdr_token) and hmac.compare_digest(hdr_token, token))
+                or (bool(cookie_token) and hmac.compare_digest(cookie_token, token))
+            )
+            if not authorized:
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "code": "UNAUTHORIZED",
+                        "message": "缺少或无效的本地会话鉴权令牌",
+                    },
+                )
+
+        return await call_next(request)
 
     # Custom Exception Handlers
     @app.exception_handler(AppException)
@@ -167,11 +303,35 @@ def create_app(db_path: Optional[Union[str, Path]] = None) -> FastAPI:
             content={"code": exc.code, "message": exc.message, "details": exc.details},
         )
 
+    def _sanitize_for_json(obj: Any) -> Any:
+        if isinstance(obj, float):
+            return obj if math.isfinite(obj) else str(obj)
+        if isinstance(obj, dict):
+            return {str(k): _sanitize_for_json(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_sanitize_for_json(v) for v in obj]
+        if isinstance(obj, (str, int, bool)) or obj is None:
+            return obj
+        return str(obj)
+
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
         return JSONResponse(
             status_code=422,
-            content={"code": "VALIDATION_ERROR", "message": "字段校验错误", "details": exc.errors()},
+            content={
+                "code": "VALIDATION_ERROR",
+                "message": "字段校验错误",
+                "details": _sanitize_for_json(exc.errors()),
+            },
+        )
+
+    @app.exception_handler(sqlite3.IntegrityError)
+    async def sqlite_integrity_handler(request: Request, exc: sqlite3.IntegrityError):
+        err_msg = str(exc)
+        status_code = 409 if "unique" in err_msg.lower() else 400
+        return JSONResponse(
+            status_code=status_code,
+            content={"code": "INTEGRITY_ERROR", "message": "数据完整性约束校验失败", "details": err_msg},
         )
 
     @app.exception_handler(sqlite3.OperationalError)

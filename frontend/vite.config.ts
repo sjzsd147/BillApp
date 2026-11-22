@@ -3,6 +3,7 @@ import vue from '@vitejs/plugin-vue';
 import path from 'path';
 
 const apiTarget = process.env.VITE_API_TARGET || 'http://127.0.0.1:8000';
+const apiToken = (process.env.BILLAPP_API_TOKEN || '').trim();
 const proxyPaths = ['/api', '/docs', '/openapi.json'] as const;
 
 export default defineConfig({
@@ -17,7 +18,14 @@ export default defineConfig({
     host: '127.0.0.1',
     port: 5173,
     proxy: Object.fromEntries(
-      proxyPaths.map((p) => [p, { target: apiTarget, changeOrigin: true }])
+      proxyPaths.map((p) => [
+        p,
+        {
+          target: apiTarget,
+          changeOrigin: true,
+          ...(apiToken ? { headers: { 'X-BillApp-Token': apiToken } } : {}),
+        },
+      ])
     ),
   },
   build: {

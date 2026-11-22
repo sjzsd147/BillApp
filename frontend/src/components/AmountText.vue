@@ -1,5 +1,11 @@
 <template>
-  <div v-if="isForeign" class="amount-container" :class="{ 'is-inline': fxDisplay === 'inline' }">
+  <div
+    v-if="isForeign"
+    class="amount-container"
+    :class="{ 'is-inline': fxDisplay === 'inline', 'is-privacy-masked': isMasked }"
+    @mouseenter="hoverRevealed = true"
+    @mouseleave="hoverRevealed = false"
+  >
     <span
       class="amount-text tabular-nums"
       :class="[directionClass, { 'is-bold': bold }]"
@@ -9,7 +15,7 @@
     </span>
 
     <template v-if="amountCny !== null && amountCny !== undefined">
-      <el-tooltip :content="fxTooltipText" placement="top" :disabled="!fxTooltipText">
+      <el-tooltip :content="fxTooltipText" placement="top" :disabled="!fxTooltipText || isMasked">
         <span class="fx-cny-text tabular-nums">≈ {{ formattedCnyValue }}</span>
       </el-tooltip>
     </template>
@@ -27,15 +33,19 @@
   <span
     v-else
     class="amount-text tabular-nums"
-    :class="[directionClass, { 'is-bold': bold }]"
+    :class="[directionClass, { 'is-bold': bold, 'is-privacy-masked': isMasked }]"
     :style="{ fontSize: size }"
+    @mouseenter="hoverRevealed = true"
+    @mouseleave="hoverRevealed = false"
   >
     {{ formattedValue }}
   </span>
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
+import { getActivePinia } from 'pinia';
+import { useAppStore } from '@/stores/app';
 import { formatAmount, getCurrencySymbol } from '@/utils/money';
 import type { DirectionType } from '@/types/api';
 
@@ -72,13 +82,26 @@ const props = withDefaults(
     symbol: undefined,
     bold: false,
     size: 'inherit',
-    privacy: false,
+    privacy: undefined,
   }
 );
 
 const emit = defineEmits<{
   (e: 'clickPendingFx'): void;
 }>();
+
+const activePinia = getActivePinia();
+const appStore = activePinia ? useAppStore(activePinia) : null;
+const hoverRevealed = ref(false);
+
+const effectivePrivacy = computed(() => {
+  if (props.privacy !== undefined) {
+    return props.privacy;
+  }
+  return appStore ? appStore.amountPrivacy : false;
+});
+
+const isMasked = computed(() => effectivePrivacy.value && !hoverRevealed.value);
 
 const effectiveCents = computed(() => {
   return props.value ?? props.amountCents ?? props.cents ?? 0;
@@ -94,7 +117,7 @@ const effectiveSymbol = computed(() => {
 });
 
 const formattedValue = computed(() => {
-  if (props.privacy) {
+  if (isMasked.value) {
     return `${effectiveSymbol.value}••••`;
   }
   return formatAmount(effectiveCents.value, {
@@ -105,7 +128,7 @@ const formattedValue = computed(() => {
 });
 
 const formattedOriginalValue = computed(() => {
-  if (props.privacy) {
+  if (isMasked.value) {
     return `${effectiveSymbol.value}••••`;
   }
   return formatAmount(effectiveCents.value, {
@@ -116,7 +139,7 @@ const formattedOriginalValue = computed(() => {
 });
 
 const formattedCnyValue = computed(() => {
-  if (props.privacy) {
+  if (isMasked.value) {
     return '¥••••';
   }
   if (props.amountCny === null || props.amountCny === undefined) {

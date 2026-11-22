@@ -5,11 +5,14 @@ Provides rates management, missing FX refresh, and manual rate entry per Milesto
 
 from __future__ import annotations
 
+from datetime import datetime
+import math
+import re
 import sqlite3
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from billapp.app import AppException, NotFoundError, ValidationError, get_db_conn
 from billapp.core.fx import (
@@ -56,11 +59,38 @@ class FxRefreshResponse(BaseModel):
 
 
 class FxManualRateRequest(BaseModel):
-    currency: str = Field(..., min_length=2, max_length=10)
-    rate: float = Field(..., gt=0)
+    currency: str = Field(..., min_length=3, max_length=3)
+    rate: float = Field(..., gt=0, le=1_000_000, allow_inf_nan=False)
     effective_date: str = Field(..., min_length=10, max_length=10)
     note: Optional[str] = None
     apply_to_all_missing: bool = False
+
+    @field_validator("currency")
+    @classmethod
+    def _validate_currency(cls, value: str) -> str:
+        curr = (value or "").strip().upper()
+        if not re.fullmatch(r"^[A-Z]{3}$", curr):
+            raise ValueError("币种必须是 3 位大写 ISO 字母代码（如 USD、EUR、HKD）")
+        return curr
+
+    @field_validator("effective_date")
+    @classmethod
+    def _validate_effective_date(cls, value: str) -> str:
+        date_str = (value or "").strip()
+        if not re.fullmatch(r"^\d{4}-\d{2}-\d{2}$", date_str):
+            raise ValueError("生效日期格式必须为 YYYY-MM-DD")
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError("生效日期不是有效的日历日期") from exc
+        return date_str
+
+    @field_validator("rate")
+    @classmethod
+    def _validate_rate(cls, value: float) -> float:
+        if not math.isfinite(value) or value <= 0 or value > 1_000_000:
+            raise ValueError("汇率必须为 (0, 1000000] 范围内的有限正数")
+        return value
 
 
 class FxManualRateResponse(BaseModel):
