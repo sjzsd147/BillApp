@@ -17,6 +17,7 @@ import httpx
 
 from billapp.core.secrets import (
     DPAPI_PREFIX,
+    ENCV1_PREFIX,
     B64_PREFIX,
     SecretDecryptionError,
     decrypt_secret,
@@ -429,6 +430,6 @@ class TestDPAPICorruptionResilience:
         """Sanity test: valid roundtrip encryption and decryption functions accurately."""
         original = "sk-deepseek-live-secret-test-key-12345678"
         encrypted = encrypt_secret(original)
-        assert encrypted.startswith(DPAPI_PREFIX) or encrypted.startswith(B64_PREFIX)
+        assert encrypted.startswith(DPAPI_PREFIX) or encrypted.startswith(ENCV1_PREFIX)
         decrypted = decrypt_secret(encrypted)
         assert decrypted == original
