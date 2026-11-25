@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from billapp.app import create_app
+from billapp.app import APP_VERSION, create_app
 
 
 @pytest.fixture
@@ -46,4 +46,4 @@ def test_api_health_works_with_static_mount(static_client: TestClient):
     """Test standard API endpoints work untouched when static distribution is mounted."""
     resp = static_client.get("/api/health")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok", "version": "1.2.3"}
+    assert resp.json() == {"status": "ok", "version": APP_VERSION}

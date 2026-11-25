@@ -983,3 +983,37 @@ export interface ResetDataResponse {
   success: boolean;
   message: string;
 }
+
+// ============================================================================
+// Diagnostic Logs (/api/logs/*)
+// ============================================================================
+
+export interface LogFileItemOut {
+  name: string;
+  size_bytes: number;
+  modified_at: string;
+}
+
+export interface LogsInfoOut {
+  log_dir: string;
+  active_log_path: string;
+  files: LogFileItemOut[];
+  total_size_bytes: number;
+  tail_lines: string[];
+  has_logs: boolean;
+}
+
+export interface FrontendLogEntry {
+  timestamp: string;
+  level: 'info' | 'warn' | 'error';
+  source: string;
+  message: string;
+  stack?: string;
+}
+
+export interface LogExportRequest {
+  format: 'zip' | 'log';
+  include_diagnostics?: boolean;
+  redact_pii?: boolean;
+  frontend_logs?: FrontendLogEntry[];
+}

@@ -1,6 +1,7 @@
 import axios, { type AxiosInstance, type AxiosRequestConfig } from 'axios';
 import { ElMessage } from 'element-plus';
 import type { ApiError } from '@/types/api';
+import { recordFrontendLog } from '@/utils/logCollector';
 
 const baseURL = typeof window !== 'undefined' && window.__BILL_API__ ? window.__BILL_API__ : '/api';
 
@@ -32,8 +33,14 @@ apiClient.interceptors.response.use(
       message = error.message;
     }
 
-    // Suppress noisy UI error toasts for silent background checks if requested
+    // Record sanitized API error into frontend runtime ring buffer (exclude URL query strings)
     const config = error.config as (AxiosRequestConfig & { silent?: boolean }) | undefined;
+    const reqMethod = String(config?.method || 'GET').toUpperCase();
+    const rawUrl = String(config?.url || '').split('?')[0];
+    const httpStatus = error.response?.status ? `HTTP ${error.response.status}` : 'NETWORK';
+    recordFrontendLog('error', 'api', `${reqMethod} ${rawUrl} -> ${httpStatus} [${code}] ${message}`);
+
+    // Suppress noisy UI error toasts for silent background checks if requested
     const toasted = !config?.silent;
     if (toasted) {
       ElMessage.error(message);

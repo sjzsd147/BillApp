@@ -23,6 +23,24 @@ export async function saveDatabaseBackupViaDesktop(
   return bridge.saveDatabaseBackup(defaultFilename);
 }
 
+export async function exportLogsViaDesktop(
+  options: DesktopExportLogsOptions
+): Promise<NativeSaveResult | null> {
+  const bridge = getDesktopBridge();
+  if (!bridge?.exportLogs) {
+    return null;
+  }
+  return bridge.exportLogs(options);
+}
+
+export async function getDesktopInfoViaDesktop(): Promise<BillDesktopInfo | null> {
+  const bridge = getDesktopBridge();
+  if (!bridge?.getDesktopInfo) {
+    return null;
+  }
+  return bridge.getDesktopInfo();
+}
+
 export async function getDesktopUpdaterState(): Promise<DesktopUpdateState | null> {
   const updater = getDesktopBridge()?.updater;
   if (!updater?.getState) {

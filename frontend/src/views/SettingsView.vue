@@ -444,9 +444,89 @@
             style="margin-top: 12px"
             @close="backupNotice = null"
           />
+
+          <el-divider />
+
+          <div class="card-header-flex" style="margin-bottom: 4px">
+            <div class="card-title" style="margin-bottom: 0">运行日志与诊断</div>
+            <el-tag size="small" type="info">{{ logSummaryBadge }}</el-tag>
+          </div>
+          <div class="log-meta-box">
+            <div class="info-item">
+              <span class="label">后端日志:</span>
+              <span class="val path-text">{{ logsInfo?.active_log_path || '-' }}</span>
+            </div>
+            <div v-if="desktopInfo?.desktopLogPath" class="info-item">
+              <span class="label">桌面壳日志:</span>
+              <span class="val path-text">{{ desktopInfo.desktopLogPath }}</span>
+            </div>
+            <div class="log-options-list">
+              <el-checkbox v-model="logExportOptions.includeDiagnostics">
+                附带系统环境与统计摘要（仅含计数，不含交易明细）
+              </el-checkbox>
+              <el-checkbox v-model="logExportOptions.redactPii">
+                自动脱敏银行卡号、手机号、持卡人姓名与本机路径（API Key 与会话令牌始终强制脱敏）
+              </el-checkbox>
+            </div>
+          </div>
+          <div class="data-actions-row">
+            <el-button
+              type="primary"
+              :loading="exportingLogs && exportingLogFormat === 'zip'"
+              :disabled="exportingLogs"
+              @click="handleExportLogs('zip')"
+            >
+              导出诊断日志包 (.zip)
+            </el-button>
+            <el-button
+              :loading="exportingLogs && exportingLogFormat === 'log'"
+              :disabled="exportingLogs"
+              @click="handleExportLogs('log')"
+            >
+              导出纯文本日志 (.log)
+            </el-button>
+            <el-button :loading="loadingLogsInfo" @click="openLogPreviewDialog">
+              查看最近日志
+            </el-button>
+          </div>
+          <div class="form-tip" style="margin-left: 0">
+            遇到账单导入异常、更新失败或界面报错时，可导出诊断日志用于排查；压缩包包含后端日志、桌面外壳日志及本次会话前端异常记录。
+          </div>
+          <el-alert
+            v-if="logExportNotice"
+            :title="logExportNotice.title"
+            :description="logExportNotice.description"
+            :type="logExportNotice.type"
+            show-icon
+            closable
+            style="margin-top: 12px"
+            @close="logExportNotice = null"
+          />
         </div>
       </el-tab-pane>
     </el-tabs>
+
+    <!-- Diagnostic Log Tail Preview Dialog -->
+    <el-dialog v-model="showLogPreviewDialog" title="最近运行日志预览（已脱敏）" width="760px">
+      <div class="log-preview-meta">
+        <span>日志路径：{{ logsInfo?.active_log_path || '-' }}</span>
+        <span>最近 {{ previewLogLinesCount }} 行</span>
+      </div>
+      <pre v-loading="loadingLogsInfo" class="log-preview-box">{{ previewLogText }}</pre>
+      <template #footer>
+        <div class="log-preview-footer">
+          <div class="log-preview-footer-left">
+            <el-button :loading="loadingLogsInfo" @click="loadLogsInfo(200)">刷新</el-button>
+            <el-button @click="handleCopyPreviewLogs">复制内容</el-button>
+          </div>
+          <div class="log-preview-footer-right">
+            <el-button :disabled="exportingLogs" @click="handleExportLogs('log')">导出 .log</el-button>
+            <el-button type="primary" :disabled="exportingLogs" @click="handleExportLogs('zip')">导出 .zip</el-button>
+            <el-button @click="showLogPreviewDialog = false">关闭</el-button>
+          </div>
+        </div>
+      </template>
+    </el-dialog>
 
     <!-- Reset Data Confirmation Dialog -->
     <el-dialog v-model="showResetDialog" title="清空账单数据" width="440px">
@@ -544,9 +624,22 @@ import {
 } from '@/api/settings';
 import { testLLM, listLLMModels } from '@/api/llm';
 import { getFxRates, refreshFx, saveFxRate } from '@/api/fx';
+import { getLogsInfo, exportLogs } from '@/api/logs';
 import { useAppStore } from '@/stores/app';
-import { isElectronDesktop, saveDatabaseBackupViaDesktop } from '@/utils/desktop';
-import type { SettingsOut, FxRatesResponse, FxRateItem, LLMModelInfo } from '@/types/api';
+import {
+  isElectronDesktop,
+  saveDatabaseBackupViaDesktop,
+  exportLogsViaDesktop,
+  getDesktopInfoViaDesktop,
+} from '@/utils/desktop';
+import { getFrontendLogs } from '@/utils/logCollector';
+import type {
+  SettingsOut,
+  FxRatesResponse,
+  FxRateItem,
+  LLMModelInfo,
+  LogsInfoOut,
+} from '@/types/api';
 
 const route = useRoute();
 const router = useRouter();
@@ -580,6 +673,61 @@ const backupNotice = ref<{
 const restoring = ref(false);
 const resetting = ref(false);
 const showResetDialog = ref(false);
+
+const logsInfo = ref<LogsInfoOut | null>(null);
+const desktopInfo = ref<BillDesktopInfo | null>(null);
+const loadingLogsInfo = ref(false);
+const exportingLogs = ref(false);
+const exportingLogFormat = ref<'zip' | 'log'>('zip');
+const showLogPreviewDialog = ref(false);
+const logExportOptions = reactive({
+  includeDiagnostics: true,
+  redactPii: true,
+});
+const logExportNotice = ref<{
+  type: 'success' | 'info' | 'warning' | 'error';
+  title: string;
+  description: string;
+} | null>(null);
+
+const logSummaryBadge = computed(() => {
+  const backendBytes = logsInfo.value?.total_size_bytes || 0;
+  const desktopBytes = desktopInfo.value?.desktopLogSizeBytes || 0;
+  const totalBytes = backendBytes + desktopBytes;
+  const fileCount = (logsInfo.value?.files?.length || 0) + (desktopInfo.value?.desktopLogFileCount || 0);
+  if (fileCount === 0) {
+    return '暂无磁盘日志';
+  }
+  return `${fileCount} 个文件 · ${formatBytes(totalBytes)}`;
+});
+
+const previewLogText = computed(() => {
+  const sections: string[] = [];
+  const backendTail = logsInfo.value?.tail_lines || [];
+  if (backendTail.length > 0) {
+    sections.push(backendTail.join('\n'));
+  }
+  const feLogs = getFrontendLogs();
+  if (feLogs.length > 0) {
+    const feLines = feLogs.map(
+      (entry) =>
+        `${entry.timestamp} [${entry.level.toUpperCase()}] [${entry.source}] ${entry.message}${
+          entry.stack ? `\n${entry.stack}` : ''
+        }`
+    );
+    sections.push(`--- 本次会话前端异常 (${feLogs.length} 条) ---\n${feLines.join('\n')}`);
+  }
+  if (sections.length === 0) {
+    return '当前暂无可预览的运行日志记录。';
+  }
+  return sections.join('\n\n');
+});
+
+const previewLogLinesCount = computed(() => {
+  const backendCount = logsInfo.value?.tail_lines?.length || 0;
+  const feCount = getFrontendLogs().length;
+  return backendCount + feCount;
+});
 
 const isDesktopEnv = computed(() => isElectronDesktop());
 const updateState = computed(() => appStore.updateState);
@@ -1211,9 +1359,207 @@ async function handleOpenReleasePage() {
   await appStore.openReleasePage();
 }
 
+async function loadLogsInfo(tailLines = 120) {
+  loadingLogsInfo.value = true;
+  try {
+    logsInfo.value = await getLogsInfo(tailLines, logExportOptions.redactPii);
+  } catch (e) {
+    console.error('Failed to load logs info', e);
+  } finally {
+    loadingLogsInfo.value = false;
+  }
+}
+
+async function loadDesktopInfo() {
+  try {
+    desktopInfo.value = await getDesktopInfoViaDesktop();
+  } catch {
+    desktopInfo.value = null;
+  }
+}
+
+async function openLogPreviewDialog() {
+  showLogPreviewDialog.value = true;
+  await loadLogsInfo(200);
+}
+
+async function handleCopyPreviewLogs() {
+  const text = previewLogText.value;
+  if (!text) return;
+  let copied = false;
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    } catch {
+      copied = false;
+    }
+  }
+  if (!copied) {
+    try {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      copied = document.execCommand('copy');
+      document.body.removeChild(textarea);
+    } catch {
+      copied = false;
+    }
+  }
+  if (copied) {
+    ElMessage.success('日志内容已复制到剪贴板');
+  } else {
+    ElMessage.error('复制失败，请直接导出日志文件');
+  }
+}
+
+async function handleExportLogs(format: 'zip' | 'log') {
+  exportingLogs.value = true;
+  exportingLogFormat.value = format;
+  logExportNotice.value = null;
+  const stamp = dayjs().format('YYYYMMDD-HHmmss');
+  const ext = format === 'zip' ? '.zip' : '.log';
+  const defaultFilename = `billapp-logs-${stamp}${ext}`;
+  const frontendLogs = getFrontendLogs();
+  const win = window as any;
+
+  try {
+    // 1. Desktop Electron native Save-As dialog via preload IPC bridge
+    const desktopRes = await exportLogsViaDesktop({
+      format,
+      includeDiagnostics: logExportOptions.includeDiagnostics,
+      redactPii: logExportOptions.redactPii,
+      frontendLogs,
+      defaultFilename,
+    });
+    if (desktopRes !== null) {
+      if (desktopRes.cancelled) {
+        ElMessage.info('已取消导出日志');
+        return;
+      }
+      if (!desktopRes.ok) {
+        throw new Error(desktopRes.error || '导出日志失败');
+      }
+      const savedPath = desktopRes.path || desktopRes.filename || defaultFilename;
+      logExportNotice.value = {
+        type: 'success',
+        title: format === 'zip' ? '诊断日志包已导出' : '运行日志已导出',
+        description: `保存位置：${savedPath}`,
+      };
+      ElNotification({
+        title: '日志导出成功',
+        message: `文件已保存至：${savedPath}`,
+        type: 'success',
+        duration: 6000,
+      });
+      await Promise.all([loadLogsInfo(), loadDesktopInfo()]);
+      return;
+    }
+
+    // 2. Modern browser File System Access API
+    if (typeof win.showSaveFilePicker === 'function') {
+      let handle: any;
+      try {
+        handle = await win.showSaveFilePicker({
+          suggestedName: defaultFilename,
+          types: [
+            format === 'zip'
+              ? {
+                  description: '诊断日志压缩包 (.zip)',
+                  accept: { 'application/zip': ['.zip'] },
+                }
+              : {
+                  description: '纯文本日志文件 (.log)',
+                  accept: { 'text/plain': ['.log', '.txt'] },
+                },
+          ],
+        });
+      } catch (pickerErr: any) {
+        if (pickerErr?.name === 'AbortError') {
+          ElMessage.info('已取消导出日志');
+          return;
+        }
+        throw pickerErr;
+      }
+
+      const blob = await exportLogs({
+        format,
+        include_diagnostics: logExportOptions.includeDiagnostics,
+        redact_pii: logExportOptions.redactPii,
+        frontend_logs: frontendLogs,
+      });
+      const writable = await handle.createWritable();
+      try {
+        await writable.write(blob);
+      } finally {
+        await writable.close();
+      }
+      const chosenName = handle.name || defaultFilename;
+      logExportNotice.value = {
+        type: 'success',
+        title: format === 'zip' ? '诊断日志包已导出' : '运行日志已导出',
+        description: `已保存至您选择的位置：${chosenName}`,
+      };
+      ElNotification({
+        title: '日志导出成功',
+        message: `日志文件「${chosenName}」已写入您选择的目录`,
+        type: 'success',
+        duration: 6000,
+      });
+      await loadLogsInfo();
+      return;
+    }
+
+    // 3. Fallback standard browser download
+    const blob = await exportLogs({
+      format,
+      include_diagnostics: logExportOptions.includeDiagnostics,
+      redact_pii: logExportOptions.redactPii,
+      frontend_logs: frontendLogs,
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = defaultFilename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    logExportNotice.value = {
+      type: 'info',
+      title: '已发起日志下载',
+      description: `文件名：${defaultFilename}（已保存至浏览器默认下载目录）`,
+    };
+    ElNotification({
+      title: '已发起日志下载',
+      message: `文件「${defaultFilename}」已开始下载，请查看浏览器下载目录`,
+      type: 'success',
+      duration: 6000,
+    });
+    await loadLogsInfo();
+  } catch (err: any) {
+    const msg = err?.message || '导出日志失败';
+    logExportNotice.value = {
+      type: 'error',
+      title: '导出日志失败',
+      description: msg,
+    };
+    if (!err?.toasted) {
+      ElMessage.error(msg);
+    }
+  } finally {
+    exportingLogs.value = false;
+  }
+}
+
 onMounted(() => {
   loadSettings();
   loadFxOverview();
+  loadLogsInfo();
+  loadDesktopInfo();
   appStore.initDesktopUpdater();
 });
 </script>
@@ -1475,5 +1821,63 @@ onMounted(() => {
   color: var(--text-2);
   white-space: pre-line;
   line-height: 1.55;
+}
+
+.log-meta-box {
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.log-options-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.log-preview-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--text-3);
+  margin-bottom: 10px;
+}
+
+.log-preview-box {
+  margin: 0;
+  padding: 12px 14px;
+  background: #0f172a;
+  color: #e2e8f0;
+  border-radius: var(--radius-md);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.log-preview-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.log-preview-footer-left,
+.log-preview-footer-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 </style>

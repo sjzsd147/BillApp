@@ -9,7 +9,7 @@ from typing import Generator
 import pytest
 from fastapi.testclient import TestClient
 
-from billapp.app import create_app
+from billapp.app import APP_VERSION, create_app
 from billapp.classify.categories import CategoryService
 from tests.fixtures.synthetic_alipay import generate_synthetic_alipay_csv
 from tests.fixtures.synthetic_pdf import generate_synthetic_boc_pdf
@@ -30,16 +30,21 @@ def client(tmp_path: Path) -> Generator[TestClient, None, None]:
 # =========================================================================
 
 def test_api_health_check(client: TestClient):
+    import json
+    root_version = json.loads(
+        (Path(__file__).resolve().parent.parent.parent / "version.json").read_text(encoding="utf-8")
+    )["version"]
+    assert APP_VERSION == root_version
     resp = client.get("/api/health")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok", "version": "1.2.3"}
+    assert resp.json() == {"status": "ok", "version": APP_VERSION}
 
 
 def test_api_meta_endpoint(client: TestClient):
     resp = client.get("/api/meta")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["version"] == "1.2.3"
+    assert data["version"] == APP_VERSION
     assert "categories" in data
     assert len(data["categories"]) == 16  # 16 root categories
     assert "accounts" in data

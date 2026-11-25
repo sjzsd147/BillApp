@@ -8,6 +8,7 @@ ROOT_DIR = Path(SPECPATH).resolve().parent
 BACKEND_DIR = ROOT_DIR / "backend"
 
 datas = [
+    (str(ROOT_DIR / "version.json"), "."),
     (str(BACKEND_DIR / "billapp" / "core" / "schema.sql"), "billapp/core"),
     (str(BACKEND_DIR / "billapp" / "classify" / "builtin_rules.yaml"), "billapp/classify"),
 ]

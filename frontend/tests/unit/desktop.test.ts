@@ -2,7 +2,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   checkForUpdatesViaDesktop,
   downloadUpdateViaDesktop,
+  exportLogsViaDesktop,
   getDesktopBridge,
+  getDesktopInfoViaDesktop,
   getDesktopUpdaterState,
   installUpdateViaDesktop,
   isElectronDesktop,
@@ -23,6 +25,8 @@ describe('desktop preload bridge helpers', () => {
     expect(isElectronDesktop()).toBe(false);
     expect(getDesktopBridge()).toBeUndefined();
     expect(await saveDatabaseBackupViaDesktop('backup.db')).toBeNull();
+    expect(await exportLogsViaDesktop({ format: 'zip' })).toBeNull();
+    expect(await getDesktopInfoViaDesktop()).toBeNull();
     expect(await getDesktopUpdaterState()).toBeNull();
     expect(await checkForUpdatesViaDesktop()).toBeNull();
     expect(await downloadUpdateViaDesktop()).toBeNull();
@@ -67,10 +71,28 @@ describe('desktop preload bridge helpers', () => {
       onStateChange: vi.fn().mockReturnValue(unsubscribe),
     };
 
+    const exportLogs = vi.fn().mockResolvedValue({
+      ok: true,
+      cancelled: false,
+      path: '/tmp/billapp-logs.zip',
+      filename: 'billapp-logs.zip',
+      size_bytes: 2048,
+    });
+    const getDesktopInfo = vi.fn().mockResolvedValue({
+      platform: 'win32',
+      isPackaged: true,
+      appVersion: __APP_VERSION__,
+      desktopLogPath: 'C:\\Users\\demo\\AppData\\Roaming\\BillApp\\desktop.log',
+      desktopLogSizeBytes: 1024,
+      desktopLogFileCount: 1,
+    });
+
     window.billDesktop = {
       isElectron: true,
       platform: 'win32',
       saveDatabaseBackup,
+      exportLogs,
+      getDesktopInfo,
       updater,
     };
 
@@ -78,6 +100,13 @@ describe('desktop preload bridge helpers', () => {
     const res = await saveDatabaseBackupViaDesktop('backup.db');
     expect(saveDatabaseBackup).toHaveBeenCalledWith('backup.db');
     expect(res?.ok).toBe(true);
+
+    const logRes = await exportLogsViaDesktop({ format: 'zip', defaultFilename: 'billapp-logs.zip' });
+    expect(exportLogs).toHaveBeenCalledWith({ format: 'zip', defaultFilename: 'billapp-logs.zip' });
+    expect(logRes?.ok).toBe(true);
+
+    const infoRes = await getDesktopInfoViaDesktop();
+    expect(infoRes?.desktopLogFileCount).toBe(1);
 
     expect(await getDesktopUpdaterState()).toEqual(sampleState);
     expect(await checkForUpdatesViaDesktop()).toEqual(sampleState);

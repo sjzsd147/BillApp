@@ -263,6 +263,54 @@ function httpPostBuffer(url, timeoutMs = 30000, headers = {}) {
   });
 }
 
+/**
+ * Direct loopback HTTP POST with JSON payload returning raw Buffer response (used for log export).
+ */
+function httpPostJsonForBuffer(url, payload = {}, timeoutMs = 30000, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const bodyBuf = Buffer.from(JSON.stringify(payload ?? {}), 'utf8');
+    const reqHeaders = {
+      'Content-Type': 'application/json',
+      'Content-Length': String(bodyBuf.length),
+      ...headers,
+    };
+    const req = http.request(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port,
+        path: `${parsed.pathname}${parsed.search}`,
+        method: 'POST',
+        headers: reqHeaders,
+        agent: false,
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          const buffer = Buffer.concat(chunks);
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            resolve({
+              buffer,
+              headers: res.headers,
+              statusCode: res.statusCode,
+            });
+          } else {
+            reject(new Error(`HTTP ${res.statusCode}: ${buffer.toString('utf8')}`));
+          }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy(new Error('Backend log export request timeout'));
+    });
+    req.write(bodyBuf);
+    req.end();
+  });
+}
+
 async function waitForBackendReady({ port, host = '127.0.0.1', timeoutMs = 20000, isExited, getStderr }) {
   const deadline = Date.now() + timeoutMs;
   const healthUrl = `http://${host}:${port}/api/health`;
@@ -477,6 +525,7 @@ module.exports = {
   findFreePort,
   httpGetJson,
   httpPostBuffer,
+  httpPostJsonForBuffer,
   mergeNoProxy,
   parseDbCliArg,
   resolveBackendLaunchSpec,

@@ -82,6 +82,22 @@ python backend/billapp/launcher.py --no-browser --port 8000
 python backend/billapp/launcher.py --browser --port 8000
 ```
 
+## 版本管理
+
+项目根目录的 `version.json` 是全仓唯一版本号配置源：
+
+- Python 后端（含 PyInstaller 打包产物）、Vue 前端及全部单元测试均动态读取 `version.json`，无需手动修改代码文件。
+- 升级版本只需执行一条同步命令，即可自动更新 `version.json` 以及 Electron / 前端所需的 `package.json` 与 `package-lock.json`：
+
+```powershell
+# 一键更新并同步全仓版本号
+node build/sync-version.mjs 1.3.0
+
+# 仅根据 version.json 同步清单，或校验一致性
+node build/sync-version.mjs
+node build/sync-version.mjs --check
+```
+
 ## 多平台桌面打包
 
 在项目根目录执行跨平台构建脚本（依次完成：前端生产构建 → PyInstaller 打包 `billapp-backend` Sidecar → Sidecar 自检 → `electron-builder` 打包 → Electron 端到端冒烟验证）：
@@ -106,7 +122,7 @@ powershell -ExecutionPolicy Bypass -File .\build\build.ps1 -DirOnly
   - macOS：`~/Library/Application Support/BillApp/bill.db`
   - Linux：`$XDG_DATA_HOME/BillApp/bill.db`（默认 `~/.local/share/BillApp/bill.db`）
   - 支持通过启动参数 `--db <路径>` 或环境变量 `BILLAPP_DB_PATH` 覆盖
-- **运行日志**：同数据目录下的 `launcher.log`
+- **运行日志**：同数据目录下的 `launcher.log`（后端运行日志，自动轮转）与 `desktop.log`（Electron 桌面壳与更新日志）；可在应用内「设置 → 关于与数据 → 运行日志与诊断」一键脱敏预览或导出 `.zip` 诊断包 / `.log` 文本日志。
 
 ## 运行测试
 

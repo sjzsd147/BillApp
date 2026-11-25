@@ -30,6 +30,7 @@ build/*
 !build/billapp.spec
 !build/build.mjs
 !build/build.ps1
+!build/sync-version.mjs
 dist/
 frontend/dist/
 electron/dist/

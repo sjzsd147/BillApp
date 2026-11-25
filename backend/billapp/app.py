@@ -19,9 +19,9 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from billapp.classify.categories import CategoryService
 from billapp.core.db import create_connection, get_default_db_path, init_db
+from billapp.version import APP_VERSION
 
 logger = logging.getLogger("billapp.app")
-APP_VERSION = "1.2.3"
 
 
 # =========================================================================
@@ -115,6 +115,7 @@ def _cleanup_legacy_builtin_profiles(conn: sqlite3.Connection) -> None:
 async def lifespan(app: FastAPI):
     """Application lifespan: initialize schema, seed taxonomy on startup; checkpoint on shutdown."""
     db_path = getattr(app.state, "db_path", None)
+    logger.info("BillApp lifespan starting (version=%s)", APP_VERSION)
     init_conn = init_db(db_path)
     try:
         CategoryService.init_builtin_categories(init_conn)
@@ -126,12 +127,13 @@ async def lifespan(app: FastAPI):
     yield
 
     # Clean shutdown checkpoint
+    logger.info("BillApp lifespan shutting down; running SQLite WAL checkpoint.")
     try:
         cleanup_conn = create_connection(db_path)
         cleanup_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
         cleanup_conn.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("SQLite WAL checkpoint during shutdown failed: %s", exc)
 
 
 # =========================================================================
@@ -178,6 +180,7 @@ def create_app(
     db_path: Optional[Union[str, Path]] = None,
     api_token: Optional[str] = None,
     bootstrap_token: Optional[str] = None,
+    log_path: Optional[Union[str, Path]] = None,
 ) -> FastAPI:
     """FastAPI application factory supporting configurable SQLite database path and local token auth."""
     app = FastAPI(
@@ -187,6 +190,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.db_path = db_path if db_path is not None else get_default_db_path()
+    app.state.log_path = log_path
 
     effective_api_token = (
         api_token if api_token is not None else (os.environ.get("BILLAPP_API_TOKEN") or "").strip() or None
@@ -209,6 +213,7 @@ def create_app(
         allow_credentials=bool(allowed_origins),
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Content-Type", "X-BillApp-Token", "Accept"],
+        expose_headers=["Content-Disposition", "X-BillApp-Log-Filename"],
     )
 
     # Local security middleware: Host DNS-rebinding defense, Origin CSRF defense, and Token auth
@@ -298,6 +303,15 @@ def create_app(
     # Custom Exception Handlers
     @app.exception_handler(AppException)
     async def app_exception_handler(request: Request, exc: AppException):
+        if exc.status_code >= 500:
+            logger.error(
+                "AppException %s on %s %s: code=%s message=%s",
+                exc.status_code,
+                request.method,
+                request.url.path,
+                exc.code,
+                exc.message,
+            )
         return JSONResponse(
             status_code=exc.status_code,
             content={"code": exc.code, "message": exc.message, "details": exc.details},
@@ -337,6 +351,7 @@ def create_app(
     @app.exception_handler(sqlite3.OperationalError)
     async def sqlite_busy_handler(request: Request, exc: sqlite3.OperationalError):
         err_msg = str(exc).lower()
+        logger.error("SQLite OperationalError on %s %s: %s", request.method, request.url.path, exc)
         if "locked" in err_msg or "busy" in err_msg:
             return JSONResponse(
                 status_code=503,
@@ -392,6 +407,7 @@ def create_app(
     from billapp.api.stats import router as stats_router
     from billapp.api.export import router as export_router
     from billapp.api.fx import router as fx_router
+    from billapp.api.logs import router as logs_router
 
     app.include_router(import_router)
     app.include_router(profiles_router)
@@ -406,6 +422,7 @@ def create_app(
     app.include_router(stats_router)
     app.include_router(export_router)
     app.include_router(fx_router)
+    app.include_router(logs_router)
 
     # -------------------------------------------------------------------------
     # Frontend Static Distribution & SPA Routing Fallback

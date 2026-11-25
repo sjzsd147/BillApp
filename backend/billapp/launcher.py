@@ -27,6 +27,7 @@ from typing import Any, Optional
 
 import uvicorn
 from billapp.app import create_app
+from billapp.core.logs import attach_package_logging, setup_file_logging
 from billapp.paths import get_appdata_dir, get_default_db_path, get_frontend_dist_dir
 
 logger = logging.getLogger("billapp.launcher")
@@ -63,40 +64,8 @@ def _ensure_usable_tempdir() -> Optional[Path]:
 
 
 def _setup_file_logging() -> Optional[Path]:
-    """Configure file logging under platform app data dir (with safe fallbacks)."""
-    if any(isinstance(h, logging.FileHandler) for h in logger.handlers):
-        return None
-    candidates: list[Path] = []
-    try:
-        candidates.append(get_appdata_dir() / "launcher.log")
-    except OSError:
-        pass
-    if getattr(sys, "frozen", False):
-        candidates.append(Path(sys.executable).resolve().parent / "billapp_data" / "launcher.log")
-    if sys.platform == "win32":
-        try:
-            candidates.append(Path.home() / "AppData" / "LocalLow" / "BillApp" / "launcher.log")
-        except Exception:
-            pass
-    temp_dir = _safe_gettempdir()
-    if temp_dir is not None:
-        candidates.append(temp_dir / "billapp_launcher.log")
-
-    for log_path in candidates:
-        try:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            handler = logging.FileHandler(log_path, encoding="utf-8")
-            handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-            logger.addHandler(handler)
-            logger.setLevel(logging.INFO)
-            for extra_name in ("billapp.app", "uvicorn.error"):
-                extra_logger = logging.getLogger(extra_name)
-                if not any(isinstance(h, logging.FileHandler) for h in extra_logger.handlers):
-                    extra_logger.addHandler(handler)
-            return log_path
-        except OSError:
-            continue
-    return None
+    """Configure rotating file logging under platform app data dir (with safe fallbacks)."""
+    return setup_file_logging(target_logger=logger)
 
 
 def acquire_single_instance_mutex() -> bool:
@@ -258,6 +227,7 @@ def _register_signal_handlers(server: Any) -> None:
 def main() -> None:
     _ensure_stdio()
     log_path = _setup_file_logging()
+    attach_package_logging()
     _ensure_usable_tempdir()
     logger.info("=== BillApp backend starting (frozen=%s, argv=%s) ===", getattr(sys, "frozen", False), sys.argv)
 
@@ -315,7 +285,12 @@ def main() -> None:
             dist_dir.is_dir(),
             bool(api_token),
         )
-        app = create_app(db_path=resolved_db, api_token=api_token, bootstrap_token=boot_token)
+        app = create_app(
+            db_path=resolved_db,
+            api_token=api_token,
+            bootstrap_token=boot_token,
+            log_path=log_path,
+        )
 
         config = uvicorn.Config(
             app=app,

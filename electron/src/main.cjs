@@ -4,10 +4,16 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { app, BrowserWindow, Menu, dialog, ipcMain, net, safeStorage, session, shell } = require('electron');
-const { startBackend, httpPostBuffer, parseDbCliArg } = require('./backend.cjs');
+const { startBackend, httpPostBuffer, httpPostJsonForBuffer, parseDbCliArg } = require('./backend.cjs');
+const { createDesktopLogger } = require('./logger.cjs');
 const { createAppUpdater } = require('./updater.cjs');
 
 app.setName('BillApp');
+const desktopLogger = createDesktopLogger({
+  logDir: app.getPath('userData'),
+  filename: 'desktop.log',
+  mirrorConsole: !app.isPackaged && !process.argv.includes('--smoke-test'),
+});
 // Ensure loopback traffic to the local FastAPI sidecar never routes through system HTTP proxies.
 app.commandLine.appendSwitch('proxy-bypass-list', '<-loopback>,127.0.0.1,localhost');
 
@@ -87,6 +93,7 @@ function getOrCreateSafeStorageMasterKey() {
     fs.writeFileSync(keyFile, encrypted, { mode: 0o600 });
     return { masterKey: freshKey, secretBackend: 'electron_safe_storage' };
   } catch (err) {
+    desktopLogger.warn('[security] Electron safeStorage unavailable; falling back to backend keystore:', err?.message || err);
     console.warn('[security] Electron safeStorage unavailable; falling back to backend keystore:', err?.message || err);
     return { masterKey: null, secretBackend: null };
   }
@@ -315,6 +322,26 @@ function createMainWindow() {
     }
   });
 
+  win.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+    desktopLogger.error(
+      `[renderer] did-fail-load (${errorCode}): ${errorDescription} url=${validatedURL || ''}`
+    );
+  });
+
+  win.webContents.on('render-process-gone', (_event, details) => {
+    desktopLogger.error(
+      `[renderer] render-process-gone reason=${details?.reason || 'unknown'} exitCode=${details?.exitCode ?? ''}`
+    );
+  });
+
+  win.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    // Capture renderer console warnings (2) and errors (3)
+    if (level >= 2) {
+      const tag = level >= 3 ? 'error' : 'warn';
+      desktopLogger[tag](`[renderer:console] ${message} (${sourceId || ''}:${line || 0})`);
+    }
+  });
+
   if (!downloadListenerRegistered) {
     downloadListenerRegistered = true;
     win.webContents.session.on('will-download', (_event, item) => {
@@ -367,10 +394,12 @@ function getAppUpdaterController() {
             await mainWindow.loadURL(nextUiUrl);
           }
         } catch (restartErr) {
+          desktopLogger.error('[updater] Failed to restart backend after install error:', restartErr);
           console.error('[updater] Failed to restart backend after install error:', restartErr);
         }
       },
       fetchImpl: (url, opts) => net.fetch(url, opts),
+      logger: desktopLogger,
       onStateChange: (state) => {
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('bill:updater-state', state);
@@ -387,12 +416,16 @@ function registerIpcHandlers() {
 
   ipcMain.handle('bill:get-desktop-info', (event) => {
     assertTrustedIpcSender(event);
+    const logInfo = desktopLogger.getInfo();
     return {
       platform: process.platform,
       isPackaged: app.isPackaged,
       appVersion: app.getVersion(),
       backendUrl: backendHandle ? backendHandle.url : undefined,
       installMode: updater.getState().installMode,
+      desktopLogPath: logInfo.logPath,
+      desktopLogSizeBytes: logInfo.totalSizeBytes,
+      desktopLogFileCount: logInfo.files.length,
     };
   });
 
@@ -477,6 +510,101 @@ function registerIpcHandlers() {
       };
     }
   });
+
+  ipcMain.handle('bill:export-logs', async (event, payload = {}) => {
+    assertTrustedIpcSender(event);
+    if (!backendHandle) {
+      return { ok: false, cancelled: false, error: '后台服务尚未就绪' };
+    }
+
+    const format = payload?.format === 'log' ? 'log' : 'zip';
+    const ext = format === 'log' ? '.log' : '.zip';
+    const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+    const defaultFallback = `billapp-logs-${stamp}${ext}`;
+    let filename = sanitizeDownloadFilename(payload?.defaultFilename, defaultFallback);
+    if (!filename.toLowerCase().endsWith(ext)) {
+      filename = `${filename}${ext}`;
+    }
+
+    let defaultDir;
+    try {
+      defaultDir = app.getPath('desktop');
+    } catch {
+      defaultDir = app.getPath('downloads');
+    }
+
+    const dialogResult = await dialog.showSaveDialog(mainWindow || undefined, {
+      title: format === 'zip' ? '导出诊断日志包' : '导出运行日志',
+      defaultPath: path.join(defaultDir, filename),
+      filters:
+        format === 'zip'
+          ? [
+              { name: '诊断日志压缩包 (.zip)', extensions: ['zip'] },
+              { name: '所有文件', extensions: ['*'] },
+            ]
+          : [
+              { name: '纯文本日志文件 (.log)', extensions: ['log', 'txt'] },
+              { name: '所有文件', extensions: ['*'] },
+            ],
+    });
+
+    if (dialogResult.canceled || !dialogResult.filePath) {
+      return { ok: false, cancelled: true };
+    }
+
+    let targetPath = dialogResult.filePath.trim();
+    if (!path.extname(targetPath)) {
+      targetPath = `${targetPath}${ext}`;
+    }
+
+    try {
+      desktopLogger.info(`Exporting diagnostic logs (format=${format}) via desktop Save-As dialog`);
+      const headers = backendHandle.apiToken
+        ? { 'X-BillApp-Token': backendHandle.apiToken }
+        : {};
+      const requestBody = {
+        format,
+        include_diagnostics: payload?.includeDiagnostics !== false,
+        redact_pii: payload?.redactPii !== false,
+        frontend_logs: Array.isArray(payload?.frontendLogs) ? payload.frontendLogs.slice(-500) : [],
+        desktop_logs: desktopLogger.collectLogs(),
+        desktop_meta: {
+          platform: process.platform,
+          arch: process.arch,
+          appVersion: app.getVersion(),
+          isPackaged: app.isPackaged,
+          installMode: updater.getState().installMode,
+          versions: {
+            electron: process.versions.electron,
+            chrome: process.versions.chrome,
+            node: process.versions.node,
+          },
+        },
+      };
+      const { buffer } = await httpPostJsonForBuffer(
+        `${backendHandle.url}/api/logs/export`,
+        requestBody,
+        30000,
+        headers
+      );
+      await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
+      await fs.promises.writeFile(targetPath, buffer);
+      return {
+        ok: true,
+        cancelled: false,
+        path: targetPath,
+        filename: path.basename(targetPath),
+        size_bytes: buffer.length,
+      };
+    } catch (err) {
+      desktopLogger.error('Failed to export diagnostic logs:', err);
+      return {
+        ok: false,
+        cancelled: false,
+        error: err?.message || '导出日志文件失败',
+      };
+    }
+  });
 }
 
 async function ensureBackendStarted() {
@@ -520,7 +648,9 @@ async function ensureBackendStarted() {
       frontendDir: resolveFrontendDistDir(),
       masterKey,
       secretBackend,
+      onLog: (stream, text) => desktopLogger.logBackend(stream, text),
     });
+    desktopLogger.info(`Backend sidecar started on ${backendHandle.url}`);
     return backendHandle;
   })().finally(() => {
     startInFlight = null;
@@ -581,6 +711,7 @@ async function loadAndMaybeSmokeTest({ win, uiUrl }) {
           isElectron: window.billDesktop.isElectron,
           platform: window.billDesktop.platform,
           hasSaveBackup: typeof window.billDesktop.saveDatabaseBackup === 'function',
+          hasExportLogs: typeof window.billDesktop.exportLogs === 'function',
           hasUpdater: typeof window.billDesktop.updater?.checkForUpdates === 'function',
           info: await window.billDesktop.getDesktopInfo(),
           updaterState: window.billDesktop.updater ? await window.billDesktop.updater.getState() : null,
@@ -591,7 +722,7 @@ async function loadAndMaybeSmokeTest({ win, uiUrl }) {
     })()
   `);
 
-  if (!probe?.hasAppHtml || !probe?.billDesktop?.isElectron || !probe?.billDesktop?.hasUpdater || probe?.health?.status !== 'ok' || !probe?.metaOk) {
+  if (!probe?.hasAppHtml || !probe?.billDesktop?.isElectron || !probe?.billDesktop?.hasExportLogs || !probe?.billDesktop?.hasUpdater || probe?.health?.status !== 'ok' || !probe?.metaOk) {
     throw new Error(`Smoke test probe failed: ${JSON.stringify(probe)}`);
   }
 
@@ -652,6 +783,9 @@ if (hasSingleInstanceLock) {
 
   app.whenReady()
     .then(async () => {
+      desktopLogger.info(
+        `=== BillApp Electron starting (version=${app.getVersion()}, packaged=${app.isPackaged}, platform=${process.platform}/${process.arch}) ===`
+      );
       const appMenu = buildAppMenu();
       Menu.setApplicationMenu(appMenu);
       registerIpcHandlers();
@@ -668,6 +802,7 @@ if (hasSingleInstanceLock) {
       }
     })
     .catch(async (err) => {
+      desktopLogger.error('Failed to start BillApp Electron shell:', err);
       console.error('Failed to start BillApp Electron shell:', err);
       if (!SMOKE_TEST) {
         dialog.showErrorBox('账单助手启动失败', err?.message || String(err));

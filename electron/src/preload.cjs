@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('billDesktop', {
   },
   saveDatabaseBackup: (defaultFilename = '') =>
     ipcRenderer.invoke('bill:save-database-backup', { defaultFilename }),
+  exportLogs: (options = {}) => ipcRenderer.invoke('bill:export-logs', options),
   getDesktopInfo: () => ipcRenderer.invoke('bill:get-desktop-info'),
   updater: {
     getState: () => ipcRenderer.invoke('bill:updater-get-state'),

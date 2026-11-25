@@ -1,5 +1,7 @@
 /// <reference types="vite/client" />
 
+declare const __APP_VERSION__: string;
+
 declare module '*.vue' {
   import type { DefineComponent } from 'vue';
   const component: DefineComponent<{}, {}, any>;
@@ -21,6 +23,23 @@ interface BillDesktopInfo {
   appVersion: string;
   backendUrl?: string;
   installMode?: string;
+  desktopLogPath?: string;
+  desktopLogSizeBytes?: number;
+  desktopLogFileCount?: number;
+}
+
+interface DesktopExportLogsOptions {
+  format?: 'zip' | 'log';
+  includeDiagnostics?: boolean;
+  redactPii?: boolean;
+  defaultFilename?: string;
+  frontendLogs?: Array<{
+    timestamp: string;
+    level: string;
+    source: string;
+    message: string;
+    stack?: string;
+  }>;
 }
 
 type DesktopUpdateStatus =
@@ -76,6 +95,7 @@ interface BillDesktopBridge {
     chrome?: string;
   };
   saveDatabaseBackup: (defaultFilename?: string) => Promise<NativeSaveResult>;
+  exportLogs?: (options?: DesktopExportLogsOptions) => Promise<NativeSaveResult>;
   getDesktopInfo?: () => Promise<BillDesktopInfo>;
   updater?: DesktopUpdaterBridge;
 }

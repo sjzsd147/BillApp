@@ -14,6 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { syncVersionFiles } from './sync-version.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -135,6 +136,8 @@ function resolveWritableTempRoot() {
 
 function main() {
   const opts = parseArgs(process.argv.slice(2));
+  const versionSync = syncVersionFiles();
+  console.log(`==> App Version: v${versionSync.version}${versionSync.updated.length ? ` (synced: ${versionSync.updated.join(', ')})` : ''}`);
   const pythonExe = resolvePython();
   const distOutDir = opts.outDir || path.join(rootDir, 'dist');
 

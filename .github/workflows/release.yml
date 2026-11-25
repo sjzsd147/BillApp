@@ -31,6 +31,9 @@ jobs:
             frontend/package-lock.json
             electron/package-lock.json
 
+      - name: Verify version consistency
+        run: node build/sync-version.mjs --check
+
       - name: Install, verify & build frontend
         working-directory: frontend
         run: |
@@ -99,7 +102,7 @@ jobs:
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          npm --prefix electron version "$VERSION" --no-git-tag-version --allow-same-version
+          node build/sync-version.mjs "$VERSION"
 
       - name: Build installer (${{ matrix.artifact_name }})
         env:

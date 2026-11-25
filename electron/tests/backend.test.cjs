@@ -102,12 +102,34 @@ test('findFreePort and startBackend / stop lifecycle enforce token auth and ephe
     await assert.rejects(() => httpGetJson(`${handle.url}/api/meta`), /HTTP 401/);
 
     // Authenticated POST /api/backup with X-BillApp-Token succeeds
-    const { httpPostBuffer } = require('../src/backend.cjs');
+    const { httpPostBuffer, httpPostJsonForBuffer } = require('../src/backend.cjs');
     const bak = await httpPostBuffer(`${handle.url}/api/backup`, 10000, {
       'X-BillApp-Token': handle.apiToken,
     });
     assert.equal(bak.statusCode, 200);
     assert.equal(bak.buffer.subarray(0, 15).toString('utf8'), 'SQLite format 3');
+
+    // Unauthenticated POST /api/logs/export must fail with HTTP 401
+    await assert.rejects(
+      () => httpPostJsonForBuffer(`${handle.url}/api/logs/export`, { format: 'zip' }, 10000),
+      /HTTP 401/
+    );
+
+    // Authenticated POST /api/logs/export returns valid ZIP archive
+    const logZip = await httpPostJsonForBuffer(
+      `${handle.url}/api/logs/export`,
+      {
+        format: 'zip',
+        include_diagnostics: true,
+        redact_pii: true,
+        desktop_logs: [{ name: 'desktop.log', content: '2026-11-25 [INFO] test entry\n' }],
+      },
+      10000,
+      { 'X-BillApp-Token': handle.apiToken }
+    );
+    assert.equal(logZip.statusCode, 200);
+    assert.equal(logZip.buffer[0], 0x50); // 'P'
+    assert.equal(logZip.buffer[1], 0x4b); // 'K'
   } finally {
     await handle.stop();
     assert.equal(handle.isRunning(), false);
