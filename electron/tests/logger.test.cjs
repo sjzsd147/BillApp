@@ -6,7 +6,12 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { createDesktopLogger, sanitizeLogText } = require('../src/logger.cjs');
+const {
+  createDesktopLogger,
+  formatLocalFilenameStamp,
+  formatLocalTimestamp,
+  sanitizeLogText,
+} = require('../src/logger.cjs');
 
 test('sanitizeLogText redacts tokens, API keys, encrypted envelopes, and URL credentials', () => {
   const input =
@@ -60,4 +65,19 @@ test('createDesktopLogger writes sanitized logs, rotates on size limit, and coll
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+test('desktop log timestamps include explicit local UTC offset and main.cjs omits subtractive <-loopback>', () => {
+  const sampleDate = new Date(2026, 10, 25, 21, 38, 42, 123);
+  const ts = formatLocalTimestamp(sampleDate);
+  assert.match(ts, /^2026-11-25 21:38:42\.123[+-]\d{2}:\d{2}$/);
+  assert.equal(formatLocalFilenameStamp(sampleDate), '20261125-213842');
+
+  const mainSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.cjs'), 'utf8');
+  const proxyMatch = mainSrc.match(/appendSwitch\(\s*['"]proxy-bypass-list['"]\s*,\s*['"]([^'"]+)['"]\s*\)/);
+  assert.ok(proxyMatch, 'Expected proxy-bypass-list commandLine switch in main.cjs');
+  assert.equal(proxyMatch[1].includes('<-loopback>'), false, 'proxy-bypass-list must not include subtractive <-loopback>');
+  assert.match(proxyMatch[1], /127\.0\.0\.1/);
+  assert.match(mainSrc, /onErrorOccurred/);
+  assert.match(mainSrc, /loopback-network/);
 });

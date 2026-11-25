@@ -2,16 +2,30 @@ import axios, { type AxiosInstance, type AxiosRequestConfig } from 'axios';
 import { ElMessage } from 'element-plus';
 import type { ApiError } from '@/types/api';
 import { recordFrontendLog } from '@/utils/logCollector';
+import { getFileExtension, isMemoryBackedFile } from '@/utils/uploadFile';
 
 const baseURL = typeof window !== 'undefined' && window.__BILL_API__ ? window.__BILL_API__ : '/api';
 
 export const apiClient: AxiosInstance = axios.create({
   baseURL,
   timeout: 30000,
-  headers: {
-    'Content-Type': 'application/json',
-  },
 });
+
+function summarizeUploadContext(data: unknown): string {
+  if (typeof FormData === 'undefined' || !(data instanceof FormData)) {
+    return '';
+  }
+  const fileVal = data.get('file');
+  if (typeof File !== 'undefined' && fileVal instanceof File) {
+    const ext = getFileExtension(fileVal.name);
+    const memFlag = isMemoryBackedFile(fileVal) ? 'mem' : 'disk';
+    return ` (multipart ext=${ext} size=${fileVal.size}B backing=${memFlag})`;
+  }
+  if (typeof Blob !== 'undefined' && fileVal instanceof Blob) {
+    return ` (multipart blob size=${fileVal.size}B)`;
+  }
+  return ' (multipart)';
+}
 
 apiClient.interceptors.response.use(
   (response) => {
@@ -33,12 +47,18 @@ apiClient.interceptors.response.use(
       message = error.message;
     }
 
-    // Record sanitized API error into frontend runtime ring buffer (exclude URL query strings)
+    // Record sanitized API error into frontend runtime ring buffer (exclude URL query strings & PII)
     const config = error.config as (AxiosRequestConfig & { silent?: boolean }) | undefined;
     const reqMethod = String(config?.method || 'GET').toUpperCase();
     const rawUrl = String(config?.url || '').split('?')[0];
     const httpStatus = error.response?.status ? `HTTP ${error.response.status}` : 'NETWORK';
-    recordFrontendLog('error', 'api', `${reqMethod} ${rawUrl} -> ${httpStatus} [${code}] ${message}`);
+    const axiosCode = error?.code ? ` axiosCode=${String(error.code)}` : '';
+    const uploadMeta = summarizeUploadContext(config?.data);
+    recordFrontendLog(
+      'error',
+      'api',
+      `${reqMethod} ${rawUrl} -> ${httpStatus} [${code}]${axiosCode}${uploadMeta} ${message}`
+    );
 
     // Suppress noisy UI error toasts for silent background checks if requested
     const toasted = !config?.silent;

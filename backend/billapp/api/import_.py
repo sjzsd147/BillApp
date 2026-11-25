@@ -8,9 +8,11 @@ import hashlib
 from html.parser import HTMLParser
 import io
 import json
+import logging
 from pathlib import Path
 import re
 import sqlite3
+import time
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
 import zipfile
@@ -46,7 +48,14 @@ from billapp.llm.tasks import (
     recognize_statement_account_sync,
 )
 
+logger = logging.getLogger("billapp.api.import")
 router = APIRouter(prefix="/api/import", tags=["import"])
+
+
+def _safe_file_ext(file_name: Optional[str]) -> str:
+    """Return lowercase extension only for safe, PII-free diagnostic logging."""
+    suffix = Path(str(file_name or "")).suffix.lower()
+    return suffix if suffix and re.fullmatch(r"\.[a-z0-9]{1,12}", suffix) else "(none)"
 
 # Volatile RAM-only preview store (15-min TTL, bounded capacity, zero disk persistence)
 _PREVIEW_STORE: Dict[str, Dict[str, Any]] = {}
@@ -655,6 +664,8 @@ async def extract_raw_statement(
     """Extract raw grid rows from ZIP/CSV/Excel/PDF for custom mapping and AI suggestion."""
     content = await read_upload_limited(file, MAX_STATEMENT_UPLOAD_BYTES)
     file_name = file.filename or "statement"
+    ext = _safe_file_ext(file_name)
+    logger.info("Extract-raw received: ext=%s size_bytes=%d has_password=%s", ext, len(content), bool(password))
 
     def _work() -> ExtractRawResponse:
         probe = FileProbe(content, file_name=file_name, password=password)
@@ -663,6 +674,7 @@ async def extract_raw_statement(
             raise AppException(status_code=400, code="IMPORT_PASSWORD_REQUIRED", message="ZIP 压缩包已加密，请先输入解压密码")
         file_type, raw_rows = extract_raw_rows_from_probe(probe, max_rows=30)
         preamble_rows = _extract_preamble_rows_for_mapping(probe)
+        logger.info("Extract-raw completed: ext=%s file_type=%s rows=%d", ext, file_type, len(raw_rows))
         return ExtractRawResponse(
             file_name=probe.file_name,
             file_type=file_type,
@@ -686,9 +698,19 @@ async def import_preview(
     
     Zero disk persistence: PDF passwords reside purely in volatile RAM.
     """
+    started_at = time.perf_counter()
     content = await read_upload_limited(file, MAX_STATEMENT_UPLOAD_BYTES)
     file_name = file.filename or "statement"
-    return await anyio.to_thread.run_sync(
+    ext = _safe_file_ext(file_name)
+    logger.info(
+        "Import preview received: ext=%s size_bytes=%d has_password=%s profile_id=%s use_llm=%s",
+        ext,
+        len(content),
+        bool(password),
+        profile_id or "-",
+        bool(str(use_llm or "").strip().lower() in ("true", "1", "yes", "force")),
+    )
+    res = await anyio.to_thread.run_sync(
         _import_preview_sync,
         content,
         file_name,
@@ -697,6 +719,19 @@ async def import_preview(
         use_llm,
         db,
     )
+    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    logger.info(
+        "Import preview completed: ext=%s source=%s rows=%d need_password=%s need_mapping=%s existing_batch_id=%s warnings=%d (%dms)",
+        ext,
+        res.source,
+        res.total_rows,
+        res.need_password,
+        res.need_mapping,
+        res.existing_batch_id if res.existing_batch_id is not None else "-",
+        len(res.warnings),
+        elapsed_ms,
+    )
+    return res
 
 
 def _import_preview_sync(
@@ -723,6 +758,13 @@ def _import_preview_sync(
     if probe.is_zip():
         probe, zip_needs_pwd, zip_warnings = _unwrap_zip_probe_with_warnings(probe)
         pre_warnings.extend(zip_warnings)
+        logger.info(
+            "ZIP archive unpacked: inner_ext=%s inner_size=%d needs_password=%s warnings=%d",
+            _safe_file_ext(probe.file_name),
+            probe.file_size,
+            zip_needs_pwd,
+            len(zip_warnings),
+        )
         if zip_needs_pwd:
             return ImportPreviewItem(
                 token="",
@@ -1164,6 +1206,19 @@ def import_commit(
     batch_txns = db.execute("SELECT * FROM transactions WHERE batch_id = ?", (batch_id,)).fetchall()
     _, class_summary = pipeline.classify_batch(batch_txns, update_db=True, auto_commit=False)
 
+    logger.info(
+        "Import commit completed: batch_id=%d replaced_batch_id=%s source=%s imported=%d duplicates=%d refunds=%d transfers=%d rule_hits=%d unclassified=%d",
+        batch_id,
+        replaced_batch_id if replaced_batch_id is not None else "-",
+        source,
+        inserted_count,
+        duplicate_count + dedup_summary.duplicates_auto,
+        dedup_summary.refunds_linked,
+        dedup_summary.transfers_paired,
+        class_summary.user_rule_matched + class_summary.builtin_rule_matched,
+        class_summary.unclassified,
+    )
+
     return ImportCommitResponse(
         batch_id=batch_id,
         replaced_batch_id=replaced_batch_id,
@@ -1197,4 +1252,5 @@ def rollback_batch(
         raise NotFoundError(f"导入批次 #{batch_id} 不存在")
 
     res = rollback_import_batch(db, batch_id)
+    logger.info("Rolled back import batch: batch_id=%d", batch_id)
     return res

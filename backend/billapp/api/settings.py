@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import logging
 import os
 from pathlib import Path
 import sqlite3
@@ -26,6 +27,7 @@ from billapp.core.secrets import (
 )
 from billapp.llm.client import LLMConfig, normalize_url_origin, validate_llm_base_url
 
+logger = logging.getLogger("billapp.api.settings")
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 data_router = APIRouter(prefix="/api", tags=["data"])
 
@@ -281,6 +283,18 @@ def update_settings(
                 message=str(exc),
             ) from exc
 
+    updated_sections = [
+        name
+        for name, val in (
+            ("general", payload.general),
+            ("dedup", payload.dedup),
+            ("refund", payload.refund),
+            ("llm", payload.llm),
+        )
+        if val is not None
+    ]
+    if updated_sections:
+        logger.info("Updated settings sections=%s", ",".join(updated_sections))
     return get_settings(request, db)
 
 
@@ -399,6 +413,7 @@ def backup_database(db: sqlite3.Connection = Depends(get_db_conn)):
         except OSError:
             pass
 
+    logger.info("Created SQLite backup snapshot: size_bytes=%d", len(data))
     return Response(
         content=data,
         media_type="application/octet-stream",
@@ -521,6 +536,12 @@ async def restore_database(
         raise ValidationError(message="上传文件不是有效的 SQLite 数据库备份")
 
     txn_count, acc_count = await anyio.to_thread.run_sync(_perform_database_restore, content, db)
+    logger.info(
+        "Database restored from backup: size_bytes=%d transactions=%d accounts=%d",
+        len(content),
+        txn_count,
+        acc_count,
+    )
 
     return RestoreResponse(
         success=True,
@@ -557,4 +578,5 @@ def reset_data(
 
     CategoryService.init_builtin_categories(db)
     db.commit()
+    logger.info("Data reset completed: keep_rules=%s keep_settings=%s", payload.keep_rules, payload.keep_settings)
     return ResetDataResponse(success=True, message="账单数据已清空")

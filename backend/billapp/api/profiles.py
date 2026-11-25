@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+import logging
+from pathlib import Path
 import re
 import sqlite3
 from typing import Any, Dict, List, Optional
@@ -22,6 +24,7 @@ from billapp.importers.profile_engine import (
 from billapp.llm.client import LLMClient, LLMConfig
 from billapp.llm.tasks import suggest_profile_mapping_sync
 
+logger = logging.getLogger("billapp.api.profiles")
 router = APIRouter(prefix="/api/profiles", tags=["profiles"])
 
 
@@ -157,6 +160,7 @@ def create_profile(
         """,
         (payload.id, payload.name, payload.yaml_content, now_iso, now_iso),
     )
+    logger.info("Created bank profile: id=%s file_type=%s", payload.id, p.file_type)
 
     return ProfileSummary(
         id=payload.id,
@@ -199,6 +203,7 @@ def update_profile(
         """,
         (name, payload.yaml_content, now_iso, profile_id),
     )
+    logger.info("Updated bank profile: id=%s file_type=%s", profile_id, p.file_type)
 
     return ProfileSummary(
         id=profile_id,
@@ -224,6 +229,7 @@ def delete_profile(
         raise AppException(status_code=400, code="CANNOT_DELETE_BUILTIN", message="系统内置银行配置不允许删除")
 
     db.execute("DELETE FROM bank_profiles WHERE id = ?", (profile_id,))
+    logger.info("Deleted bank profile: id=%s", profile_id)
     return {"status": "deleted", "id": profile_id}
 
 
@@ -259,9 +265,12 @@ async def test_profile(
     content = await read_upload_limited(file, MAX_STATEMENT_UPLOAD_BYTES)
     probe = FileProbe(content, file_name=file.filename or "")
     importer = ProfileImporter(profile)
+    raw_suffix = Path(str(file.filename or "")).suffix.lower()
+    ext = raw_suffix if raw_suffix and re.fullmatch(r"\.[a-z0-9]{1,12}", raw_suffix) else "(none)"
 
     try:
         result = await anyio.to_thread.run_sync(importer.parse, probe)
+        logger.info("Profile test succeeded: profile_id=%s ext=%s size_bytes=%d parsed=%d", profile_id or "inline", ext, len(content), len(result.transactions))
         return ProfileTestResponse(
             success=True,
             parsed_count=len(result.transactions),
@@ -271,6 +280,7 @@ async def test_profile(
             errors=[],
         )
     except Exception as exc:
+        logger.warning("Profile test failed: profile_id=%s ext=%s exc_type=%s", profile_id or "inline", ext, type(exc).__name__)
         return ProfileTestResponse(
             success=False,
             parsed_count=0,
@@ -406,6 +416,14 @@ def suggest_mapping(
     if not currency:
         currency = fb_meta.get("currency")
 
+    logger.info(
+        "Suggest mapping completed: headers=%d file_type=%s source=%s llm_status=%s mode=%s",
+        len(headers),
+        payload.file_type,
+        source_kind,
+        llm_status,
+        mode,
+    )
     return {
         "amount_mode": mode,
         "column_mapping": mapping,

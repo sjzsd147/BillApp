@@ -632,7 +632,13 @@ import {
   exportLogsViaDesktop,
   getDesktopInfoViaDesktop,
 } from '@/utils/desktop';
-import { getFrontendLogs } from '@/utils/logCollector';
+import { getFrontendLogs, recordFrontendLog } from '@/utils/logCollector';
+import {
+  FileSnapshotError,
+  MAX_BACKUP_UPLOAD_BYTES,
+  getFileExtension,
+  snapshotFileToMemory,
+} from '@/utils/uploadFile';
 import type {
   SettingsOut,
   FxRatesResponse,
@@ -715,7 +721,7 @@ const previewLogText = computed(() => {
           entry.stack ? `\n${entry.stack}` : ''
         }`
     );
-    sections.push(`--- 本次会话前端异常 (${feLogs.length} 条) ---\n${feLines.join('\n')}`);
+    sections.push(`--- 本次会话前端运行日志 (${feLogs.length} 条) ---\n${feLines.join('\n')}`);
   }
   if (sections.length === 0) {
     return '当前暂无可预览的运行日志记录。';
@@ -1126,21 +1132,24 @@ async function handleSaveManualFx() {
 async function handleBackup() {
   backingUp.value = true;
   backupNotice.value = null;
-  const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+  const stamp = dayjs().format('YYYYMMDD-HHmmss');
   const defaultFilename = `billapp-backup-${stamp}.db`;
   const win = window as any;
+  recordFrontendLog('info', 'settings', 'database backup start');
 
   try {
     // 1. Desktop Electron native Save-As dialog via preload IPC bridge
     const desktopRes = await saveDatabaseBackupViaDesktop(defaultFilename);
     if (desktopRes !== null) {
       if (desktopRes.cancelled) {
+        recordFrontendLog('info', 'settings', 'database backup cancelled (channel=desktop)');
         ElMessage.info('已取消导出数据库备份');
         return;
       }
       if (!desktopRes.ok) {
         throw new Error(desktopRes.error || '导出数据库备份失败');
       }
+      recordFrontendLog('info', 'settings', `database backup done (channel=desktop, size=${desktopRes.size_bytes ?? 0}B)`);
       const savedPath = desktopRes.path || desktopRes.filename || defaultFilename;
       backupNotice.value = {
         type: 'success',
@@ -1171,6 +1180,7 @@ async function handleBackup() {
         });
       } catch (pickerErr: any) {
         if (pickerErr?.name === 'AbortError') {
+          recordFrontendLog('info', 'settings', 'database backup cancelled (channel=picker)');
           ElMessage.info('已取消导出数据库备份');
           return;
         }
@@ -1184,6 +1194,7 @@ async function handleBackup() {
       } finally {
         await writable.close();
       }
+      recordFrontendLog('info', 'settings', `database backup done (channel=picker, size=${blob.size}B)`);
       const chosenName = handle.name || defaultFilename;
       backupNotice.value = {
         type: 'success',
@@ -1201,6 +1212,7 @@ async function handleBackup() {
 
     // 3. Fallback standard browser download
     const blob = await backupDatabase();
+    recordFrontendLog('info', 'settings', `database backup done (channel=browser, size=${blob.size}B)`);
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -1222,6 +1234,7 @@ async function handleBackup() {
     });
   } catch (err: any) {
     const msg = err?.message || '导出数据库备份失败';
+    recordFrontendLog('error', 'settings', `database backup failed ${msg}`);
     backupNotice.value = {
       type: 'error',
       title: '导出数据库备份失败',
@@ -1241,18 +1254,32 @@ function triggerRestoreUpload() {
 
 async function handleRestoreFileChange(event: Event) {
   const input = event.target as HTMLInputElement;
-  const file = input.files?.[0];
+  const rawFile = input.files?.[0];
+  const ext = getFileExtension(rawFile?.name);
+  const snapshotPromise = rawFile
+    ? snapshotFileToMemory(rawFile, { maxBytes: MAX_BACKUP_UPLOAD_BYTES, source: 'select' })
+    : null;
+  snapshotPromise?.catch(() => {});
   input.value = '';
-  if (!file) return;
+  if (!rawFile || !snapshotPromise) return;
 
   restoring.value = true;
+  recordFrontendLog('info', 'settings', `database restore start ext=${ext} size=${rawFile.size}B`);
   try {
+    const file = await snapshotPromise;
     const res = await restoreDatabase(file);
+    recordFrontendLog(
+      'info',
+      'settings',
+      `database restore done txns=${res.transactions_count} accounts=${res.accounts_count}`
+    );
     ElMessage.success(`数据库已恢复：共 ${res.transactions_count} 条交易、${res.accounts_count} 个账户`);
     await Promise.all([loadSettings(), loadFxOverview(), appStore.fetchMeta(), appStore.fetchLLMStatus()]);
   } catch (err: any) {
+    const msg = err instanceof FileSnapshotError ? err.userMessage : err?.message || '恢复数据库失败';
+    recordFrontendLog('error', 'settings', `database restore failed ext=${ext} ${msg}`);
     if (!err?.toasted) {
-      ElMessage.error(err?.message || '恢复数据库失败');
+      ElMessage.error(msg);
     }
   } finally {
     restoring.value = false;
@@ -1271,16 +1298,19 @@ async function handleConfirmReset() {
     return;
   }
   resetting.value = true;
+  recordFrontendLog('info', 'settings', `data reset start keepRules=${resetForm.keep_rules}`);
   try {
     await resetData({
       confirm_text: resetForm.confirm_text,
       keep_rules: resetForm.keep_rules,
       keep_settings: true,
     });
+    recordFrontendLog('info', 'settings', 'data reset done');
     showResetDialog.value = false;
     ElMessage.success('账单数据已清空');
     await Promise.all([loadSettings(), loadFxOverview(), appStore.fetchMeta(), appStore.fetchLLMStatus()]);
   } catch (err: any) {
+    recordFrontendLog('error', 'settings', `data reset failed ${err?.message || '清空数据失败'}`);
     if (!err?.toasted) {
       ElMessage.error(err?.message || '清空数据失败');
     }
@@ -1542,6 +1572,7 @@ async function handleExportLogs(format: 'zip' | 'log') {
     await loadLogsInfo();
   } catch (err: any) {
     const msg = err?.message || '导出日志失败';
+    recordFrontendLog('error', 'settings', `diagnostic logs export failed format=${format} ${msg}`);
     logExportNotice.value = {
       type: 'error',
       title: '导出日志失败',

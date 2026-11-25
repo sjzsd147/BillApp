@@ -45,9 +45,23 @@ function formatArg(arg) {
 
 function formatLocalTimestamp(date = new Date()) {
   const pad = (n, len = 2) => String(n).padStart(len, '0');
+  const offsetMin = -date.getTimezoneOffset();
+  const sign = offsetMin >= 0 ? '+' : '-';
+  const absOffset = Math.abs(offsetMin);
+  const tzHours = pad(Math.floor(absOffset / 60));
+  const tzMins = pad(absOffset % 60);
   return (
     `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
-    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}` +
+    `${sign}${tzHours}:${tzMins}`
+  );
+}
+
+function formatLocalFilenameStamp(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return (
+    `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-` +
+    `${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
   );
 }
 
@@ -229,5 +243,7 @@ function createDesktopLogger({
 
 module.exports = {
   createDesktopLogger,
+  formatLocalFilenameStamp,
+  formatLocalTimestamp,
   sanitizeLogText,
 };

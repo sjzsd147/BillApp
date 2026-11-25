@@ -4,6 +4,7 @@ import apiClient from '@/api/client';
 import { exportLogs, getLogsInfo } from '@/api/logs';
 import {
   clearFrontendLogs,
+  formatLocalLogTimestamp,
   getFrontendLogs,
   installGlobalErrorCapture,
   recordFrontendLog,
@@ -49,6 +50,19 @@ describe('frontend log collector and logs API', () => {
     expect(logs.length).toBe(1);
     expect(logs[0].source).toBe('vue:render function');
     expect(logs[0].message).not.toContain('secret123');
+  });
+
+  it('formats frontend timestamps in local time with explicit UTC offset (never raw Z)', () => {
+    const ts = formatLocalLogTimestamp(new Date(2026, 10, 25, 21, 38, 42, 985));
+    expect(ts).toMatch(/^2026-11-25 21:38:42\.985[+-]\d{2}:\d{2}$/);
+    expect(ts.endsWith('Z')).toBe(false);
+
+    recordFrontendLog('info', 'import', 'files dropped count=1');
+    const logs = getFrontendLogs();
+    expect(logs.length).toBe(1);
+    expect(logs[0].timestamp).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}$/);
+    expect(logs[0].level).toBe('info');
+    expect(logs[0].source).toBe('import');
   });
 
   it('calls backend /logs/info and /logs/export endpoints with expected options', async () => {

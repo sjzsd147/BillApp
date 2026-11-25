@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import sqlite3
+import time
 from typing import Any, Generator, Optional, Union
 from urllib.parse import urlparse
 
@@ -216,10 +217,12 @@ def create_app(
         expose_headers=["Content-Disposition", "X-BillApp-Log-Filename"],
     )
 
-    # Local security middleware: Host DNS-rebinding defense, Origin CSRF defense, and Token auth
+    # Local security middleware: Host DNS-rebinding defense, Origin CSRF defense, Token auth & API logging
     @app.middleware("http")
     async def local_security_middleware(request: Request, call_next):
+        started_at = time.perf_counter()
         token = getattr(app.state, "api_token", None)
+        path = request.url.path
 
         # 1. Host header allowlist (blocks DNS rebinding)
         host_header = (request.headers.get("host") or "").strip()
@@ -228,6 +231,7 @@ def create_app(
         if token is None:
             allowed_hosts.add("testserver")
         if hostname not in allowed_hosts:
+            logger.warning("Blocked %s %s: INVALID_HOST (host=%s)", request.method, path, hostname)
             return JSONResponse(
                 status_code=403,
                 content={
@@ -246,6 +250,7 @@ def create_app(
                 same_origin_http = f"http://{host_header.lower()}"
                 same_origin_https = f"https://{host_header.lower()}"
                 if origin_norm not in allowed_origin_set and origin_norm not in (same_origin_http, same_origin_https):
+                    logger.warning("Blocked %s %s: FORBIDDEN_ORIGIN (origin=%s)", request.method, path, origin)
                     return JSONResponse(
                         status_code=403,
                         content={
@@ -259,7 +264,7 @@ def create_app(
         if (
             token
             and request.method == "GET"
-            and request.url.path == "/"
+            and path == "/"
             and "boot_token" in request.query_params
         ):
             boot_expected = getattr(app.state, "bootstrap_token", None)
@@ -277,7 +282,6 @@ def create_app(
                 return resp
 
         # 4. Enforce local API token on /api/* (except /api/health) and OpenAPI docs
-        path = request.url.path
         protected = (
             (path.startswith("/api/") and path != "/api/health")
             or path in ("/docs", "/redoc", "/openapi.json")
@@ -290,6 +294,7 @@ def create_app(
                 or (bool(cookie_token) and hmac.compare_digest(cookie_token, token))
             )
             if not authorized:
+                logger.warning("Blocked %s %s: UNAUTHORIZED (missing or invalid session token)", request.method, path)
                 return JSONResponse(
                     status_code=401,
                     content={
@@ -298,7 +303,30 @@ def create_app(
                     },
                 )
 
-        return await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            if path.startswith("/api/"):
+                elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+                logger.error(
+                    "API %s %s -> 500 (%dms) unhandled=%s",
+                    request.method,
+                    path,
+                    elapsed_ms,
+                    type(exc).__name__,
+                )
+            raise
+        if path.startswith("/api/") and (
+            request.method in ("POST", "PUT", "PATCH", "DELETE") or response.status_code >= 400
+        ):
+            elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+            if response.status_code >= 500:
+                logger.error("API %s %s -> %d (%dms)", request.method, path, response.status_code, elapsed_ms)
+            elif response.status_code >= 400:
+                logger.warning("API %s %s -> %d (%dms)", request.method, path, response.status_code, elapsed_ms)
+            else:
+                logger.info("API %s %s -> %d (%dms)", request.method, path, response.status_code, elapsed_ms)
+        return response
 
     # Custom Exception Handlers
     @app.exception_handler(AppException)
@@ -311,6 +339,14 @@ def create_app(
                 request.url.path,
                 exc.code,
                 exc.message,
+            )
+        elif exc.status_code >= 400:
+            logger.warning(
+                "AppException %s on %s %s: code=%s",
+                exc.status_code,
+                request.method,
+                request.url.path,
+                exc.code,
             )
         return JSONResponse(
             status_code=exc.status_code,
@@ -330,6 +366,16 @@ def create_app(
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        locs = [
+            ".".join(str(part) for part in err.get("loc", ()))
+            for err in (exc.errors() or [])[:5]
+        ]
+        logger.warning(
+            "ValidationError 422 on %s %s: fields=%s",
+            request.method,
+            request.url.path,
+            locs,
+        )
         return JSONResponse(
             status_code=422,
             content={
@@ -343,6 +389,7 @@ def create_app(
     async def sqlite_integrity_handler(request: Request, exc: sqlite3.IntegrityError):
         err_msg = str(exc)
         status_code = 409 if "unique" in err_msg.lower() else 400
+        logger.warning("SQLite IntegrityError %d on %s %s", status_code, request.method, request.url.path)
         return JSONResponse(
             status_code=status_code,
             content={"code": "INTEGRITY_ERROR", "message": "数据完整性约束校验失败", "details": err_msg},

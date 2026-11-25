@@ -441,6 +441,7 @@ async function startBackend({
 
   let exited = false;
   let exitCode = null;
+  let stopping = false;
   let spawnError = null;
   let readyInfo = null;
   let stdoutBuf = '';
@@ -457,9 +458,12 @@ async function startBackend({
     appendStderr(`spawn error: ${err?.message || err}\n`);
   });
 
-  child.once('exit', (code) => {
+  child.once('exit', (code, signal) => {
     exited = true;
     exitCode = code;
+    if (onLog && !stopping) {
+      onLog('stderr', `Backend process exited unexpectedly (code=${code}, signal=${signal || 'none'})\n`);
+    }
   });
 
   child.stderr.on('data', (chunk) => {
@@ -501,6 +505,7 @@ async function startBackend({
 
   let stoppingPromise = null;
   const stop = async () => {
+    stopping = true;
     if (!stoppingPromise) {
       stoppingPromise = stopChildProcess(child, { platform });
     }

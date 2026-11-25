@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { app, BrowserWindow, Menu, dialog, ipcMain, net, safeStorage, session, shell } = require('electron');
 const { startBackend, httpPostBuffer, httpPostJsonForBuffer, parseDbCliArg } = require('./backend.cjs');
-const { createDesktopLogger } = require('./logger.cjs');
+const { createDesktopLogger, formatLocalFilenameStamp } = require('./logger.cjs');
 const { createAppUpdater } = require('./updater.cjs');
 
 app.setName('BillApp');
@@ -15,7 +15,8 @@ const desktopLogger = createDesktopLogger({
   mirrorConsole: !app.isPackaged && !process.argv.includes('--smoke-test'),
 });
 // Ensure loopback traffic to the local FastAPI sidecar never routes through system HTTP proxies.
-app.commandLine.appendSwitch('proxy-bypass-list', '<-loopback>,127.0.0.1,localhost');
+// Note: do NOT include Chromium's subtractive "<-loopback>" rule, which disables implicit loopback bypass.
+app.commandLine.appendSwitch('proxy-bypass-list', '127.0.0.1,localhost,::1,<local>');
 
 const WINDOW_TITLE = '账单助手 - BillApp';
 const SMOKE_TEST =
@@ -109,6 +110,19 @@ function assertTrustedIpcSender(event) {
   }
 }
 
+const ALLOWED_TRUSTED_LOCAL_PERMISSIONS = new Set(['loopback-network']);
+
+function isTrustedOriginString(rawOrigin) {
+  if (!rawOrigin) {
+    return false;
+  }
+  try {
+    return trustedOrigins.includes(new URL(rawOrigin).origin);
+  } catch {
+    return trustedOrigins.includes(rawOrigin);
+  }
+}
+
 function configureSessionSecurity(sess, allowedOrigins) {
   trustedOrigins = Array.from(new Set(allowedOrigins));
   if (sessionSecurityConfigured) {
@@ -116,12 +130,25 @@ function configureSessionSecurity(sess, allowedOrigins) {
   }
   sessionSecurityConfigured = true;
 
-  // Deny all browser permission requests (camera, mic, geolocation, clipboard, notifications, etc.)
-  sess.setPermissionRequestHandler((_wc, _permission, callback) => {
+  // Deny dangerous browser permissions (camera, mic, geolocation, clipboard, notifications, etc.),
+  // while permitting Chromium loopback-network checks strictly for our trusted local UI origin.
+  sess.setPermissionRequestHandler((wc, permission, callback, details) => {
+    const origin = details?.requestingUrl || wc?.getURL?.() || '';
+    if (ALLOWED_TRUSTED_LOCAL_PERMISSIONS.has(permission) && isTrustedOriginString(origin)) {
+      callback(true);
+      return;
+    }
+    desktopLogger.warn(`[security] Denied permission request: ${permission}`);
     callback(false);
   });
   if (typeof sess.setPermissionCheckHandler === 'function') {
-    sess.setPermissionCheckHandler(() => false);
+    sess.setPermissionCheckHandler((wc, permission, requestingOrigin) => {
+      const origin = requestingOrigin || wc?.getURL?.() || '';
+      if (ALLOWED_TRUSTED_LOCAL_PERMISSIONS.has(permission) && isTrustedOriginString(origin)) {
+        return true;
+      }
+      return false;
+    });
   }
 
   // Inject local per-session API auth token ONLY to trusted local backend/UI origins
@@ -177,6 +204,23 @@ function configureSessionSecurity(sess, allowedOrigins) {
       // ignore invalid URL
     }
     callback({ responseHeaders });
+  });
+
+  // Capture low-level Chromium network errors (e.g. net::ERR_FILE_NOT_FOUND, ERR_UPLOAD_FILE_CHANGED,
+  // ERR_ACCESS_DENIED, ERR_CONNECTION_RESET) on local UI/API requests without leaking query params.
+  sess.webRequest.onErrorOccurred((details) => {
+    try {
+      const parsed = new URL(details.url);
+      const isLocal = trustedOrigins.includes(parsed.origin);
+      const errText = String(details.error || 'UNKNOWN');
+      if (isLocal && (parsed.pathname.startsWith('/api/') || errText !== 'net::ERR_ABORTED')) {
+        desktopLogger.error(
+          `[net:error] ${details.method || 'GET'} ${parsed.pathname} -> ${errText} (resourceType=${details.resourceType || 'unknown'})`
+        );
+      }
+    } catch {
+      desktopLogger.error(`[net:error] ${details.method || 'GET'} -> ${details.error || 'UNKNOWN'}`);
+    }
   });
 }
 
@@ -319,12 +363,28 @@ function createMainWindow() {
   win.webContents.on('will-navigate', (event, navigationUrl) => {
     if (!isAllowedUiUrl(navigationUrl, trustedOrigins)) {
       event.preventDefault();
+      let proto = 'unknown';
+      try {
+        proto = new URL(navigationUrl).protocol;
+      } catch {
+        // ignore invalid URL
+      }
+      desktopLogger.warn(`[security] Blocked unexpected navigation (protocol=${proto})`);
     }
   });
 
   win.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+    let safeUrl = '';
+    if (validatedURL) {
+      try {
+        const parsed = new URL(validatedURL);
+        safeUrl = `${parsed.origin}${parsed.pathname}`;
+      } catch {
+        safeUrl = String(validatedURL).split('?')[0];
+      }
+    }
     desktopLogger.error(
-      `[renderer] did-fail-load (${errorCode}): ${errorDescription} url=${validatedURL || ''}`
+      `[renderer] did-fail-load (${errorCode}): ${errorDescription} url=${safeUrl}`
     );
   });
 
@@ -334,11 +394,32 @@ function createMainWindow() {
     );
   });
 
-  win.webContents.on('console-message', (_event, level, message, line, sourceId) => {
-    // Capture renderer console warnings (2) and errors (3)
-    if (level >= 2) {
-      const tag = level >= 3 ? 'error' : 'warn';
-      desktopLogger[tag](`[renderer:console] ${message} (${sourceId || ''}:${line || 0})`);
+  win.webContents.on('console-message', (event, legacyLevel, legacyMessage, legacyLine, legacySourceId) => {
+    // Capture renderer console warnings and errors across both Electron 35+ object payloads and legacy args
+    let isError = false;
+    let isWarn = false;
+    let message = '';
+    let line = 0;
+    let sourceId = '';
+
+    if (typeof legacyLevel === 'number') {
+      isError = legacyLevel >= 3;
+      isWarn = legacyLevel === 2;
+      message = String(legacyMessage || '');
+      line = legacyLine || 0;
+      sourceId = String(legacySourceId || '');
+    } else if (event && typeof event === 'object' && 'level' in event) {
+      const lvl = String(event.level || '').toLowerCase();
+      isError = lvl === 'error';
+      isWarn = lvl === 'warning' || lvl === 'warn';
+      message = String(event.message || '');
+      line = event.lineNumber || 0;
+      sourceId = String(event.sourceId || '');
+    }
+
+    if (isError || isWarn) {
+      const tag = isError ? 'error' : 'warn';
+      desktopLogger[tag](`[renderer:console] ${message} (${sourceId}:${line})`);
     }
   });
 
@@ -346,6 +427,12 @@ function createMainWindow() {
     downloadListenerRegistered = true;
     win.webContents.session.on('will-download', (_event, item) => {
       const filename = sanitizeDownloadFilename(item.getFilename(), 'billapp-export.xlsx');
+      const rawExt = path.extname(filename).toLowerCase();
+      const ext = /^\.[a-z0-9]{1,12}$/.test(rawExt) ? rawExt : '(none)';
+      desktopLogger.info(`[download] Starting native download (ext=${ext})`);
+      item.once('done', (_doneEvent, state) => {
+        desktopLogger.info(`[download] Completed native download (ext=${ext}, state=${state})`);
+      });
       if (!app.isPackaged) {
         const testDir = (process.env.BILLAPP_TEST_DOWNLOAD_DIR || '').trim();
         if (testDir) {
@@ -456,7 +543,7 @@ function registerIpcHandlers() {
       return { ok: false, cancelled: false, error: '后台服务尚未就绪' };
     }
 
-    const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+    const stamp = formatLocalFilenameStamp();
     const defaultFallback = `billapp-backup-${stamp}.db`;
     let filename = sanitizeDownloadFilename(payload?.defaultFilename, defaultFallback);
     if (!filename.toLowerCase().endsWith('.db')) {
@@ -489,12 +576,14 @@ function registerIpcHandlers() {
     }
 
     try {
+      desktopLogger.info('Exporting database backup via desktop Save-As dialog');
       const headers = backendHandle.apiToken
         ? { 'X-BillApp-Token': backendHandle.apiToken }
         : {};
       const { buffer } = await httpPostBuffer(`${backendHandle.url}/api/backup`, 30000, headers);
       await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
       await fs.promises.writeFile(targetPath, buffer);
+      desktopLogger.info(`Database backup exported successfully (size_bytes=${buffer.length})`);
       return {
         ok: true,
         cancelled: false,
@@ -503,6 +592,7 @@ function registerIpcHandlers() {
         size_bytes: buffer.length,
       };
     } catch (err) {
+      desktopLogger.error('Failed to export database backup:', err);
       return {
         ok: false,
         cancelled: false,
@@ -519,7 +609,7 @@ function registerIpcHandlers() {
 
     const format = payload?.format === 'log' ? 'log' : 'zip';
     const ext = format === 'log' ? '.log' : '.zip';
-    const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+    const stamp = formatLocalFilenameStamp();
     const defaultFallback = `billapp-logs-${stamp}${ext}`;
     let filename = sanitizeDownloadFilename(payload?.defaultFilename, defaultFallback);
     if (!filename.toLowerCase().endsWith(ext)) {
@@ -589,6 +679,7 @@ function registerIpcHandlers() {
       );
       await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
       await fs.promises.writeFile(targetPath, buffer);
+      desktopLogger.info(`Diagnostic logs exported successfully (format=${format}, size_bytes=${buffer.length})`);
       return {
         ok: true,
         cancelled: false,

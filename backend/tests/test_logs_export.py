@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from billapp.app import APP_VERSION, create_app
 from billapp.core.logs import (
     attach_package_logging,
+    format_local_log_timestamp,
     redact_log_text,
     sanitize_archive_filename,
     setup_file_logging,
@@ -314,6 +315,13 @@ def test_rotating_file_logging_captures_subpackage_logs_without_duplication(monk
         content = log_path.read_text(encoding="utf-8")
         assert content.count("UNIQUE_LAUNCHER_LINE_123") == 1
         assert content.count("UNIQUE_LLM_SUBMODULE_LINE_456") == 1
+        # Verify timestamps use local time with explicit millisecond + UTC offset format
+        import re
+
+        assert re.search(
+            r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2} \[INFO\] \[billapp\.launcher\] UNIQUE_LAUNCHER_LINE_123",
+            content,
+        )
     finally:
         for lgr in (test_launcher, test_app, test_pkg, logging.getLogger("uvicorn.error")):
             for h in list(lgr.handlers):
@@ -326,3 +334,72 @@ def test_rotating_file_logging_captures_subpackage_logs_without_duplication(monk
         test_app.handlers = orig_app_handlers
         test_app.propagate = orig_app_prop
         test_pkg.handlers = orig_pkg_handlers
+
+
+def test_import_and_security_operations_emit_sanitized_logs_with_timezone(tmp_path: Path, caplog):
+    import re
+
+    ts = format_local_log_timestamp()
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}", ts)
+
+    db_file = tmp_path / "ops_logs.db"
+    token = "c" * 64
+    app = create_app(db_path=str(db_file), api_token=token, log_path=tmp_path / "launcher.log")
+
+    with caplog.at_level(logging.INFO, logger="billapp"), TestClient(
+        app, base_url="http://127.0.0.1:18997"
+    ) as client:
+        # 1. Unauthorized POST must be logged without leaking token
+        r_unauth = client.post("/api/backup")
+        assert r_unauth.status_code == 401
+
+        # 2. Import preview receipt & completion must be logged with extension/size only (no PII filename)
+        csv_body = (
+            "交易时间,交易分类,交易对方,对方账号,商品说明,收/支,金额,收/付款方式,交易状态,交易订单号,商家订单号,备注\n"
+            "2026-10-10 12:00:00,餐饮美食,测试餐厅,,午餐,支出,35.00,余额宝,交易成功,202610100001,M001,\n"
+        ).encode("utf-8")
+        r_prev = client.post(
+            "/api/import/preview",
+            files={"file": ("张伟明_秘密账单.csv", csv_body, "text/csv")},
+            headers={"X-BillApp-Token": token},
+        )
+        assert r_prev.status_code == 200
+
+        # 3. Export diagnostics must include runtime timezone
+        r_exp = client.post(
+            "/api/logs/export",
+            json={"format": "zip"},
+            headers={"X-BillApp-Token": token},
+        )
+        assert r_exp.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(r_exp.content), "r") as zf:
+            diag = json.loads(zf.read("diagnostics.json").decode("utf-8"))
+            assert re.search(r"[+-]\d{2}:\d{2}$", diag["exported_at"])
+            assert diag["runtime"].get("timezone", "").startswith("UTC")
+
+    joined = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "UNAUTHORIZED" in joined
+    assert "Import preview received: ext=.csv" in joined
+    assert "API POST /api/import/preview -> 200" in joined
+    assert "张伟明" not in joined
+    assert token not in joined
+
+
+def test_unhandled_api_exception_is_logged_by_middleware(monkeypatch, tmp_path: Path, caplog):
+    db_file = tmp_path / "err_logs.db"
+    app = create_app(db_path=str(db_file), log_path=tmp_path / "launcher.log")
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated crash")
+
+    monkeypatch.setattr("billapp.api.logs.discover_backend_log_files", _boom)
+
+    with caplog.at_level(logging.ERROR, logger="billapp"), TestClient(
+        app, raise_server_exceptions=False
+    ) as client:
+        resp = client.get("/api/logs/info")
+        assert resp.status_code == 500
+
+    joined = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "API GET /api/logs/info -> 500" in joined
+    assert "unhandled=RuntimeError" in joined

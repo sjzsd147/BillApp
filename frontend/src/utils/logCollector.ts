@@ -29,6 +29,20 @@ function truncateText(text: string, maxLen: number): string {
   return `${text.slice(0, maxLen)}...(truncated)`;
 }
 
+export function formatLocalLogTimestamp(date: Date = new Date()): string {
+  const pad = (n: number, len = 2) => String(n).padStart(len, '0');
+  const offsetMin = -date.getTimezoneOffset();
+  const sign = offsetMin >= 0 ? '+' : '-';
+  const absOffset = Math.abs(offsetMin);
+  const tzHours = pad(Math.floor(absOffset / 60));
+  const tzMins = pad(absOffset % 60);
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}` +
+    `${sign}${tzHours}:${tzMins}`
+  );
+}
+
 export function recordFrontendLog(
   level: 'info' | 'warn' | 'error',
   source: string,
@@ -38,7 +52,7 @@ export function recordFrontendLog(
   const sanitizedMsg = truncateText(sanitizeFrontendLogText(message || ''), MAX_MESSAGE_LEN);
   const sanitizedStack = stack ? truncateText(sanitizeFrontendLogText(stack), MAX_STACK_LEN) : undefined;
   entries.push({
-    timestamp: new Date().toISOString(),
+    timestamp: formatLocalLogTimestamp(),
     level,
     source: (source || 'frontend').slice(0, 64),
     message: sanitizedMsg,

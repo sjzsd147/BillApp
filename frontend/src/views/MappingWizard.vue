@@ -45,7 +45,7 @@
                 ✨ 让 AI 智能生成字段映射
               </el-button>
               <el-button
-                v-if="activeQueueItem"
+                v-if="activeQueueItem?.file"
                 type="success"
                 plain
                 :loading="aiFullParsing"
@@ -297,10 +297,13 @@ const activeQueueItem = computed(() => {
   const token = (route.params.token as string) || '';
   const qFileName = (route.query.fileName as string) || fileName.value || '';
   let found = importStore.queue.find(
-    (i) => (token && i.preview?.token === token) || (qFileName && i.name === qFileName)
+    (i) => (token && i.preview?.token === token) || (qFileName && i.name === qFileName && Boolean(i.file))
   );
+  if (!found && qFileName) {
+    found = importStore.queue.find((i) => i.name === qFileName);
+  }
   if (!found && importStore.queue.length > 0) {
-    found = importStore.queue[0];
+    found = importStore.queue.find((i) => Boolean(i.file)) || importStore.queue[0];
   }
   return found || null;
 });
@@ -871,6 +874,7 @@ async function handleSaveAndFinish() {
     });
     const pendingItem = importStore.queue.find(
       (i) =>
+        Boolean(i.file) &&
         (i.status === 'need_mapping' || i.status === 'error') &&
         (!fileName.value || i.name === fileName.value)
     );
@@ -907,8 +911,8 @@ async function handleSaveAndFinish() {
 
 async function handleDirectAiTakeover() {
   const targetItem = activeQueueItem.value;
-  if (!targetItem) {
-    ElMessage.warning('未找到对应的待导入文件');
+  if (!targetItem || !targetItem.file) {
+    ElMessage.warning('未找到可读取的待导入文件');
     return;
   }
   aiFullParsing.value = true;

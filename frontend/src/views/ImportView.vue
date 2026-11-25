@@ -113,7 +113,7 @@
                     预览
                   </el-button>
                   <el-button
-                    v-if="row.status === 'queued' || row.status === 'error'"
+                    v-if="row.status === 'queued' || (row.status === 'error' && row.file)"
                     type="primary"
                     link
                     size="small"
@@ -122,7 +122,7 @@
                     解析
                   </el-button>
                   <el-button
-                    v-if="row.status === 'need_password'"
+                    v-if="row.status === 'need_password' && row.file"
                     type="warning"
                     link
                     size="small"
@@ -131,7 +131,7 @@
                     输入密码
                   </el-button>
                   <el-button
-                    v-if="row.status === 'need_mapping' || row.status === 'error'"
+                    v-if="(row.status === 'need_mapping' || row.status === 'error') && row.file"
                     type="success"
                     link
                     size="small"
@@ -141,7 +141,7 @@
                     AI 整单识别
                   </el-button>
                   <el-button
-                    v-if="row.status === 'need_mapping' || row.status === 'error'"
+                    v-if="(row.status === 'need_mapping' || row.status === 'error') && row.file"
                     type="primary"
                     link
                     size="small"
@@ -413,6 +413,13 @@ import { UploadFilled, Refresh, InfoFilled } from '@element-plus/icons-vue';
 import { useImportStore, type FileQueueItem } from '@/stores/import';
 import { useAppStore } from '@/stores/app';
 import { getProfiles, deleteProfile } from '@/api/profiles';
+import { recordFrontendLog } from '@/utils/logCollector';
+import {
+  captureDroppedFiles,
+  captureSelectedFiles,
+  FileSnapshotError,
+  type CapturedFileTask,
+} from '@/utils/uploadFile';
 import DirectionTag from '@/components/DirectionTag.vue';
 import AmountText from '@/components/AmountText.vue';
 import SelfCheckList from '@/components/SelfCheckList.vue';
@@ -527,32 +534,100 @@ function triggerFileInput() {
   fileInputRef.value?.click();
 }
 
+async function ingestCapturedTasks(tasks: CapturedFileTask[], source: 'drop' | 'select') {
+  const readyFiles: File[] = [];
+  const failureMessages: string[] = [];
+
+  for (const task of tasks) {
+    try {
+      const memFile = await task.snapshotPromise;
+      readyFiles.push(memFile);
+      recordFrontendLog(
+        'info',
+        'import',
+        `file snapshotted source=${source} ext=${task.ext} size=${memFile.size}B`
+      );
+    } catch (err: any) {
+      const isSnapErr = err instanceof FileSnapshotError;
+      const errCode = isSnapErr ? err.code : 'FILE_UNREADABLE';
+      const cause = isSnapErr && err.causeName ? ` cause=${err.causeName}` : '';
+      const msg = isSnapErr ? err.userMessage : err?.message || '无法读取该文件，请先保存到本地文件夹后再导入';
+      recordFrontendLog(
+        'error',
+        'import',
+        `file snapshot failed source=${source} ext=${task.ext} size=${task.size}B dir=${task.isDirectory} code=${errCode}${cause}`
+      );
+      importStore.addErrorItem(task.name, task.size, msg);
+      if (!failureMessages.includes(msg)) {
+        failureMessages.push(msg);
+      }
+    }
+  }
+
+  for (const msg of failureMessages) {
+    ElMessage.error({ message: msg, duration: 6000 });
+  }
+
+  if (readyFiles.length > 0) {
+    importStore.addFiles(readyFiles);
+    await processAllQueued();
+  }
+}
+
 function handleFileSelect(e: Event) {
   const target = e.target as HTMLInputElement;
   if (target.files && target.files.length > 0) {
-    importStore.addFiles(target.files);
+    const tasks = captureSelectedFiles(target.files);
+    recordFrontendLog('info', 'import', `files selected count=${tasks.length}`);
     target.value = '';
-    processAllQueued();
+    void ingestCapturedTasks(tasks, 'select');
   }
 }
 
 function handleDrop(e: DragEvent) {
   isDragging.value = false;
-  if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-    importStore.addFiles(e.dataTransfer.files);
-    processAllQueued();
+  const { tasks, transferTypes } = captureDroppedFiles(e.dataTransfer);
+  if (tasks.length === 0) {
+    recordFrontendLog(
+      'warn',
+      'import',
+      `drop yielded no readable files types=[${transferTypes.slice(0, 8).join(',')}]`
+    );
+    ElMessage.warning({
+      message: '未获取到可读取的本地文件（不支持直接从邮件客户端如 Thunderbird 或压缩包预览拖入虚拟附件），请先保存到本地文件夹后再拖入或点击选择',
+      duration: 6000,
+    });
+    return;
   }
+  recordFrontendLog(
+    'info',
+    'import',
+    `files dropped count=${tasks.length} types=[${transferTypes.slice(0, 8).join(',')}]`
+  );
+  void ingestCapturedTasks(tasks, 'drop');
 }
 
+let isProcessingQueue = false;
+
 async function processAllQueued() {
-  for (const item of importStore.queue) {
-    if (item.status === 'queued') {
+  if (isProcessingQueue) {
+    return;
+  }
+  isProcessingQueue = true;
+  try {
+    while (true) {
+      const nextItem = importStore.queue.find((item) => item.status === 'queued');
+      if (!nextItem) {
+        break;
+      }
       try {
-        await importStore.parseFile(item);
+        await importStore.parseFile(nextItem);
       } catch {
         // Error recorded in item.status and errorMsg
       }
     }
+  } finally {
+    isProcessingQueue = false;
   }
 }
 

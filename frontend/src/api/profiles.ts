@@ -1,4 +1,5 @@
 import apiClient from './client';
+import { MAX_STATEMENT_UPLOAD_BYTES, snapshotFileToMemory } from '@/utils/uploadFile';
 import type {
   ProfileSummary,
   ProfileDetail,
@@ -29,18 +30,20 @@ export function deleteProfile(id: string): Promise<{ status: string; id: string 
   return apiClient.delete(`/profiles/${id}`);
 }
 
-export function testProfile(
+export async function testProfile(
   file: File,
   yamlContent?: string,
   profileId?: string
 ): Promise<ProfileTestResponse> {
+  const safeFile = await snapshotFileToMemory(file, {
+    maxBytes: MAX_STATEMENT_UPLOAD_BYTES,
+    source: 'upload',
+  });
   const formData = new FormData();
-  formData.append('file', file);
+  formData.append('file', safeFile);
   if (yamlContent) formData.append('yaml_content', yamlContent);
   if (profileId) formData.append('profile_id', profileId);
-  return apiClient.post('/profiles/test', formData, {
-    headers: { 'Content-Type': 'multipart/form-data' },
-  });
+  return apiClient.post('/profiles/test', formData);
 }
 
 export function suggestMapping(

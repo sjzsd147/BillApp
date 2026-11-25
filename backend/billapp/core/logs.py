@@ -32,6 +32,31 @@ LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
 _active_log_path: Optional[Path] = None
 _active_handler: Optional[RotatingFileHandler] = None
 
+
+def format_local_log_timestamp(
+    dt: Optional[datetime] = None,
+    *,
+    include_ms: bool = True,
+) -> str:
+    """Format a timezone-aware local timestamp (``YYYY-MM-DD HH:MM:SS[.mmm]±HH:MM``)."""
+    local_dt = (dt if dt is not None else datetime.now()).astimezone()
+    tz_raw = local_dt.strftime("%z")
+    tz_fmt = f"{tz_raw[:3]}:{tz_raw[3:]}" if len(tz_raw) == 5 else tz_raw
+    if include_ms:
+        ms = local_dt.microsecond // 1000
+        return f"{local_dt.strftime('%Y-%m-%d %H:%M:%S')}.{ms:03d}{tz_fmt}"
+    return f"{local_dt.strftime('%Y-%m-%d %H:%M:%S')}{tz_fmt}"
+
+
+class _LocalTimezoneFormatter(logging.Formatter):
+    """Log formatter emitting local timestamps with millisecond precision and explicit UTC offset."""
+
+    def formatTime(self, record: logging.LogRecord, datefmt: Optional[str] = None) -> str:
+        dt = datetime.fromtimestamp(record.created).astimezone()
+        if datefmt:
+            return dt.strftime(datefmt)
+        return format_local_log_timestamp(dt, include_ms=True)
+
 # ---------------------------------------------------------------------------
 # Always-on secret redaction patterns (NEVER disabled)
 # ---------------------------------------------------------------------------
@@ -133,7 +158,7 @@ def setup_file_logging(
                 backupCount=LOG_BACKUP_COUNT,
                 encoding="utf-8",
             )
-            handler.setFormatter(logging.Formatter(LOG_FORMAT))
+            handler.setFormatter(_LocalTimezoneFormatter(LOG_FORMAT))
             primary.addHandler(handler)
             primary.setLevel(logging.INFO)
             for extra_name in extra_logger_names:
@@ -392,8 +417,12 @@ def build_diagnostics_summary(
             if k in desktop_meta:
                 safe_desktop_meta[k] = desktop_meta[k]
 
+    local_now = datetime.now().astimezone()
+    tz_raw = local_now.strftime("%z")
+    tz_label = f"UTC{tz_raw[:3]}:{tz_raw[3:]}" if len(tz_raw) == 5 else (local_now.tzname() or "LOCAL")
+
     return {
-        "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "exported_at": format_local_log_timestamp(local_now, include_ms=False),
         "app_version": app_version,
         "redaction": {
             "secrets_redacted": True,
@@ -406,6 +435,7 @@ def build_diagnostics_summary(
             "machine": platform.machine(),
             "python_version": platform.python_version(),
             "frozen": bool(getattr(sys, "frozen", False)),
+            "timezone": tz_label,
         },
         "desktop": safe_desktop_meta,
         "database": {
@@ -442,17 +472,18 @@ def build_diagnostics_summary(
 
 def format_diagnostics_text(summary: Dict[str, Any]) -> str:
     """Format diagnostic summary dictionary as a clean human-readable text report."""
+    rt = summary.get("runtime", {})
+    tz_note = f" (本地时区 {rt.get('timezone')})" if rt.get("timezone") else ""
     lines = [
         "============================================================",
         "BillApp (账单助手) 诊断日志摘要",
         "============================================================",
-        f"导出时间: {summary.get('exported_at', '')}",
+        f"导出时间: {summary.get('exported_at', '')}{tz_note}",
         f"应用版本: v{summary.get('app_version', '')}",
         f"隐私脱敏: 密钥/令牌=已强制脱敏, 个人敏感信息/路径={'已脱敏' if summary.get('redaction', {}).get('pii_redacted') else '未启用'}",
         "",
         "[运行环境]",
     ]
-    rt = summary.get("runtime", {})
     lines.append(f"  操作系统: {rt.get('os', '')} {rt.get('os_release', '')} ({rt.get('machine', '')})")
     lines.append(f"  Python:   {rt.get('python_version', '')} (frozen={rt.get('frozen', False)})")
 

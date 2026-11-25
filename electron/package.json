@@ -1,6 +1,6 @@
 {
   "name": "billapp-desktop",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "账单助手 (BillApp) - 本地优先的跨平台个人账单管理桌面应用",
   "author": "BillApp Contributors <noreply@github.com>",
   "homepage": "https://github.com/sjzsd147/BillApp",

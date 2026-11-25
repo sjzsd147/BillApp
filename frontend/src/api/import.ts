@@ -1,4 +1,5 @@
 import apiClient from './client';
+import { MAX_STATEMENT_UPLOAD_BYTES, snapshotFileToMemory } from '@/utils/uploadFile';
 import type {
   ImportPreviewItem,
   ExtractRawResponse,
@@ -8,26 +9,33 @@ import type {
   BatchRollbackResponse,
 } from '@/types/api';
 
-export function extractRawImport(file: File, password?: string): Promise<ExtractRawResponse> {
+export async function extractRawImport(file: File, password?: string): Promise<ExtractRawResponse> {
+  const safeFile = await snapshotFileToMemory(file, {
+    maxBytes: MAX_STATEMENT_UPLOAD_BYTES,
+    source: 'upload',
+  });
   const formData = new FormData();
-  formData.append('file', file);
+  formData.append('file', safeFile);
   if (password) {
     formData.append('password', password);
   }
   return apiClient.post('/import/extract-raw', formData, {
-    headers: { 'Content-Type': 'multipart/form-data' },
     timeout: 60000,
   });
 }
 
-export function previewImport(
+export async function previewImport(
   file: File,
   password?: string,
   profileId?: string,
   useLlm?: boolean
 ): Promise<ImportPreviewItem> {
+  const safeFile = await snapshotFileToMemory(file, {
+    maxBytes: MAX_STATEMENT_UPLOAD_BYTES,
+    source: 'upload',
+  });
   const formData = new FormData();
-  formData.append('file', file);
+  formData.append('file', safeFile);
   if (password) {
     formData.append('password', password);
   }
@@ -38,7 +46,6 @@ export function previewImport(
     formData.append('use_llm', 'true');
   }
   return apiClient.post('/import/preview', formData, {
-    headers: { 'Content-Type': 'multipart/form-data' },
     timeout: useLlm ? 120000 : 60000,
   });
 }
