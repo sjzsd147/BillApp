@@ -151,6 +151,8 @@ function getKindLabel(kind: AccountKind): string {
       return '信用卡';
     case 'wallet':
       return '第三方钱包';
+    case 'platform':
+      return '第三方平台';
     default:
       return '其他';
   }
@@ -161,6 +163,7 @@ function getKindTagType(kind: AccountKind): '' | 'success' | 'warning' | 'info' 
     case 'bank_credit':
       return 'warning';
     case 'wallet':
+    case 'platform':
       return 'success';
     default:
       return 'info';
@@ -189,14 +192,16 @@ async function saveRename() {
   savingRename.value = true;
   try {
     await patchAccount(activeRenameAccount.value.id, {
-      alias: renameForm.alias.trim() || undefined,
+      alias: renameForm.alias.trim() || null,
     });
     ElMessage.success('账户别名已更新');
     showRenameDialog.value = false;
     await loadAccounts();
     await appStore.fetchMeta();
   } catch (err: any) {
-    ElMessage.error(err.message || '更新失败');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '更新失败');
+    }
   } finally {
     savingRename.value = false;
   }
@@ -221,7 +226,9 @@ async function executeMerge() {
     await loadAccounts();
     await appStore.fetchMeta();
   } catch (err: any) {
-    ElMessage.error(err.message || '合并失败');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '合并失败');
+    }
   } finally {
     merging.value = false;
   }

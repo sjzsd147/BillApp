@@ -334,12 +334,34 @@ columns 中的每个映射值必须严格等于【表头列表】中的某一个
 }
 """
 
+_DATE_YYYYMMDD_RE = re.compile(r"^(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])$")
+_TIMESTAMP_14_RE = re.compile(
+    r"^(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])(?:[01]\d|2[0-3])[0-5]\d[0-5]\d$"
+)
+_DATE_DMY_HYPHEN_RE = re.compile(r"^\d{1,2}-\d{1,2}-(?:19|20)\d{2}$")
+_DATE_RANGE_RE = re.compile(
+    r"^(?:19|20)\d{2}-?(?:0[1-9]|1[0-2])-?(?:0[1-9]|[12]\d|3[01])-(?:19|20)\d{2}-?(?:0[1-9]|1[0-2])-?(?:0[1-9]|[12]\d|3[01])$"
+)
+
+
+def _is_calendar_date_token(token_str: str) -> bool:
+    return bool(
+        _DATE_YYYYMMDD_RE.match(token_str)
+        or _TIMESTAMP_14_RE.match(token_str)
+        or _DATE_DMY_HYPHEN_RE.match(token_str)
+        or _DATE_RANGE_RE.match(token_str)
+    )
+
+
 def _mask_card_digits_keep_tail(text: str, placeholders: Optional[Dict[str, str]] = None) -> str:
-    """Mask long card/account numbers (>=8 chars) while retaining last 4 digits."""
+    """Mask long card/account numbers (>=8 chars) while retaining last 4 digits and preserving calendar dates."""
     idx = len(placeholders) if placeholders is not None else 0
 
     def _repl(match: re.Match[str]) -> str:
         nonlocal idx
+        full = match.group(0)
+        if _is_calendar_date_token(full):
+            return full
         tail = match.group(1)
         val = f"****{tail}"
         if placeholders is not None:
@@ -368,10 +390,25 @@ def _mask_preamble_cell(raw_val: Any) -> str:
         return ""
     s = re.sub(r"((?:户\s*名|客户姓名|姓\s*名|持卡人|Holder|Name)\s*[：:])\s*[^\s,，\t]+", r"\1 [已脱敏]", s, flags=re.IGNORECASE)
     s = re.sub(r"((?:验\s*证\s*码|Verification\s*Code)\s*[：:])\s*\S+", r"\1 ***", s, flags=re.IGNORECASE)
-    # Strip explicit 18-digit ID, 11-digit phone, email, 20-32d order ID first
-    s = sanitize_prompt_text(s)
+    # Strip explicit 18-digit ID, mobile/landline phone, email, and 20-32 digit order IDs before card tail preservation
+    s = re.sub(r"(?<!\d)\d{17}[\dXx](?!\d)", "[ID_CARD]", s)
+    s = re.sub(r"(?<!\d)(?:\+86[- ]?)?1[3-9]\d{9}(?!\d)", "[PHONE]", s)
+    s = re.sub(r"(?<!\d)0\d{2,3}[- ]\d{7,8}(?!\d)", "[PHONE]", s)
+    s = re.sub(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", "[EMAIL]", s)
+    s = re.sub(r"(?<!\d)\d{20,32}(?!\d)", "[ORDER_ID]", s)
+
     placeholders: Dict[str, str] = {}
+
+    def _grouped_card_repl(match: re.Match[str]) -> str:
+        tok = f"__CTAIL_{len(placeholders)}__"
+        placeholders[tok] = f"****{match.group(1)[-4:]}"
+        return tok
+
+    # Preserve last-4 tail on space/hyphen-grouped 13-19 digit card numbers BEFORE sanitize_prompt_text
+    s = re.sub(r"(?<!\d)(?:\d{4}[ -]){3,4}(\d{1,4})(?!\d)", _grouped_card_repl, s)
+    # Preserve last-4 tail on contiguous/masked card numbers (including 16/19-digit cards)
     s = _mask_card_digits_keep_tail(s, placeholders=placeholders)
+    s = sanitize_prompt_text(s)
     s = re.sub(r"(-?\s*)\d+(?:,\d{3})*\.\d{2}", r"\1XX.XX", s)
     s = re.sub(r"\d{4,}", "****", s)
     for tok, restored in placeholders.items():

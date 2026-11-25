@@ -35,6 +35,8 @@ class ReviewTxnSide(BaseModel):
     txn_time: str
     amount_cents: int
     amount_display: str
+    currency: str = "CNY"
+    amount_cny: Optional[int] = None
     counterparty: Optional[str] = None
     description: Optional[str] = None
     channel: Optional[str] = None
@@ -68,11 +70,11 @@ def list_pending_reviews(
     """List pending duplicate and internal transfer review candidates with breakdown scoring."""
     query = """
         SELECT ml.id, ml.kind, ml.score, ml.features_json, ml.llm_verdict, ml.llm_reason, ml.status, ml.created_at,
-               t1.id AS l_id, t1.source AS l_source, t1.txn_time AS l_time, t1.amount_cents AS l_amt,
-               t1.counterparty AS l_party, t1.description AS l_desc, t1.channel AS l_chan,
+               t1.id AS l_id, t1.source AS l_source, t1.txn_time AS l_time, t1.amount_cents AS l_amt, t1.currency AS l_curr,
+               t1.amount_cny AS l_cny, t1.counterparty AS l_party, t1.description AS l_desc, t1.channel AS l_chan,
                a1.bank AS l_bank, a1.tail AS l_tail, a1.alias AS l_alias,
-               t2.id AS r_id, t2.source AS r_source, t2.txn_time AS r_time, t2.amount_cents AS r_amt,
-               t2.counterparty AS r_party, t2.description AS r_desc, t2.channel AS r_chan,
+               t2.id AS r_id, t2.source AS r_source, t2.txn_time AS r_time, t2.amount_cents AS r_amt, t2.currency AS r_curr,
+               t2.amount_cny AS r_cny, t2.counterparty AS r_party, t2.description AS r_desc, t2.channel AS r_chan,
                a2.bank AS r_bank, a2.tail AS r_tail, a2.alias AS r_alias
         FROM match_links ml
         JOIN transactions t1 ON ml.primary_id = t1.id
@@ -80,6 +82,10 @@ def list_pending_reviews(
         LEFT JOIN accounts a1 ON t1.account_id = a1.id
         LEFT JOIN accounts a2 ON t2.account_id = a2.id
         WHERE ml.status = 'pending'
+          AND (
+            (ml.kind = 'duplicate' AND t1.duplicate_of IS NULL AND t2.duplicate_of IS NULL)
+            OR (ml.kind = 'transfer' AND t1.transfer_peer IS NULL AND t2.transfer_peer IS NULL)
+          )
         ORDER BY ml.score DESC, ml.id ASC
     """
     rows = db.execute(query).fetchall()
@@ -93,16 +99,30 @@ def list_pending_reviews(
             except Exception:
                 features = {}
 
-        bd = features.get("breakdown", {
-            "amount": 0.3, "tail": 0.25, "time": 0.3, "channel": 0.0, "name": 0.0, "penalty": 0.0
-        })
+        if isinstance(features.get("breakdown"), dict):
+            bd = features["breakdown"]
+        elif r["kind"] == "transfer":
+            td = float(features.get("time_diff_sec", 0) or 0)
+            t_score = 0.15 if td <= 600 else (0.10 if td <= 7200 else (0.05 if td <= 86400 else 0.02))
+            rem = max(0.0, round(float(r["score"]) - 0.30 - t_score, 4))
+            bd = {"amount": 0.30, "tail": rem, "time": t_score, "channel": 0.0, "name": 0.0, "penalty": 0.0}
+        else:
+            bd = {"amount": 0.3, "tail": 0.0, "time": 0.0, "channel": 0.0, "name": 0.0, "penalty": 0.0}
 
         llm_info = None
-        if r["llm_verdict"]:
+        arb = features.get("llm_arbitration") if isinstance(features.get("llm_arbitration"), dict) else None
+        verdict = r["llm_verdict"] or (arb.get("verdict") if arb else None)
+        if verdict:
+            reason = r["llm_reason"] or (arb.get("reason") if arb else "") or ""
+            conf_raw = arb.get("confidence") if arb and arb.get("confidence") is not None else r["score"]
+            try:
+                conf_val = float(conf_raw)
+            except (TypeError, ValueError):
+                conf_val = float(r["score"])
             llm_info = {
-                "verdict": r["llm_verdict"],
-                "reason": r["llm_reason"],
-                "confidence": r["score"],
+                "verdict": verdict,
+                "reason": reason,
+                "confidence": conf_val,
             }
 
         l_name = r["l_alias"] or (f"{r['l_bank']} ({r['l_tail']})" if r["l_tail"] else (r["l_bank"] or ""))
@@ -122,6 +142,8 @@ def list_pending_reviews(
                     txn_time=r["l_time"],
                     amount_cents=r["l_amt"],
                     amount_display=f"{r['l_amt'] / 100:.2f}",
+                    currency=r["l_curr"] or "CNY",
+                    amount_cny=r["l_cny"],
                     counterparty=r["l_party"],
                     description=r["l_desc"],
                     channel=r["l_chan"],
@@ -134,6 +156,8 @@ def list_pending_reviews(
                     txn_time=r["r_time"],
                     amount_cents=r["r_amt"],
                     amount_display=f"{r['r_amt'] / 100:.2f}",
+                    currency=r["r_curr"] or "CNY",
+                    amount_cny=r["r_cny"],
                     counterparty=r["r_party"],
                     description=r["r_desc"],
                     channel=r["r_chan"],

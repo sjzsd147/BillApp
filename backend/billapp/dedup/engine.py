@@ -12,6 +12,7 @@ Feature 17 & Dedup Coordinator:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import sqlite3
 from typing import Any, Dict, Optional
@@ -56,7 +57,11 @@ def _load_dedup_settings(conn: sqlite3.Connection) -> Dict[str, Any]:
     return defaults
 
 
-def run_dedup_pipeline(conn: sqlite3.Connection, batch_id: Optional[int] = None) -> DedupSummary:
+def run_dedup_pipeline(
+    conn: sqlite3.Connection,
+    batch_id: Optional[int] = None,
+    auto_commit: bool = True,
+) -> DedupSummary:
     """Execute complete 4-stage deduplication pipeline respecting user dedup_settings.
     
     Pipeline stages:
@@ -98,7 +103,7 @@ def run_dedup_pipeline(conn: sqlite3.Connection, batch_id: Optional[int] = None)
             from billapp.llm.tasks import dedup_arbitration_sync
 
             llm_cfg = LLMConfig.load_from_db(conn)
-            llm_client = LLMClient(llm_cfg, conn=conn)
+            llm_client = LLMClient(llm_cfg, conn=conn, auto_commit=auto_commit)
             if llm_client.is_available() and llm_cfg.task_arbitrate_enabled:
                 holders = collect_known_holder_names(conn)
                 effective_auto_confirm = llm_auto_confirm or llm_cfg.auto_confirm_dedup
@@ -125,12 +130,17 @@ def run_dedup_pipeline(conn: sqlite3.Connection, batch_id: Optional[int] = None)
                     }
                     link_id = m.get("link_id")
                     if link_id:
+                        db_verdict = "uncertain" if arb.verdict == "unsure" else arb.verdict
                         conn.execute(
-                            "UPDATE match_links SET features_json = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
-                            (json.dumps(features, ensure_ascii=False), link_id),
+                            """
+                            UPDATE match_links
+                            SET features_json = ?, llm_verdict = ?, llm_reason = ?, updated_at = datetime('now', 'localtime')
+                            WHERE id = ?
+                            """,
+                            (json.dumps(features, ensure_ascii=False), db_verdict, arb.reason, link_id),
                         )
                         if effective_auto_confirm and arb.verdict == "same" and arb.confidence >= effective_threshold:
-                            if confirm_match_link(conn, link_id):
+                            if confirm_match_link(conn, link_id, manage_transaction=auto_commit):
                                 m["status"] = "confirmed"
                                 auto_dups += 1
                                 pending_dups = max(0, pending_dups - 1)
@@ -157,13 +167,38 @@ def run_dedup_pipeline(conn: sqlite3.Connection, batch_id: Optional[int] = None)
     )
 
 
-def confirm_match_link(conn: sqlite3.Connection, link_id: int) -> bool:
+def confirm_match_link(
+    conn: sqlite3.Connection,
+    link_id: int,
+    manage_transaction: bool = True,
+) -> bool:
     """User confirms a pending or auto match link."""
     link = conn.execute("SELECT * FROM match_links WHERE id = ?", (link_id,)).fetchone()
-    if not link:
+    if not link or link["status"] == "rejected":
         return False
 
-    with conn:
+    kind = link["kind"]
+    p_id = link["primary_id"]
+    s_id = link["secondary_id"]
+
+    p_txn = conn.execute("SELECT id, duplicate_of, transfer_peer FROM transactions WHERE id = ?", (p_id,)).fetchone()
+    s_txn = conn.execute("SELECT id, duplicate_of, transfer_peer FROM transactions WHERE id = ?", (s_id,)).fetchone()
+    if not p_txn or not s_txn:
+        return False
+
+    if kind == "duplicate":
+        if p_txn["duplicate_of"] is not None:
+            return False
+        if s_txn["duplicate_of"] is not None and s_txn["duplicate_of"] != p_id:
+            return False
+    elif kind == "transfer":
+        if p_txn["transfer_peer"] is not None and p_txn["transfer_peer"] != s_id:
+            return False
+        if s_txn["transfer_peer"] is not None and s_txn["transfer_peer"] != p_id:
+            return False
+
+    ctx = conn if manage_transaction else nullcontext()
+    with ctx:
         conn.execute(
             """
             UPDATE match_links
@@ -173,14 +208,21 @@ def confirm_match_link(conn: sqlite3.Connection, link_id: int) -> bool:
             (link_id,),
         )
 
-        kind = link["kind"]
-        p_id = link["primary_id"]
-        s_id = link["secondary_id"]
-
         if kind == "duplicate":
             conn.execute(
                 "UPDATE transactions SET duplicate_of = ? WHERE id = ?",
                 (p_id, s_id),
+            )
+            # Retire any competing pending duplicate links involving s_id
+            conn.execute(
+                """
+                DELETE FROM match_links
+                WHERE kind = 'duplicate'
+                  AND status = 'pending'
+                  AND id != ?
+                  AND (secondary_id = ? OR primary_id = ?)
+                """,
+                (link_id, s_id, s_id),
             )
         elif kind == "transfer":
             conn.execute(
@@ -190,6 +232,17 @@ def confirm_match_link(conn: sqlite3.Connection, link_id: int) -> bool:
             conn.execute(
                 "UPDATE transactions SET transfer_peer = ?, direction = 'transfer' WHERE id = ?",
                 (p_id, s_id),
+            )
+            # Retire any competing pending transfer links involving p_id or s_id
+            conn.execute(
+                """
+                DELETE FROM match_links
+                WHERE kind = 'transfer'
+                  AND status = 'pending'
+                  AND id != ?
+                  AND (primary_id IN (?, ?) OR secondary_id IN (?, ?))
+                """,
+                (link_id, p_id, s_id, p_id, s_id),
             )
 
     return True
@@ -273,9 +326,14 @@ def is_pair_blocked(conn: sqlite3.Connection, id1: int, id2: int, kind: Optional
     return row is not None
 
 
-def rollback_import_batch(conn: sqlite3.Connection, batch_id: int) -> Dict[str, Any]:
+def rollback_import_batch(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    manage_transaction: bool = True,
+) -> Dict[str, Any]:
     """Safely roll back an imported batch, restoring all interrelated transaction states."""
-    with conn:
+    ctx = conn if manage_transaction else nullcontext()
+    with ctx:
         # Check if batch exists in import_batches or transactions
         batch_row = conn.execute(
             "SELECT id FROM import_batches WHERE id = ?",
@@ -325,7 +383,7 @@ def rollback_import_batch(conn: sqlite3.Connection, batch_id: int) -> Dict[str, 
         )
 
         # Step 4: Revert transfer directions on surviving transactions and clear transfer_peer
-        # 4a. Query transfer match_links involving transactions from this batch before deletion
+        # 4a. Query ACTIVE transfer match_links involving transactions from this batch before deletion
         transfer_links = conn.execute(
             """
             SELECT ml.id, ml.primary_id, ml.secondary_id, ml.features_json,
@@ -334,6 +392,7 @@ def rollback_import_batch(conn: sqlite3.Connection, batch_id: int) -> Dict[str, 
             JOIN transactions t1 ON ml.primary_id = t1.id
             JOIN transactions t2 ON ml.secondary_id = t2.id
             WHERE ml.kind = 'transfer'
+              AND ml.status IN ('auto', 'confirmed')
               AND (t1.batch_id = ? OR t2.batch_id = ?)
             """,
             (batch_id, batch_id),
@@ -351,26 +410,32 @@ def rollback_import_batch(conn: sqlite3.Connection, batch_id: int) -> Dict[str, 
                 except Exception:
                     feat = {}
 
-            # If primary (outflow) is in this batch, secondary (inflow) survives
+            # If primary (outflow) is in this batch, secondary (inflow) survives (only if still paired with p_id)
             if p_batch == batch_id and s_batch != batch_id:
                 orig_in = feat.get("orig_dir_in")
                 if orig_in:
                     conn.execute(
-                        "UPDATE transactions SET transfer_peer = NULL, direction = ? WHERE id = ?",
-                        (orig_in, s_id),
+                        "UPDATE transactions SET transfer_peer = NULL, direction = ? WHERE id = ? AND transfer_peer = ?",
+                        (orig_in, s_id, p_id),
                     )
                 else:
-                    conn.execute("UPDATE transactions SET transfer_peer = NULL WHERE id = ?", (s_id,))
-            # If secondary (inflow) is in this batch, primary (outflow) survives
+                    conn.execute(
+                        "UPDATE transactions SET transfer_peer = NULL WHERE id = ? AND transfer_peer = ?",
+                        (s_id, p_id),
+                    )
+            # If secondary (inflow) is in this batch, primary (outflow) survives (only if still paired with s_id)
             elif s_batch == batch_id and p_batch != batch_id:
                 orig_out = feat.get("orig_dir_out")
                 if orig_out:
                     conn.execute(
-                        "UPDATE transactions SET transfer_peer = NULL, direction = ? WHERE id = ?",
-                        (orig_out, p_id),
+                        "UPDATE transactions SET transfer_peer = NULL, direction = ? WHERE id = ? AND transfer_peer = ?",
+                        (orig_out, p_id, s_id),
                     )
                 else:
-                    conn.execute("UPDATE transactions SET transfer_peer = NULL WHERE id = ?", (p_id,))
+                    conn.execute(
+                        "UPDATE transactions SET transfer_peer = NULL WHERE id = ? AND transfer_peer = ?",
+                        (p_id, s_id),
+                    )
 
         # 4b. Defensive cleanup: clear any remaining transfer_peer references pointing to this batch
         conn.execute(

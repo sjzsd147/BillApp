@@ -724,6 +724,11 @@ class CategoryService:
             target_cat = CategoryService.get_by_id(conn, reassign_to_id)
             if not target_cat:
                 raise ValueError(f"Reassignment target category #{reassign_to_id} does not exist.")
+            if target_cat.direction != existing.direction:
+                raise ValueError(
+                    f"Cannot reassign category #{category_id} ({existing.direction}) "
+                    f"to target #{reassign_to_id} ({target_cat.direction}): direction mismatch."
+                )
 
         # 1. Check child categories
         children = conn.execute(

@@ -46,13 +46,17 @@ class ICBCCreditImporter(Importer):
         try:
             with open_pdf_document(probe) as doc:
                 first_page_text = doc[0].get_text() if len(doc) > 0 else ""
+                if ("借记卡" in first_page_text or "储蓄卡" in first_page_text) and not (
+                    "信用卡" in first_page_text or "贷记卡" in first_page_text
+                ):
+                    return 0.0
                 if "中国工商银行信用卡历史明细" in first_page_text or "活期历史明细清单" in first_page_text:
                     return 1.0
                 if "中国工商银行" in first_page_text and ("卡号:" in first_page_text or "卡号：" in first_page_text or "交易卡号" in first_page_text):
                     return 0.95
                 if "中国工商银行" in first_page_text:
                     return 0.8
-                return 0.5 if has_icbc_hint else 0.0
+                return 0.0
         except PDFPasswordRequiredError:
             return 0.85 if has_icbc_hint else 0.2
         except Exception:

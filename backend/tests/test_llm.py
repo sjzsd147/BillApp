@@ -990,8 +990,8 @@ class TestRegressionIssueFixes:
                     },
                 )
 
-            def _mock_client(config, conn=None):
-                return LLMClient(config=config, conn=conn, transport=httpx.MockTransport(mock_handler))
+            def _mock_client(config, conn=None, **kwargs):
+                return LLMClient(config=config, conn=conn, transport=httpx.MockTransport(mock_handler), **kwargs)
 
             monkeypatch.setattr(import_api, "LLMClient", _mock_client)
             monkeypatch.setattr(profiles_api, "LLMClient", _mock_client)

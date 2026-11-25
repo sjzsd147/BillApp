@@ -85,7 +85,9 @@ async function handleApply() {
     visible.value = false;
     emit('applied');
   } catch (err: any) {
-    ElMessage.error(err.message || '应用规则失败');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '应用规则失败');
+    }
   } finally {
     applying.value = false;
   }

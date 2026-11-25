@@ -82,6 +82,7 @@ export interface ImportPreviewItem {
   file_name: string;
   source: string;
   profile_id?: string | null;
+  existing_batch_id?: number | null;
   total_rows: number;
   need_password: boolean;
   need_mapping: boolean;
@@ -125,6 +126,7 @@ export interface DedupSummary {
 
 export interface ImportCommitResponse {
   batch_id: number;
+  replaced_batch_id?: number | null;
   imported_count: number;
   duplicate_count: number;
   refund_count: number;
@@ -234,6 +236,7 @@ export interface MergedSourceItem {
   txn_time: string;
   amount_cents: number;
   currency: string;
+  amount_cny?: number | null;
   direction: DirectionType;
   counterparty?: string | null;
   description?: string | null;
@@ -394,6 +397,8 @@ export interface ReviewTxnSide {
   txn_time: string;
   amount_cents: number;
   amount_display: string;
+  currency?: string;
+  amount_cny?: number | null;
   counterparty?: string | null;
   description?: string | null;
   channel?: string | null;
@@ -624,7 +629,7 @@ export interface LLMReviewItemOut {
 
 export interface LLMReviewResponse {
   success: boolean;
-  status: 'ok' | 'offline' | 'error';
+  status: 'ok' | 'offline' | 'disabled' | 'error';
   reviews: LLMReviewItemOut[];
   reason?: string | null;
 }

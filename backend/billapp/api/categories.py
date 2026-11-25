@@ -181,14 +181,8 @@ def create_category(
     db: sqlite3.Connection = Depends(get_db_conn),
 ):
     """Create a new custom category enforcing sibling uniqueness and 2-tier depth limit."""
-    # Sibling name uniqueness check
-    sibling = CategoryService.get_by_name(
-        db, name=payload.name, parent_id=payload.parent_id, direction=payload.direction
-    )
-    if sibling:
-        raise ConflictError(f"同级分类中已存在同名分类: '{payload.name}'")
-
-    # 2-tier depth check
+    # 2-tier depth check & inherit parent direction before sibling uniqueness check
+    effective_direction = payload.direction
     if payload.parent_id is not None:
         parent = CategoryService.get_by_id(db, payload.parent_id)
         if not parent:
@@ -199,11 +193,19 @@ def create_category(
                 code="MAX_DEPTH_EXCEEDED",
                 message="层级深度不能超过2级，子分类不能再创建子分类",
             )
+        effective_direction = parent.direction
+
+    # Sibling name uniqueness check
+    sibling = CategoryService.get_by_name(
+        db, name=payload.name, parent_id=payload.parent_id, direction=effective_direction
+    )
+    if sibling:
+        raise ConflictError(f"同级分类中已存在同名分类: '{payload.name}'")
 
     try:
         cat_create = CategoryCreate(
             name=payload.name,
-            direction=payload.direction,
+            direction=effective_direction,
             parent_id=payload.parent_id,
             key=payload.key,
             icon=payload.icon,
@@ -282,6 +284,15 @@ def update_category(
     # Fetch budget
     b_row = db.execute("SELECT value FROM settings WHERE key = 'category_budgets'").fetchone()
     budget_map = json.loads(b_row["value"]) if b_row and b_row["value"] else {}
+
+    # Return full rolled-up item including real counts and children
+    full_tree = list_categories_tree(direction=updated.direction, db=db)
+    for root in full_tree:
+        if root.id == updated.id:
+            return root
+        for child in root.children:
+            if child.id == updated.id:
+                return child
 
     path, path_names = CategoryService.get_path(db, updated.id)
     return CategoryItemOut(

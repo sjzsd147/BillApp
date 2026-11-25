@@ -136,18 +136,29 @@ def rule_matches(rule: Rule, txn: Any) -> bool:
     if rule.amount_max_cents is not None and amt > rule.amount_max_cents:
         return False
 
-    # 2. Extract target field
+    # 2. Extract target field & match (with consistent counterparty <-> merchant_norm pairing)
     field_name = rule.field
     val = _get_val(txn, field_name)
 
-    # 3. Fallback heuristic for counterparty <-> merchant_norm
-    if not val:
-        if field_name == "merchant_norm":
-            val = _get_val(txn, "counterparty")
-        elif field_name == "counterparty":
-            val = _get_val(txn, "merchant_norm")
-            if not val:
-                val = _get_val(txn, "description")
+    if field_name == "counterparty":
+        if val and match_pattern(rule.pattern_type, rule.pattern_value, str(val)):
+            return True
+        mn = _get_val(txn, "merchant_norm")
+        if mn and match_pattern(rule.pattern_type, rule.pattern_value, str(mn)):
+            return True
+        if not val and not mn:
+            desc = _get_val(txn, "description")
+            if desc:
+                return match_pattern(rule.pattern_type, rule.pattern_value, str(desc))
+        return False
+
+    if field_name == "merchant_norm":
+        if val and match_pattern(rule.pattern_type, rule.pattern_value, str(val)):
+            return True
+        cp = _get_val(txn, "counterparty")
+        if cp:
+            return match_pattern(rule.pattern_type, rule.pattern_value, str(cp))
+        return False
 
     if not val:
         return False
@@ -337,7 +348,7 @@ def apply_rule_to_existing(
     if force_reclassify is not None:
         overwrite_manual = force_reclassify
 
-    pat = rule.pattern_value
+    pat = (rule.pattern_value or "").strip()
     base_query = """
         SELECT id, amount_cents, counterparty, merchant_norm, description,
                platform_category, pay_method, direction, category_id, category_source
@@ -349,9 +360,9 @@ def apply_rule_to_existing(
         base_query += " AND batch_id = ?"
         params.append(batch_id)
 
-    # For regex patterns, do NOT apply SQL LIKE since SQL LIKE treats regex literally.
-    # For non-regex patterns, apply field-specific LIKE to narrow candidates.
-    if rule.pattern_type.lower() != "regex" and pat:
+    # For regex patterns or non-ASCII patterns (where SQLite LIKE only folds ASCII case),
+    # skip SQL LIKE pre-filter and rely on Python's exact match_pattern().
+    if rule.pattern_type.lower() != "regex" and pat and pat.isascii():
         target_field = rule.field.lower() if rule.field else "counterparty"
         if target_field in ("platform_category", "pay_method"):
             base_query += f" AND {target_field} LIKE '%' || ? || '%'"
@@ -412,27 +423,42 @@ def get_learning_suggestions(
     conn: sqlite3.Connection,
     min_count: int = 3,
 ) -> List[Dict[str, Any]]:
-    """Query accumulated manual edits that suggest new rules."""
+    """Query accumulated manual edits aggregated by cleaned brand keyword to suggest new rules."""
     query = """
-        SELECT counterparty, merchant_norm, category_id, COUNT(*) as cnt
+        SELECT counterparty, merchant_norm, category_id
         FROM transactions
         WHERE category_source = 'manual' AND category_id IS NOT NULL
-        GROUP BY counterparty, merchant_norm, category_id
-        HAVING cnt >= ?
-        ORDER BY cnt DESC
     """
-    rows = conn.execute(query, (min_count,)).fetchall()
-    suggestions: List[Dict[str, Any]] = []
+    rows = conn.execute(query).fetchall()
+    grouped: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
     for r in rows:
         cp = r["counterparty"] or ""
         mn = r["merchant_norm"] or ""
-        cat_id = r["category_id"]
-        cnt = r["cnt"]
+        cat_id = int(r["category_id"])
 
         brand = clean_merchant_for_learning(cp, mn)
         if not brand:
             continue
+
+        key = (brand, cat_id)
+        entry = grouped.get(key)
+        if entry is None:
+            grouped[key] = {
+                "brand": brand,
+                "category_id": cat_id,
+                "count": 1,
+                "sample_counterparty": cp or mn,
+            }
+        else:
+            entry["count"] += 1
+
+    suggestions: List[Dict[str, Any]] = []
+    for entry in sorted(grouped.values(), key=lambda x: (-x["count"], x["brand"])):
+        if entry["count"] < min_count:
+            continue
+        brand = entry["brand"]
+        cat_id = entry["category_id"]
 
         # Check if user already has an active rule for this pattern
         has_rule = conn.execute(
@@ -447,8 +473,8 @@ def get_learning_suggestions(
             "brand": brand,
             "category_id": cat_id,
             "category_name": cat.name if cat else "未分类",
-            "count": cnt,
-            "sample_counterparty": cp,
+            "count": entry["count"],
+            "sample_counterparty": entry["sample_counterparty"],
         })
 
     return suggestions

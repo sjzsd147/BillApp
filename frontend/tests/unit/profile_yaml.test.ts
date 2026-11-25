@@ -111,9 +111,23 @@ describe('buildProfileYaml', () => {
     });
 
     expect(yaml).toContain('name: "带\\"引号\\"与:冒号的配置"');
-    expect(yaml).toContain('account_kind: "debit"');
+    expect(yaml).toContain('account_kind: "wallet"');
     expect(yaml).toContain('date: "日期:时间"');
     expect(yaml).toContain('amount: "金额 \\"RMB\\""');
+  });
+
+  it('emits auto_detect: false when autoApplyNextTime is unchecked', () => {
+    const yaml = buildProfileYaml({
+      profileId: 'manual_only_profile',
+      profileName: '仅手动选择的配置',
+      accountKind: 'bank_debit',
+      headerRowIndex: 1,
+      dataStartRowIndex: 2,
+      amountMode: 'signed',
+      fieldMap: { txn_time: '交易时间', amount: '金额' },
+      autoApplyNextTime: false,
+    });
+    expect(yaml).toContain('auto_detect: false');
   });
 
   it('emits metadata_extraction card_tail rule and default when defaultCardTail is provided', () => {

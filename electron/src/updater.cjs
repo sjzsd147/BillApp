@@ -214,7 +214,7 @@ function formatUpdaterError(err, platform = process.platform) {
   if (lower.includes('sha512') || lower.includes('checksum')) {
     return {
       message: '安装包完整性校验失败，请重试下载或前往 GitHub Releases 手动获取。',
-      requiresManualDownload: true,
+      requiresManualDownload: false,
     };
   }
 
@@ -290,6 +290,7 @@ function createAppUpdater({
   autoUpdater,
   openUrl,
   beforeInstall,
+  onInstallFailed,
   onStateChange,
   fetchImpl,
   owner = DEFAULT_OWNER,
@@ -338,6 +339,7 @@ function createAppUpdater({
   let initialized = false;
   let checkPromise = null;
   let downloadPromise = null;
+  let installPromise = null;
   let resolvedAutoUpdater = autoUpdater;
 
   function getAutoUpdater() {
@@ -368,6 +370,10 @@ function createAppUpdater({
   function buildTagUrl(version) {
     const clean = stripLeadingV(version);
     return clean ? `${repositoryUrl}/releases/tag/v${clean}` : releasesUrl;
+  }
+
+  function hasAvailableUpdate() {
+    return Boolean(state.latestVersion && compareSemver(state.latestVersion, state.currentVersion) > 0);
   }
 
   function init() {
@@ -467,14 +473,14 @@ function createAppUpdater({
       if (state.silent) {
         logger?.warn?.('[updater] Silent check failed:', err?.message || err);
         updateState({
-          status: state.latestVersion ? 'available' : 'idle',
+          status: hasAvailableUpdate() ? 'available' : 'idle',
           downloadProgress: null,
           error: null,
         });
         return;
       }
       const formatted = formatUpdaterError(err, platform);
-      const keepAvailable = Boolean(state.latestVersion && formatted.requiresManualDownload);
+      const keepAvailable = Boolean(hasAvailableUpdate() && formatted.requiresManualDownload);
       updateState({
         status: keepAvailable ? 'available' : 'error',
         downloadProgress: null,
@@ -520,7 +526,7 @@ function createAppUpdater({
       if (state.silent) {
         logger?.warn?.('[updater] Silent GitHub check failed:', err?.message || err);
         return updateState({
-          status: 'idle',
+          status: hasAvailableUpdate() ? 'available' : 'idle',
           error: null,
         });
       }
@@ -557,13 +563,14 @@ function createAppUpdater({
       if (!useElectronUpdater) {
         return checkViaGitHubHttpFallback();
       }
+      updateState({ status: 'checking', error: null });
       try {
         const updater = getAutoUpdater();
         await updater.checkForUpdates();
         return getState();
       } catch (err) {
         if (state.silent) {
-          return updateState({ status: 'idle', error: null });
+          return updateState({ status: hasAvailableUpdate() ? 'available' : 'idle', error: null });
         }
         // Fallback if updater wasn't active or threw before emitting error
         if (state.status === 'checking') {
@@ -610,7 +617,7 @@ function createAppUpdater({
               : '当前安装包类型暂不支持应用内自动更新，请前往 GitHub Releases 手动下载。',
       });
     }
-    if (!state.latestVersion) {
+    if (!hasAvailableUpdate()) {
       await checkForUpdates({ silent: false });
       if (state.status !== 'available') {
         return getState();
@@ -636,7 +643,7 @@ function createAppUpdater({
         return getState();
       } catch (err) {
         const formatted = formatUpdaterError(err, platform);
-        const keepAvailable = Boolean(state.latestVersion && formatted.requiresManualDownload);
+        const keepAvailable = Boolean(hasAvailableUpdate() && formatted.requiresManualDownload);
         return updateState({
           status: keepAvailable ? 'available' : 'error',
           downloadProgress: null,
@@ -652,6 +659,9 @@ function createAppUpdater({
   }
 
   async function quitAndInstall() {
+    if (installPromise) {
+      return installPromise;
+    }
     if (state.status !== 'downloaded') {
       return {
         ok: false,
@@ -660,17 +670,39 @@ function createAppUpdater({
       };
     }
 
-    // Ensure Python FastAPI sidecar checkpoints SQLite WAL & releases file locks before installer runs
-    if (typeof beforeInstall === 'function') {
-      await beforeInstall();
-    }
+    installPromise = (async () => {
+      // Ensure Python FastAPI sidecar checkpoints SQLite WAL & releases file locks before installer runs
+      if (typeof beforeInstall === 'function') {
+        await beforeInstall();
+      }
 
-    const updater = getAutoUpdater();
-    updater.quitAndInstall(false, true);
-    return {
-      ok: true,
-      state: getState(),
-    };
+      try {
+        const updater = getAutoUpdater();
+        updater.quitAndInstall(false, true);
+        return {
+          ok: true,
+          state: getState(),
+        };
+      } catch (err) {
+        if (typeof onInstallFailed === 'function') {
+          await onInstallFailed(err);
+        }
+        const formatted = formatUpdaterError(err, platform);
+        return {
+          ok: false,
+          error: formatted.message,
+          state: updateState({
+            status: 'error',
+            manualDownloadRequired: state.manualDownloadRequired || formatted.requiresManualDownload,
+            error: formatted.message,
+          }),
+        };
+      }
+    })().finally(() => {
+      installPromise = null;
+    });
+
+    return installPromise;
   }
 
   function isValidReleaseUrl(targetUrl) {

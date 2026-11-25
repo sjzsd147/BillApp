@@ -11,7 +11,7 @@ import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from billapp.stats import build_stats_filters
+from billapp.stats import build_stats_filters, get_refund_mode
 
 
 def sanitize_cell_value(val: Any) -> Any:
@@ -88,9 +88,8 @@ def generate_excel_export(
     params: List[Any] = []
 
     if start_date:
-        val = f"{start_date} 00:00:00" if len(start_date) == 10 else start_date
         where_clauses.append("t.txn_time >= ?")
-        params.append(val)
+        params.append(start_date)
     if end_date:
         val = f"{end_date} 23:59:59" if len(end_date) == 10 else end_date
         where_clauses.append("t.txn_time <= ?")
@@ -112,15 +111,20 @@ def generate_excel_export(
                t.transfer_peer, t.excluded, t.note, t.currency,
                t.amount_cny, t.fx_rate, t.fx_rate_at, t.fx_rate_source,
                c.key AS cat_key, c.name AS cat_name, p.name AS parent_cat_name,
+               oc.name AS orig_cat_name, op.name AS orig_parent_cat_name,
                a.bank, a.tail, a.alias
         FROM transactions t
         LEFT JOIN categories c ON t.category_id = c.id
         LEFT JOIN categories p ON c.parent_id = p.id
+        LEFT JOIN transactions orig ON t.refund_of = orig.id
+        LEFT JOIN categories oc ON orig.category_id = oc.id
+        LEFT JOIN categories op ON oc.parent_id = op.id
         LEFT JOIN accounts a ON t.account_id = a.id
         WHERE {where_sql}
         ORDER BY t.txn_time DESC
     """
     rows = conn.execute(sql, params).fetchall()
+    refund_mode = get_refund_mode(conn)
 
     direction_labels = {
         "expense": "支出",
@@ -193,7 +197,7 @@ def generate_excel_export(
             ref_yuan,
             net_yuan,
             sanitize_cell_value(root_cat),
-            sanitize_cell_value(sub_cat),
+            sub_cat if sub_cat == "-" else sanitize_cell_value(sub_cat),
             sanitize_cell_value(acc_label),
             sanitize_cell_value(r["pay_method"] or ""),
             sanitize_cell_value(status_tag),
@@ -223,39 +227,59 @@ def generate_excel_export(
             else:
                 cell.alignment = align_left
 
-        # Collect for Sheet 2 aggregation if valid expense (excluding internal transfers and missing FX)
+        # Collect for Sheet 2 aggregation (respecting refund_mode and unlinked refunds, excluding transfers & missing FX)
         is_internal_transfer = (
             r["transfer_peer"] is not None
             or r["cat_key"] == "financial.internal_transfer"
             or r["cat_name"] in ("内部转账", "资金互转")
         )
-        if (
-            r["direction"] == "expense"
-            and r["duplicate_of"] is None
-            and r["excluded"] == 0
-            and not is_internal_transfer
-        ):
-            if r["currency"] == "CNY" or r["currency"] is None:
-                month_str = r["txn_time"][:7]  # 'YYYY-MM'
-                months_set.add(month_str)
-                cat_key = (root_cat, sub_cat)
-                category_month_matrix.setdefault(cat_key, {})
-                category_month_matrix[cat_key][month_str] = round(
-                    category_month_matrix[cat_key].get(month_str, 0.0) + net_yuan, 2
-                )
-            elif r["amount_cny"] is not None:
-                if r["fx_rate"] is not None:
-                    cny_cents = max(0, round((r["amount_cents"] - r["refunded_cents"]) * r["fx_rate"]))
-                else:
-                    cny_cents = max(0, r["amount_cny"] - r["refunded_cents"])
-                cny_net_yuan = round(cny_cents / 100.0, 2)
-                month_str = r["txn_time"][:7]  # 'YYYY-MM'
-                months_set.add(month_str)
-                cat_key = (root_cat, sub_cat)
-                category_month_matrix.setdefault(cat_key, {})
-                category_month_matrix[cat_key][month_str] = round(
-                    category_month_matrix[cat_key].get(month_str, 0.0) + cny_net_yuan, 2
-                )
+        if r["duplicate_of"] is None and r["excluded"] == 0 and not is_internal_transfer:
+            if r["direction"] == "expense":
+                if r["currency"] == "CNY" or r["currency"] is None:
+                    exp_val_yuan = amt_yuan if refund_mode == "refund_month" else net_yuan
+                    month_str = r["txn_time"][:7]
+                    months_set.add(month_str)
+                    cat_key = (root_cat, sub_cat)
+                    category_month_matrix.setdefault(cat_key, {})
+                    category_month_matrix[cat_key][month_str] = round(
+                        category_month_matrix[cat_key].get(month_str, 0.0) + exp_val_yuan, 2
+                    )
+                elif r["amount_cny"] is not None:
+                    if refund_mode == "refund_month":
+                        cny_cents = max(0, int(r["amount_cny"]))
+                    elif r["fx_rate"] is not None:
+                        cny_cents = max(0, round((r["amount_cents"] - r["refunded_cents"]) * r["fx_rate"]))
+                    else:
+                        cny_cents = max(0, r["amount_cny"] - r["refunded_cents"])
+                    cny_val_yuan = round(cny_cents / 100.0, 2)
+                    month_str = r["txn_time"][:7]
+                    months_set.add(month_str)
+                    cat_key = (root_cat, sub_cat)
+                    category_month_matrix.setdefault(cat_key, {})
+                    category_month_matrix[cat_key][month_str] = round(
+                        category_month_matrix[cat_key].get(month_str, 0.0) + cny_val_yuan, 2
+                    )
+            elif r["direction"] == "refund" and (refund_mode == "refund_month" or r["refund_of"] is None):
+                ref_cny_yuan: Optional[float] = None
+                if r["currency"] == "CNY" or r["currency"] is None:
+                    ref_cny_yuan = amt_yuan
+                elif r["amount_cny"] is not None:
+                    ref_cny_yuan = round(int(r["amount_cny"]) / 100.0, 2)
+                if ref_cny_yuan is not None:
+                    if refund_mode == "refund_month" and (r["orig_parent_cat_name"] or r["orig_cat_name"]):
+                        if r["orig_parent_cat_name"]:
+                            r_root, r_sub = r["orig_parent_cat_name"], r["orig_cat_name"]
+                        else:
+                            r_root, r_sub = r["orig_cat_name"], "-"
+                    else:
+                        r_root, r_sub = root_cat, sub_cat
+                    month_str = r["txn_time"][:7]
+                    months_set.add(month_str)
+                    cat_key = (r_root, r_sub)
+                    category_month_matrix.setdefault(cat_key, {})
+                    category_month_matrix[cat_key][month_str] = round(
+                        category_month_matrix[cat_key].get(month_str, 0.0) - ref_cny_yuan, 2
+                    )
 
     # Freeze header on Sheet 1
     ws1.freeze_panes = "A2"
@@ -303,7 +327,10 @@ def generate_excel_export(
         ]
         sum_formula = f"=SUM({first_month_col_letter}{cur_p_row}:{last_month_col_letter}{cur_p_row})"
 
-        p_row_vals = [sanitize_cell_value(root_cat), sanitize_cell_value(sub_cat)] + month_vals + [sum_formula]
+        p_row_vals = [
+            sanitize_cell_value(root_cat),
+            sub_cat if sub_cat == "-" else sanitize_cell_value(sub_cat),
+        ] + month_vals + [sum_formula]
         ws2.append(p_row_vals)
 
         for c_idx in range(1, len(p_row_vals) + 1):

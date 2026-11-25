@@ -48,7 +48,10 @@ export const useTransactionsStore = defineStore('transactions', () => {
     fx: null,
   });
 
+  let fetchSeq = 0;
+
   async function fetchList() {
+    const seq = ++fetchSeq;
     loading.value = true;
     try {
       const params: TransactionListQueryParams = {
@@ -74,12 +77,26 @@ export const useTransactionsStore = defineStore('transactions', () => {
       if (filters.fx) params.fx = filters.fx;
 
       const res = await getTransactions(params);
-      items.value = res.items;
-      total.value = res.total;
+      if (seq !== fetchSeq) return;
+      if (res.items.length === 0 && res.total > 0 && pagination.page > 1) {
+        const lastPage = Math.max(1, Math.ceil(res.total / pagination.pageSize));
+        pagination.page = Math.min(pagination.page - 1, lastPage);
+        const fallbackRes = await getTransactions({ ...params, page: pagination.page });
+        if (seq !== fetchSeq) return;
+        items.value = fallbackRes.items;
+        total.value = fallbackRes.total;
+      } else {
+        items.value = res.items;
+        total.value = res.total;
+      }
     } catch (e) {
-      console.error('Failed to load transactions', e);
+      if (seq === fetchSeq) {
+        console.error('Failed to load transactions', e);
+      }
     } finally {
-      loading.value = false;
+      if (seq === fetchSeq) {
+        loading.value = false;
+      }
     }
   }
 

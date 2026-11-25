@@ -133,3 +133,17 @@ test('resolveBackendLaunchSpec passes secrets only via env and never CLI args', 
   assert.equal(spec.args.join(' ').includes('secret-token-abc'), false);
   assert.equal(spec.args.join(' ').includes('secret-master-xyz'), false);
 });
+
+test('startBackend rejects cleanly on missing executable without uncaught error event (F-H1)', async () => {
+  const repoRoot = path.resolve(__dirname, '..', '..');
+  await assert.rejects(
+    () =>
+      startBackend({
+        isPackaged: true,
+        resourcesPath: path.join(os.tmpdir(), 'billapp-nonexistent-resources-dir'),
+        repoRoot,
+        timeoutMs: 3000,
+      }),
+    /Backend process exited prematurely/
+  );
+});

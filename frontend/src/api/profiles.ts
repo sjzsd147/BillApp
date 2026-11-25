@@ -43,6 +43,12 @@ export function testProfile(
   });
 }
 
-export function suggestMapping(data: SuggestMappingRequest): Promise<SuggestMappingResponse> {
-  return apiClient.post('/profiles/suggest', data, { timeout: 120000 });
+export function suggestMapping(
+  data: SuggestMappingRequest,
+  options?: { silent?: boolean }
+): Promise<SuggestMappingResponse> {
+  return apiClient.post('/profiles/suggest', data, {
+    timeout: 120000,
+    ...(options?.silent ? { silent: true } : {}),
+  } as any);
 }

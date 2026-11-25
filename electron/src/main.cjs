@@ -20,14 +20,18 @@ const ALLOW_MULTI =
 let mainWindow = null;
 let backendHandle = null;
 let isQuitting = false;
+let startInFlight = null;
 let stopInFlight = null;
 let appUpdaterController = null;
 let trustedOrigins = [];
 let sessionSecurityConfigured = false;
+let downloadListenerRegistered = false;
+let hasSingleInstanceLock = true;
 
 if (!ALLOW_MULTI) {
   const gotLock = app.requestSingleInstanceLock();
   if (!gotLock) {
+    hasSingleInstanceLock = false;
     app.quit();
   }
 }
@@ -249,13 +253,18 @@ function isAllowedUiUrl(targetUrl, allowedOrigins) {
   }
 }
 
-function createMainWindow() {
+function refreshTrustedOrigins() {
   const uiUrl = getUiEntryUrl();
   const allowedOrigins = [new URL(uiUrl).origin];
   if (backendHandle) {
     allowedOrigins.push(new URL(backendHandle.url).origin);
   }
   configureSessionSecurity(session.defaultSession, allowedOrigins);
+  return uiUrl;
+}
+
+function createMainWindow() {
+  const uiUrl = refreshTrustedOrigins();
 
   const win = new BrowserWindow({
     width: 1280,
@@ -285,7 +294,7 @@ function createMainWindow() {
       const parsed = new URL(url);
       // Convert API export window.open calls cleanly into native downloads
       if (
-        allowedOrigins.includes(parsed.origin) &&
+        trustedOrigins.includes(parsed.origin) &&
         parsed.pathname.startsWith('/api/export')
       ) {
         win.webContents.downloadURL(url);
@@ -301,27 +310,30 @@ function createMainWindow() {
   });
 
   win.webContents.on('will-navigate', (event, navigationUrl) => {
-    if (!isAllowedUiUrl(navigationUrl, allowedOrigins)) {
+    if (!isAllowedUiUrl(navigationUrl, trustedOrigins)) {
       event.preventDefault();
     }
   });
 
-  win.webContents.session.on('will-download', (_event, item) => {
-    const filename = sanitizeDownloadFilename(item.getFilename(), 'billapp-export.xlsx');
-    if (!app.isPackaged) {
-      const testDir = (process.env.BILLAPP_TEST_DOWNLOAD_DIR || '').trim();
-      if (testDir) {
-        fs.mkdirSync(testDir, { recursive: true });
-        item.setSavePath(path.join(testDir, filename));
-        return;
+  if (!downloadListenerRegistered) {
+    downloadListenerRegistered = true;
+    win.webContents.session.on('will-download', (_event, item) => {
+      const filename = sanitizeDownloadFilename(item.getFilename(), 'billapp-export.xlsx');
+      if (!app.isPackaged) {
+        const testDir = (process.env.BILLAPP_TEST_DOWNLOAD_DIR || '').trim();
+        if (testDir) {
+          fs.mkdirSync(testDir, { recursive: true });
+          item.setSavePath(path.join(testDir, filename));
+          return;
+        }
       }
-    }
-    const downloadsDir = app.getPath('downloads');
-    item.setSaveDialogOptions({
-      title: '保存导出文件',
-      defaultPath: path.join(downloadsDir, filename),
+      const downloadsDir = app.getPath('downloads');
+      item.setSaveDialogOptions({
+        title: '保存导出文件',
+        defaultPath: path.join(downloadsDir, filename),
+      });
     });
-  });
+  }
 
   win.on('closed', () => {
     if (mainWindow === win) {
@@ -342,7 +354,22 @@ function getAppUpdaterController() {
     appUpdaterController = createAppUpdater({
       app,
       openUrl: (url) => shell.openExternal(url),
-      beforeInstall: () => shutdownBackend(),
+      beforeInstall: async () => {
+        isQuitting = true;
+        await shutdownBackend();
+      },
+      onInstallFailed: async () => {
+        isQuitting = false;
+        try {
+          await ensureBackendStarted();
+          const nextUiUrl = refreshTrustedOrigins();
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            await mainWindow.loadURL(nextUiUrl);
+          }
+        } catch (restartErr) {
+          console.error('[updater] Failed to restart backend after install error:', restartErr);
+        }
+      },
       fetchImpl: (url, opts) => net.fetch(url, opts),
       onStateChange: (state) => {
         if (mainWindow && !mainWindow.isDestroyed()) {
@@ -456,41 +483,50 @@ async function ensureBackendStarted() {
   if (backendHandle && backendHandle.isRunning()) {
     return backendHandle;
   }
-
-  // Never trust external BILLAPP_BACKEND_URL override in packaged builds (S-04)
-  if (!app.isPackaged) {
-    const externalUrl = (process.env.BILLAPP_BACKEND_URL || '').trim();
-    if (externalUrl) {
-      const parsed = new URL(externalUrl);
-      backendHandle = {
-        host: parsed.hostname,
-        port: Number(parsed.port) || 8000,
-        url: externalUrl.replace(/\/+$/, ''),
-        apiToken: (process.env.BILLAPP_API_TOKEN || '').trim() || null,
-        dbPath: parseDbCliArg() || process.env.BILLAPP_DB_PATH || null,
-        frontendDist: resolveFrontendDistDir(),
-        stop: async () => {},
-        isRunning: () => true,
-      };
-      return backendHandle;
-    }
+  if (startInFlight) {
+    return startInFlight;
   }
 
-  const dbPath = parseDbCliArg() || (process.env.BILLAPP_DB_PATH || '').trim() || null;
-  const requestedPort = !app.isPackaged ? Number(process.env.BILLAPP_BACKEND_PORT || 0) || 0 : 0;
-  const { masterKey, secretBackend } = getOrCreateSafeStorageMasterKey();
+  startInFlight = (async () => {
+    // Never trust external BILLAPP_BACKEND_URL override in packaged builds (S-04)
+    if (!app.isPackaged) {
+      const externalUrl = (process.env.BILLAPP_BACKEND_URL || '').trim();
+      if (externalUrl) {
+        const parsed = new URL(externalUrl);
+        backendHandle = {
+          host: parsed.hostname,
+          port: Number(parsed.port) || 8000,
+          url: externalUrl.replace(/\/+$/, ''),
+          apiToken: (process.env.BILLAPP_API_TOKEN || '').trim() || null,
+          dbPath: parseDbCliArg() || process.env.BILLAPP_DB_PATH || null,
+          frontendDist: resolveFrontendDistDir(),
+          stop: async () => {},
+          isRunning: () => true,
+        };
+        return backendHandle;
+      }
+    }
 
-  backendHandle = await startBackend({
-    isPackaged: app.isPackaged,
-    resourcesPath: process.resourcesPath,
-    repoRoot: getRepoRoot(),
-    requestedPort,
-    dbPath,
-    frontendDir: resolveFrontendDistDir(),
-    masterKey,
-    secretBackend,
+    const dbPath = parseDbCliArg() || (process.env.BILLAPP_DB_PATH || '').trim() || null;
+    const requestedPort = !app.isPackaged ? Number(process.env.BILLAPP_BACKEND_PORT || 0) || 0 : 0;
+    const { masterKey, secretBackend } = getOrCreateSafeStorageMasterKey();
+
+    backendHandle = await startBackend({
+      isPackaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+      repoRoot: getRepoRoot(),
+      requestedPort,
+      dbPath,
+      frontendDir: resolveFrontendDistDir(),
+      masterKey,
+      secretBackend,
+    });
+    return backendHandle;
+  })().finally(() => {
+    startInFlight = null;
   });
-  return backendHandle;
+
+  return startInFlight;
 }
 
 async function shutdownBackend() {
@@ -562,72 +598,81 @@ async function loadAndMaybeSmokeTest({ win, uiUrl }) {
   console.log(`BILLAPP_ELECTRON_SMOKETEST_OK ${JSON.stringify(probe)}`);
 }
 
-app.on('web-contents-created', (_event, contents) => {
-  contents.on('will-attach-webview', (event) => {
-    event.preventDefault();
+if (hasSingleInstanceLock) {
+  app.on('web-contents-created', (_event, contents) => {
+    contents.on('will-attach-webview', (event) => {
+      event.preventDefault();
+    });
   });
-});
 
-app.on('second-instance', () => {
-  if (mainWindow) {
-    if (mainWindow.isMinimized()) {
-      mainWindow.restore();
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) {
+        mainWindow.restore();
+      }
+      mainWindow.show();
+      mainWindow.focus();
     }
-    mainWindow.show();
-    mainWindow.focus();
-  }
-});
-
-app.on('activate', async () => {
-  if (!app.isReady()) return;
-  if (BrowserWindow.getAllWindows().length === 0) {
-    await ensureBackendStarted();
-    const { win, uiUrl } = createMainWindow();
-    await win.loadURL(uiUrl);
-  } else if (mainWindow) {
-    mainWindow.show();
-  }
-});
-
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
-});
-
-app.on('before-quit', (event) => {
-  if (isQuitting) {
-    return;
-  }
-  event.preventDefault();
-  isQuitting = true;
-  shutdownBackend().finally(() => {
-    app.quit();
   });
-});
 
-app.whenReady()
-  .then(async () => {
-    const appMenu = buildAppMenu();
-    Menu.setApplicationMenu(appMenu);
-    registerIpcHandlers();
-    await ensureBackendStarted();
-    const created = createMainWindow();
-    await loadAndMaybeSmokeTest(created);
-    if (SMOKE_TEST) {
+  app.on('activate', async () => {
+    if (!app.isReady()) return;
+    try {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        await ensureBackendStarted();
+        const { win, uiUrl } = createMainWindow();
+        await win.loadURL(uiUrl);
+      } else if (mainWindow) {
+        mainWindow.show();
+      }
+    } catch (err) {
+      console.error('Failed to restore BillApp window on activate:', err);
+      if (!SMOKE_TEST) {
+        dialog.showErrorBox('账单助手恢复窗口失败', err?.message || String(err));
+      }
+    }
+  });
+
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') {
       app.quit();
-    } else {
-      const startupTimer = setTimeout(() => {
-        getAppUpdaterController().checkForUpdates({ silent: true }).catch(() => {});
-      }, 5000);
-      startupTimer.unref();
     }
-  })
-  .catch(async (err) => {
-    console.error('Failed to start BillApp Electron shell:', err);
-    if (!SMOKE_TEST) {
-      dialog.showErrorBox('账单助手启动失败', err?.message || String(err));
-    }
-    await shutdownBackend();
-    app.exit(1);
   });
+
+  app.on('before-quit', (event) => {
+    if (isQuitting) {
+      return;
+    }
+    event.preventDefault();
+    isQuitting = true;
+    shutdownBackend().finally(() => {
+      app.quit();
+    });
+  });
+
+  app.whenReady()
+    .then(async () => {
+      const appMenu = buildAppMenu();
+      Menu.setApplicationMenu(appMenu);
+      registerIpcHandlers();
+      await ensureBackendStarted();
+      const created = createMainWindow();
+      await loadAndMaybeSmokeTest(created);
+      if (SMOKE_TEST) {
+        app.quit();
+      } else {
+        const startupTimer = setTimeout(() => {
+          getAppUpdaterController().checkForUpdates({ silent: true }).catch(() => {});
+        }, 5000);
+        startupTimer.unref();
+      }
+    })
+    .catch(async (err) => {
+      console.error('Failed to start BillApp Electron shell:', err);
+      if (!SMOKE_TEST) {
+        dialog.showErrorBox('账单助手启动失败', err?.message || String(err));
+      }
+      await shutdownBackend();
+      app.exit(1);
+    });
+}

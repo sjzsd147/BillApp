@@ -65,11 +65,12 @@ export function formatAmount(
 
 export function formatCompact(cents: number | null | undefined): string {
   if (cents === null || cents === undefined || isNaN(cents)) return '¥0';
+  const sign = cents < 0 ? '-' : '';
   const yuan = Math.abs(cents) / 100;
   if (yuan >= 10000) {
-    return `¥${(yuan / 10000).toFixed(1)}万`;
+    return `${sign}¥${(yuan / 10000).toFixed(1)}万`;
   }
-  return `¥${yuan.toFixed(0)}`;
+  return `${sign}¥${yuan.toFixed(0)}`;
 }
 
 export function getCurrencySymbol(currency?: string): string {

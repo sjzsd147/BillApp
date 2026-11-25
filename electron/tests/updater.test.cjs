@@ -237,3 +237,114 @@ test('openReleasePage blocks URL traversal, non-GitHub hosts, and userinfo spoof
   assert.equal(okRes.ok, true);
   assert.equal(opened, 'https://github.com/sjzsd147/BillApp/releases/tag/v1.3.0');
 });
+
+test('updater does not treat equal latestVersion as available update on silent error (F-M4)', async () => {
+  const mockAuto = new MockAutoUpdater();
+  let calls = 0;
+  mockAuto.checkBehavior = async () => {
+    calls += 1;
+    if (calls === 1) {
+      mockAuto.emit('checking-for-update');
+      mockAuto.emit('update-not-available', { version: '1.2.0' });
+      return {};
+    }
+    const err = new Error('net::ERR_CONNECTION_TIMED_OUT');
+    mockAuto.emit('error', err);
+    throw err;
+  };
+
+  const controller = createAppUpdater({
+    app: { isPackaged: true, getVersion: () => '1.2.0' },
+    autoUpdater: mockAuto,
+    platform: 'win32',
+    env: {},
+  });
+
+  const first = await controller.checkForUpdates({ silent: false });
+  assert.equal(first.status, 'not-available');
+  assert.equal(first.latestVersion, '1.2.0');
+
+  const second = await controller.checkForUpdates({ silent: true });
+  assert.equal(second.status, 'idle');
+  assert.equal(second.error, null);
+});
+
+test('quitAndInstall invokes onInstallFailed and returns error state if updater throws (F-H3)', async () => {
+  const mockAuto = new MockAutoUpdater();
+  mockAuto.checkBehavior = async () => {
+    mockAuto.emit('update-available', { version: '1.3.0' });
+    return {};
+  };
+  mockAuto.downloadBehavior = async () => {
+    mockAuto.emit('update-downloaded', { version: '1.3.0' });
+    return [];
+  };
+  mockAuto.quitAndInstall = () => {
+    throw new Error('installer failed to launch');
+  };
+
+  let recovered = false;
+  const controller = createAppUpdater({
+    app: { isPackaged: true, getVersion: () => '1.2.0' },
+    autoUpdater: mockAuto,
+    platform: 'win32',
+    env: {},
+    beforeInstall: async () => {},
+    onInstallFailed: async () => {
+      recovered = true;
+    },
+  });
+
+  await controller.checkForUpdates({ silent: false });
+  await controller.downloadUpdate();
+  const res = await controller.quitAndInstall();
+  assert.equal(res.ok, false);
+  assert.equal(recovered, true);
+  assert.equal(res.state.status, 'error');
+});
+
+test('checksum mismatch keeps retryable download enabled and concurrent quitAndInstall coalesces (R-FL2)', async () => {
+  const checksumErr = formatUpdaterError(new Error('sha512 checksum mismatch'));
+  assert.equal(checksumErr.requiresManualDownload, false);
+  assert.match(checksumErr.message, /校验失败/);
+
+  const mockAuto = new MockAutoUpdater();
+  mockAuto.checkBehavior = async () => {
+    mockAuto.emit('update-available', { version: '1.3.0' });
+    return {};
+  };
+  mockAuto.downloadBehavior = async () => {
+    mockAuto.emit('update-downloaded', { version: '1.3.0' });
+    return [];
+  };
+
+  let beforeInstallCalls = 0;
+  let releaseBeforeInstall;
+  const beforeInstallGate = new Promise((resolve) => {
+    releaseBeforeInstall = resolve;
+  });
+
+  const controller = createAppUpdater({
+    app: { isPackaged: true, getVersion: () => '1.2.0' },
+    autoUpdater: mockAuto,
+    platform: 'win32',
+    env: {},
+    beforeInstall: async () => {
+      beforeInstallCalls += 1;
+      await beforeInstallGate;
+    },
+  });
+
+  await controller.checkForUpdates({ silent: false });
+  await controller.downloadUpdate();
+
+  const p1 = controller.quitAndInstall();
+  const p2 = controller.quitAndInstall();
+  releaseBeforeInstall();
+  const [r1, r2] = await Promise.all([p1, p2]);
+
+  assert.equal(r1.ok, true);
+  assert.equal(r2.ok, true);
+  assert.equal(beforeInstallCalls, 1);
+  assert.equal(mockAuto.quitAndInstallCalls.length, 1);
+});

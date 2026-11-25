@@ -11,7 +11,7 @@ Strictly adheres to Milestone 6 specifications and Frontend Design Document v1.2
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import math
 import re
@@ -120,11 +120,13 @@ def get_cached_fx_rate(
     conn: sqlite3.Connection,
     currency: str,
     date_str: str,
+    exact_only: bool = False,
+    max_age_days: Optional[int] = None,
 ) -> Optional[sqlite3.Row]:
     """Retrieve cached exchange rate from fx_rates table.
-    
-    Matches exact effective_date first; if missing, falls back to the latest
-    effective rate for this currency on or before the requested date.
+
+    Matches exact effective_date first; if ``exact_only`` is False, falls back to the
+    latest prior effective rate (optionally bounded within ``max_age_days``).
     """
     curr = currency.strip().upper()
     date_part = date_str[:10]
@@ -134,10 +136,26 @@ def get_cached_fx_rate(
         "SELECT * FROM fx_rates WHERE currency = ? AND effective_date = ?",
         (curr, date_part),
     ).fetchone()
-    if row:
+    if row or exact_only:
         return row
 
-    # 2. Latest prior effective rate
+    # 2. Latest prior effective rate (optionally bounded by max_age_days)
+    if max_age_days is not None:
+        try:
+            min_date = (datetime.strptime(date_part, "%Y-%m-%d") - timedelta(days=max_age_days)).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+        row = conn.execute(
+            """
+            SELECT * FROM fx_rates
+            WHERE currency = ? AND effective_date <= ? AND effective_date >= ?
+            ORDER BY effective_date DESC
+            LIMIT 1
+            """,
+            (curr, date_part, min_date),
+        ).fetchone()
+        return row
+
     row = conn.execute(
         """
         SELECT * FROM fx_rates
@@ -155,37 +173,33 @@ def convert_transaction(
     currency: str,
     amount_cents: int,
     txn_time: str,
+    online_cache: Optional[Dict[Tuple[str, str], Optional[float]]] = None,
 ) -> Tuple[Optional[int], Optional[float], Optional[str], Optional[str]]:
-    """Convert transaction amount into CNY using cached or online exchange rate.
-    
-    Returns:
-        (amount_cny, fx_rate, fx_rate_at, fx_rate_source)
-        
-    If currency is CNY:
-        returns (amount_cents, None, None, None)
-    If foreign currency and rate found:
-        amount_cny = round(amount_cents * fx_rate)
-        returns (amount_cny, fx_rate, effective_date, source)
-    If rate cannot be found / offline:
-        returns (None, None, None, 'none')
-    """
+    """Convert transaction amount into CNY using exact-date cache, online lookup, or fresh prior fallback."""
     curr = normalize_currency(currency, default="CNY") if currency else "CNY"
     if curr == "CNY":
         return amount_cents, None, None, None
 
     date_part = txn_time[:10]
 
-    # 1. Query cached rate
-    cached = get_cached_fx_rate(conn, curr, date_part)
-    if cached:
-        rate = float(cached["rate"])
-        rate_at = cached["effective_date"]
-        source = cached["source"]
+    # 1. Exact-date cached rate
+    cached_exact = get_cached_fx_rate(conn, curr, date_part, exact_only=True)
+    if cached_exact:
+        rate = float(cached_exact["rate"])
+        rate_at = cached_exact["effective_date"]
+        source = cached_exact["source"]
         amount_cny = round(amount_cents * rate)
         return amount_cny, rate, rate_at, source
 
-    # 2. Attempt online query
-    online_rate = fetch_online_fx_rate(curr, date_part)
+    # 2. Attempt online query for exact transaction date (memoized per batch if online_cache supplied)
+    cache_key = (curr, date_part)
+    if online_cache is not None and cache_key in online_cache:
+        online_rate = online_cache[cache_key]
+    else:
+        online_rate = fetch_online_fx_rate(curr, date_part)
+        if online_cache is not None:
+            online_cache[cache_key] = online_rate
+
     if online_rate is not None:
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
@@ -197,6 +211,7 @@ def convert_transaction(
                     rate = excluded.rate,
                     source = excluded.source,
                     updated_at = excluded.updated_at
+                WHERE fx_rates.source != 'manual'
                 """,
                 (curr, online_rate, date_part, now_str, now_str),
             )
@@ -206,7 +221,16 @@ def convert_transaction(
         amount_cny = round(amount_cents * online_rate)
         return amount_cny, online_rate, date_part, "online"
 
-    # 3. Non-blocking fallback: rate missing
+    # 3. Offline fallback: accept a recent prior cached rate (<= 7 days, e.g. weekend/holiday)
+    cached_recent = get_cached_fx_rate(conn, curr, date_part, exact_only=False, max_age_days=7)
+    if cached_recent:
+        rate = float(cached_recent["rate"])
+        rate_at = cached_recent["effective_date"]
+        source = cached_recent["source"]
+        amount_cny = round(amount_cents * rate)
+        return amount_cny, rate, rate_at, source
+
+    # 4. Non-blocking fallback: rate missing
     return None, None, None, "none"
 
 
@@ -298,6 +322,7 @@ def refresh_missing_fx(conn: sqlite3.Connection) -> Tuple[int, int]:
 
     total_missing = len(missing_rows)
     refreshed_count = 0
+    online_cache: Dict[Tuple[str, str], Optional[float]] = {}
 
     for r in missing_rows:
         txn_id = r["id"]
@@ -305,7 +330,9 @@ def refresh_missing_fx(conn: sqlite3.Connection) -> Tuple[int, int]:
         cents = r["amount_cents"]
         ttime = r["txn_time"]
 
-        amount_cny, rate, rate_at, source = convert_transaction(conn, curr, cents, ttime)
+        amount_cny, rate, rate_at, source = convert_transaction(
+            conn, curr, cents, ttime, online_cache=online_cache
+        )
         if amount_cny is not None and source in ("online", "manual"):
             conn.execute(
                 """
@@ -329,14 +356,19 @@ def retry_transaction_fx(conn: sqlite3.Connection, txn_id: int) -> Optional[Dict
     if not row:
         return None
 
-    curr = row["currency"]
+    raw_curr = row["currency"]
+    curr = normalize_currency(raw_curr, default="CNY") if raw_curr else "CNY"
     cents = row["amount_cents"]
     ttime = row["txn_time"]
 
-    if curr == "CNY" or curr is None:
-        conn.execute("UPDATE transactions SET amount_cny = ? WHERE id = ?", (cents, txn_id))
+    if curr == "CNY":
+        conn.execute(
+            "UPDATE transactions SET currency = 'CNY', amount_cny = ?, fx_rate = NULL, fx_rate_at = NULL, fx_rate_source = NULL WHERE id = ?",
+            (cents, txn_id),
+        )
     else:
-        # First check online query directly
+        if raw_curr != curr:
+            conn.execute("UPDATE transactions SET currency = ? WHERE id = ?", (curr, txn_id))
         date_part = ttime[:10]
         online_rate = fetch_online_fx_rate(curr, date_part)
         if online_rate is not None:
@@ -349,6 +381,7 @@ def retry_transaction_fx(conn: sqlite3.Connection, txn_id: int) -> Optional[Dict
                     rate = excluded.rate,
                     source = excluded.source,
                     updated_at = excluded.updated_at
+                WHERE fx_rates.source != 'manual'
                 """,
                 (curr, online_rate, date_part, now_str, now_str),
             )
@@ -362,8 +395,8 @@ def retry_transaction_fx(conn: sqlite3.Connection, txn_id: int) -> Optional[Dict
                 (amount_cny, online_rate, date_part, txn_id),
             )
         else:
-            # Check cached rate fallback
-            cached = get_cached_fx_rate(conn, curr, date_part)
+            # Check recent cached rate fallback
+            cached = get_cached_fx_rate(conn, curr, date_part, exact_only=False, max_age_days=7)
             if cached:
                 rate = float(cached["rate"])
                 amount_cny = round(cents * rate)
@@ -375,17 +408,30 @@ def retry_transaction_fx(conn: sqlite3.Connection, txn_id: int) -> Optional[Dict
                     """,
                     (amount_cny, rate, cached["effective_date"], cached["source"], txn_id),
                 )
-            else:
+            elif row["amount_cny"] is None:
+                # Only normalize missing FX fields; never wipe an existing valid conversion on offline retry
                 conn.execute(
                     """
                     UPDATE transactions
-                    SET amount_cny = NULL, fx_rate = NULL, fx_rate_source = 'none'
+                    SET amount_cny = NULL, fx_rate = NULL, fx_rate_at = NULL, fx_rate_source = 'none'
                     WHERE id = ?
                     """,
                     (txn_id,),
                 )
 
-    updated_row = conn.execute("SELECT * FROM transactions WHERE id = ?", (txn_id,)).fetchone()
+    updated_row = conn.execute(
+        """
+        SELECT t.*, c.name AS category_name, c.key AS category_key,
+               a.bank AS account_bank, a.tail AS account_tail, a.alias AS account_alias,
+               fa.bank AS fund_account_bank, fa.tail AS fund_account_tail
+        FROM transactions t
+        LEFT JOIN categories c ON t.category_id = c.id
+        LEFT JOIN accounts a ON t.account_id = a.id
+        LEFT JOIN accounts fa ON t.fund_account_id = fa.id
+        WHERE t.id = ?
+        """,
+        (txn_id,),
+    ).fetchone()
     return dict(updated_row) if updated_row else None
 
 
@@ -408,6 +454,9 @@ def get_fx_overview(conn: sqlite3.Connection) -> Dict[str, Any]:
         FROM transactions
         WHERE currency != 'CNY'
           AND currency IS NOT NULL
+          AND duplicate_of IS NULL
+          AND excluded = 0
+          AND direction IN ('expense', 'income')
           AND (amount_cny IS NULL OR fx_rate_source = 'none')
         """
     ).fetchone()
@@ -419,6 +468,9 @@ def get_fx_overview(conn: sqlite3.Connection) -> Dict[str, Any]:
         FROM transactions
         WHERE currency != 'CNY'
           AND currency IS NOT NULL
+          AND duplicate_of IS NULL
+          AND excluded = 0
+          AND direction IN ('expense', 'income')
           AND (amount_cny IS NULL OR fx_rate_source = 'none')
         GROUP BY currency
         ORDER BY currency ASC

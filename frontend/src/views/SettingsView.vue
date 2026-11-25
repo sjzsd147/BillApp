@@ -1,6 +1,6 @@
 <template>
   <div class="settings-view" v-loading="loading">
-    <el-tabs v-model="activeTab" class="settings-tabs">
+    <el-tabs v-model="activeTab" class="settings-tabs" @tab-change="handleTabChange">
       <!-- Tab 1: General Settings -->
       <el-tab-pane label="通用设置" name="general">
         <div class="settings-card">
@@ -24,7 +24,7 @@
             </el-form-item>
           </el-form>
           <div class="card-footer">
-            <el-button type="primary" :loading="saving" @click="saveSettings">保存通用设置</el-button>
+            <el-button type="primary" :loading="saving" @click="saveGeneralSettings">保存通用设置</el-button>
           </div>
         </div>
       </el-tab-pane>
@@ -83,9 +83,14 @@
               />
               <span class="form-tip">信用卡入账延时容差 (默认 5 天)</span>
             </el-form-item>
+
+            <el-form-item label="AI 辅助去重仲裁">
+              <el-switch v-model="settings.dedup.llm_arbitrate_enabled" />
+              <span class="form-tip">开启后对灰区重复候选调用 AI 研判（需同时开启 AI 辅助）</span>
+            </el-form-item>
           </el-form>
           <div class="card-footer">
-            <el-button type="primary" :loading="saving" @click="saveSettings">保存去重设置</el-button>
+            <el-button type="primary" :loading="saving" @click="saveDedupSettings">保存去重设置</el-button>
           </div>
         </div>
       </el-tab-pane>
@@ -110,7 +115,7 @@
             <div class="example-line">· <strong>计入退款当月</strong>：10 月支出不变，11 月支出减少 32.80。</div>
           </div>
           <div class="card-footer">
-            <el-button type="primary" :loading="saving" @click="saveSettings">保存退款口径</el-button>
+            <el-button type="primary" :loading="saving" @click="saveRefundSettings">保存退款口径</el-button>
           </div>
         </div>
 
@@ -236,12 +241,24 @@
             </el-form-item>
 
             <el-form-item label="API Key">
-              <el-input
-                v-model="llmApiKeyInput"
-                type="password"
-                show-password
-                :placeholder="settings.llm.has_api_key ? '已配置密钥 (输入新密钥可覆盖)' : '请输入 API Key'"
-              />
+              <div class="model-select-row">
+                <el-input
+                  v-model="llmApiKeyInput"
+                  type="password"
+                  show-password
+                  class="model-select-control"
+                  :placeholder="settings.llm.has_api_key ? '已配置密钥 (输入新密钥可覆盖)' : '请输入 API Key'"
+                />
+                <el-button
+                  v-if="settings.llm.has_api_key || settings.llm.api_key_decryption_failed"
+                  type="danger"
+                  plain
+                  :loading="clearingApiKey"
+                  @click="handleClearLLMApiKey"
+                >
+                  清空密钥
+                </el-button>
+              </div>
             </el-form-item>
 
             <el-form-item label="请求超时 (秒)">
@@ -258,8 +275,11 @@
               <el-checkbox v-model="settings.llm.task_classify_enabled">
                 未知交易兜底智能分类
               </el-checkbox>
-              <el-checkbox v-model="settings.llm.task_review_enabled">
+              <el-checkbox v-model="settings.llm.task_arbitrate_enabled">
                 复杂重复候选归因推理
+              </el-checkbox>
+              <el-checkbox v-model="settings.llm.task_review_enabled">
+                低置信度分类复核
               </el-checkbox>
               <el-checkbox v-model="settings.llm.task_suggest_profile_enabled">
                 未知账单表头列名智能推导
@@ -374,6 +394,8 @@
               <el-button
                 v-if="updateState?.status === 'downloaded'"
                 type="success"
+                :loading="installingUpdate"
+                :disabled="installingUpdate"
                 @click="handleQuitAndInstall"
               >
                 立即重启并安装
@@ -509,8 +531,9 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, watch } from 'vue';
-import { useRoute } from 'vue-router';
-import { ElMessage, ElNotification } from 'element-plus';
+import { useRoute, useRouter } from 'vue-router';
+import dayjs from 'dayjs';
+import { ElMessage, ElMessageBox, ElNotification } from 'element-plus';
 import { Lock } from '@element-plus/icons-vue';
 import {
   getSettings,
@@ -526,6 +549,7 @@ import { isElectronDesktop, saveDatabaseBackupViaDesktop } from '@/utils/desktop
 import type { SettingsOut, FxRatesResponse, FxRateItem, LLMModelInfo } from '@/types/api';
 
 const route = useRoute();
+const router = useRouter();
 const appStore = useAppStore();
 
 const activeTab = ref((route.params.tab as string) || 'general');
@@ -533,6 +557,15 @@ const loading = ref(false);
 const saving = ref(false);
 const testingLLM = ref(false);
 const fetchingModels = ref(false);
+const clearingApiKey = ref(false);
+const installingUpdate = ref(false);
+
+function handleTabChange(name: string | number) {
+  const tabName = String(name);
+  if (route.params.tab !== tabName) {
+    router.replace(`/settings/${tabName}`);
+  }
+}
 
 const refreshingFx = ref(false);
 const savingFx = ref(false);
@@ -553,7 +586,12 @@ const updateState = computed(() => appStore.updateState);
 const checkingUpdate = computed(() => updateState.value?.status === 'checking');
 const canDownloadUpdate = computed(() => {
   const s = updateState.value;
-  return Boolean(s && s.status === 'available' && s.autoInstallSupported && !s.manualDownloadRequired);
+  return Boolean(
+    s &&
+      (s.status === 'available' || (s.status === 'error' && Boolean(s.latestVersion))) &&
+      s.autoInstallSupported &&
+      !s.manualDownloadRequired
+  );
 });
 const updaterModeLabel = computed(() => {
   if (!isDesktopEnv.value) return '网页模式';
@@ -618,7 +656,7 @@ const availableCurrencies = computed(() => {
 const manualFxForm = reactive({
   currency: 'USD',
   rate: undefined as number | undefined,
-  effective_date: new Date().toISOString().slice(0, 10),
+  effective_date: dayjs().format('YYYY-MM-DD'),
   note: '',
   apply_to_all_missing: false,
 });
@@ -702,20 +740,74 @@ async function loadSettings() {
   }
 }
 
-async function saveSettings() {
+async function saveGeneralSettings() {
   saving.value = true;
   try {
-    const res = await updateSettings({
-      general: settings.general,
-      dedup: settings.dedup,
-      refund: settings.refund,
-    });
+    const res = await updateSettings({ general: settings.general });
     appStore.applyGeneralSettings(res.general);
-    ElMessage.success('设置已成功保存');
+    ElMessage.success('通用设置已保存');
   } catch (err: any) {
-    ElMessage.error(err.message || '保存设置失败');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '保存通用设置失败');
+    }
   } finally {
     saving.value = false;
+  }
+}
+
+async function saveDedupSettings() {
+  if (settings.dedup.pending_threshold > settings.dedup.auto_confirm_threshold) {
+    ElMessage.warning('人工核对下限阈值不能大于自动合并置信度阈值');
+    return;
+  }
+  saving.value = true;
+  try {
+    await updateSettings({ dedup: settings.dedup });
+    ElMessage.success('去重设置已保存');
+  } catch (err: any) {
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '保存去重设置失败');
+    }
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function saveRefundSettings() {
+  saving.value = true;
+  try {
+    await updateSettings({ refund: settings.refund });
+    ElMessage.success('退款口径已保存');
+  } catch (err: any) {
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '保存退款口径失败');
+    }
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function handleClearLLMApiKey() {
+  try {
+    await ElMessageBox.confirm('确定要清空已保存的 API Key 吗？', '清空密钥确认', {
+      type: 'warning',
+    });
+  } catch {
+    return;
+  }
+  clearingApiKey.value = true;
+  try {
+    await updateSettings({ llm: { api_key: '' } });
+    llmApiKeyInput.value = '';
+    ElMessage.success('API Key 已清空');
+    await loadSettings();
+    await appStore.fetchLLMStatus();
+  } catch (err: any) {
+    if (!err?.toasted) {
+      ElMessage.error(err?.message || '清空密钥失败');
+    }
+  } finally {
+    clearingApiKey.value = false;
   }
 }
 
@@ -724,11 +816,12 @@ async function saveLLMSettings() {
   try {
     const payload: any = {
       base_url: settings.llm.base_url,
-      model: settings.llm.model,
+      model: (settings.llm.model ?? '').trim(),
       timeout_sec: settings.llm.timeout_sec,
       enabled: settings.llm.enabled,
       task_classify_enabled: settings.llm.task_classify_enabled,
       task_review_enabled: settings.llm.task_review_enabled,
+      task_arbitrate_enabled: settings.llm.task_arbitrate_enabled,
       task_suggest_profile_enabled: settings.llm.task_suggest_profile_enabled,
       task_full_parse_enabled: settings.llm.task_full_parse_enabled,
     };
@@ -743,7 +836,9 @@ async function saveLLMSettings() {
     await loadSettings();
     await appStore.fetchLLMStatus();
   } catch (err: any) {
-    ElMessage.error(err.message || '保存 AI 配置失败');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '保存 AI 配置失败');
+    }
   } finally {
     saving.value = false;
   }
@@ -759,6 +854,7 @@ async function handleFetchModels() {
     const res = await listLLMModels({
       base_url: settings.llm.base_url || undefined,
       api_key: llmApiKeyInput.value.trim() || undefined,
+      timeout_sec: settings.llm.timeout_sec,
     });
     if (res.ok && res.models.length > 0) {
       fetchedModels.value = res.models;
@@ -773,7 +869,9 @@ async function handleFetchModels() {
       ElMessage.error(`获取模型列表失败: ${res.error || '未知错误'}`);
     }
   } catch (err: any) {
-    ElMessage.error(err.message || '获取模型列表异常');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '获取模型列表异常');
+    }
   } finally {
     fetchingModels.value = false;
   }
@@ -786,6 +884,7 @@ async function handleTestLLM() {
       base_url: settings.llm.base_url || undefined,
       model: settings.llm.model || undefined,
       api_key: llmApiKeyInput.value.trim() || undefined,
+      timeout_sec: settings.llm.timeout_sec,
     });
     if (res.ok) {
       ElMessage.success(`连接成功！模型: ${res.model}，延迟: ${res.latency_ms}ms`);
@@ -793,7 +892,9 @@ async function handleTestLLM() {
       ElMessage.error(`连接失败: ${res.error || '未知错误'}`);
     }
   } catch (err: any) {
-    ElMessage.error(err.message || '测试请求异常');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '测试请求异常');
+    }
   } finally {
     testingLLM.value = false;
   }
@@ -818,7 +919,9 @@ async function handleRefreshFx() {
     ElMessage.success(`缺失汇率刷新完毕，成功补充 ${res.refreshed_count} 笔汇率`);
     await loadFxOverview();
   } catch (err: any) {
-    ElMessage.error(err?.message || '刷新汇率失败');
+    if (!err?.toasted) {
+      ElMessage.error(err?.message || '刷新汇率失败');
+    }
   } finally {
     refreshingFx.value = false;
   }
@@ -827,7 +930,7 @@ async function handleRefreshFx() {
 function openAddRateDialog() {
   manualFxForm.currency = 'USD';
   manualFxForm.rate = undefined;
-  manualFxForm.effective_date = new Date().toISOString().slice(0, 10);
+  manualFxForm.effective_date = dayjs().format('YYYY-MM-DD');
   manualFxForm.note = '';
   manualFxForm.apply_to_all_missing = false;
   showFxDialog.value = true;
@@ -864,7 +967,9 @@ async function handleSaveManualFx() {
     showFxDialog.value = false;
     await loadFxOverview();
   } catch (err: any) {
-    ElMessage.error(err?.message || '保存汇率失败');
+    if (!err?.toasted) {
+      ElMessage.error(err?.message || '保存汇率失败');
+    }
   } finally {
     savingFx.value = false;
   }
@@ -974,7 +1079,9 @@ async function handleBackup() {
       title: '导出数据库备份失败',
       description: msg,
     };
-    ElMessage.error(msg);
+    if (!err?.toasted) {
+      ElMessage.error(msg);
+    }
   } finally {
     backingUp.value = false;
   }
@@ -994,9 +1101,11 @@ async function handleRestoreFileChange(event: Event) {
   try {
     const res = await restoreDatabase(file);
     ElMessage.success(`数据库已恢复：共 ${res.transactions_count} 条交易、${res.accounts_count} 个账户`);
-    await Promise.all([loadSettings(), loadFxOverview(), appStore.fetchMeta()]);
+    await Promise.all([loadSettings(), loadFxOverview(), appStore.fetchMeta(), appStore.fetchLLMStatus()]);
   } catch (err: any) {
-    ElMessage.error(err?.message || '恢复数据库失败');
+    if (!err?.toasted) {
+      ElMessage.error(err?.message || '恢复数据库失败');
+    }
   } finally {
     restoring.value = false;
   }
@@ -1022,9 +1131,11 @@ async function handleConfirmReset() {
     });
     showResetDialog.value = false;
     ElMessage.success('账单数据已清空');
-    await Promise.all([loadSettings(), loadFxOverview(), appStore.fetchMeta()]);
+    await Promise.all([loadSettings(), loadFxOverview(), appStore.fetchMeta(), appStore.fetchLLMStatus()]);
   } catch (err: any) {
-    ElMessage.error(err?.message || '清空数据失败');
+    if (!err?.toasted) {
+      ElMessage.error(err?.message || '清空数据失败');
+    }
   } finally {
     resetting.value = false;
   }
@@ -1082,6 +1193,8 @@ async function handleDownloadUpdate() {
 }
 
 async function handleQuitAndInstall() {
+  if (installingUpdate.value) return;
+  installingUpdate.value = true;
   try {
     const res = await appStore.quitAndInstallUpdate();
     if (res && !res.ok && res.error) {
@@ -1089,6 +1202,8 @@ async function handleQuitAndInstall() {
     }
   } catch (err: any) {
     ElMessage.error(err?.message || '安装更新失败');
+  } finally {
+    installingUpdate.value = false;
   }
 }
 

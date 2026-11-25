@@ -12,7 +12,7 @@ from typing import Any, Dict, Literal, Optional, Tuple
 
 import anyio
 from fastapi import APIRouter, Depends, File, Request, Response, UploadFile, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from billapp.api._upload import MAX_BACKUP_UPLOAD_BYTES, read_upload_limited
 from billapp.app import AppException, ValidationError, get_db_conn
@@ -24,7 +24,7 @@ from billapp.core.secrets import (
     get_secret_storage_info,
     mask_secret,
 )
-from billapp.llm.client import LLMConfig, validate_llm_base_url
+from billapp.llm.client import LLMConfig, normalize_url_origin, validate_llm_base_url
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 data_router = APIRouter(prefix="/api", tags=["data"])
@@ -47,9 +47,15 @@ class DedupSettings(BaseModel):
     second_window_minutes: int = Field(30, ge=1, le=120)
     day_window_debit_days: int = Field(3, ge=1, le=14)
     day_window_credit_days: int = Field(5, ge=1, le=30)
-    llm_arbitrate_enabled: bool = True
+    llm_arbitrate_enabled: bool = False
     llm_auto_confirm: bool = False
     llm_auto_confirm_threshold: float = Field(0.90, ge=0.7, le=1.0)
+
+    @model_validator(mode="after")
+    def _validate_thresholds(self) -> "DedupSettings":
+        if self.pending_threshold > self.auto_confirm_threshold:
+            raise ValueError("pending_threshold 不能大于 auto_confirm_threshold")
+        return self
 
 
 class RefundSettings(BaseModel):
@@ -209,6 +215,14 @@ def update_settings(
 
     if payload.llm is not None:
         conf = LLMConfig.load_from_db(db)
+        raw_key = payload.llm.api_key.strip() if payload.llm.api_key is not None else None
+        has_new_key = bool(
+            raw_key and not raw_key.startswith("****") and not raw_key.startswith("sk-****")
+        )
+        explicit_clear_key = payload.llm.api_key is not None and raw_key == ""
+        had_saved_key = bool(conf.api_key.strip() or conf.raw_api_key_encrypted)
+        saved_base_url = conf.base_url.strip()
+
         if payload.llm.base_url is not None:
             cleaned_url = payload.llm.base_url.strip()
             if cleaned_url:
@@ -216,6 +230,12 @@ def update_settings(
                     validate_llm_base_url(cleaned_url)
                 except ValueError as exc:
                     raise ValidationError(message=str(exc)) from exc
+                # Prevent redirecting a persisted API key to a different origin (S-02)
+                if had_saved_key and not has_new_key and not explicit_clear_key:
+                    if not saved_base_url or normalize_url_origin(cleaned_url) != normalize_url_origin(saved_base_url):
+                        raise ValidationError(
+                            message="检测到 API 服务地址 (Base URL) 与已保存地址不一致，出于安全保护禁止复用原 API Key，请重新输入 API Key 或先清空原密钥后再修改地址"
+                        )
             conf.base_url = cleaned_url
         if payload.llm.model is not None:
             conf.model = payload.llm.model
@@ -242,11 +262,15 @@ def update_settings(
         if payload.llm.auto_confirm_threshold is not None:
             conf.auto_confirm_threshold = payload.llm.auto_confirm_threshold
 
-        # Update API key if provided and not masked
-        if payload.llm.api_key is not None:
-            raw_key = payload.llm.api_key.strip()
-            if raw_key and not raw_key.startswith("****") and not raw_key.startswith("sk-****"):
-                conf.api_key = raw_key
+        # Update or explicitly clear API key
+        if explicit_clear_key:
+            conf.api_key = ""
+            conf.raw_api_key_encrypted = ""
+            conf.api_key_decryption_failed = False
+        elif has_new_key and raw_key is not None:
+            conf.api_key = raw_key
+            conf.raw_api_key_encrypted = ""
+            conf.api_key_decryption_failed = False
 
         try:
             conf.save_to_db(db)
@@ -363,6 +387,8 @@ def backup_database(db: sqlite3.Connection = Depends(get_db_conn)):
             db.backup(dst_conn)
             _redact_backup_secrets(dst_conn)
             dst_conn.commit()
+            dst_conn.execute("PRAGMA journal_mode=DELETE;")
+            dst_conn.execute("VACUUM;")
         finally:
             dst_conn.close()
 

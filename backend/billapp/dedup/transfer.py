@@ -125,8 +125,20 @@ def compute_transfer_score(
     out_kind = out_txn.get("acc_kind")
     in_kind = in_txn.get("acc_kind")
 
+    # Pattern B: Debit Card / Platform -> Credit Card Repayment
+    # Evaluated before Pattern A so WeChat/Alipay credit card repayments get repayment bonuses
+    if (out_kind == "bank_debit" or out_src in ("wechat", "alipay")) and in_kind == "bank_credit":
+        score += 0.20
+        features["pattern"] = "credit_card_repay"
+        if any(w in in_desc for w in ("还款", "转帐", "转账", "跨行还款", "自动还款")):
+            score += 0.15
+        if any(w in out_desc for w in ("信用卡还款", "还款", "转账", "转帐")):
+            score += 0.15
+        if holder_name and (holder_name in in_desc or holder_name in out_desc):
+            score += 0.15
+
     # Pattern A: Platform Withdrawal -> Bank Deposit
-    if out_src in ("wechat", "alipay") and in_src not in ("wechat", "alipay"):
+    elif out_src in ("wechat", "alipay") and in_src not in ("wechat", "alipay"):
         if any(w in out_desc for w in ("提现", "转出到银行卡", "零钱提现", "经营账户提现", "零钱通转出")):
             score += 0.25
             features["pattern"] = "wallet_withdrawal"
@@ -142,17 +154,6 @@ def compute_transfer_score(
                 score += 0.20
         elif target_tail and in_tail and target_tail == in_tail:
             score += 0.25
-
-    # Pattern B: Debit Card -> Credit Card Repayment
-    elif (out_kind == "bank_debit" or out_src in ("wechat", "alipay")) and in_kind == "bank_credit":
-        score += 0.20
-        features["pattern"] = "credit_card_repay"
-        if any(w in in_desc for w in ("还款", "转帐", "转账", "跨行还款", "自动还款")):
-            score += 0.15
-        if any(w in out_desc for w in ("信用卡还款", "还款", "转账", "转帐")):
-            score += 0.15
-        if holder_name and (holder_name in in_desc or holder_name in out_desc):
-            score += 0.15
 
     # Pattern C: Inter-Bank Debit -> Debit Transfer
     elif (out_kind == "bank_debit" or out_kind is None) and (in_kind == "bank_debit" or in_kind is None):
@@ -365,6 +366,17 @@ def pair_internal_transfers(
             conn.execute(
                 "UPDATE transactions SET transfer_peer = ?, direction = 'transfer' WHERE id = ?",
                 (c["out_id"], c["in_id"]),
+            )
+            # Retire competing pending transfer links involving either transaction
+            conn.execute(
+                """
+                DELETE FROM match_links
+                WHERE kind = 'transfer'
+                  AND status = 'pending'
+                  AND NOT (primary_id = ? AND secondary_id = ?)
+                  AND (primary_id IN (?, ?) OR secondary_id IN (?, ?))
+                """,
+                (c["out_id"], c["in_id"], c["out_id"], c["in_id"], c["out_id"], c["in_id"]),
             )
 
     return final_matches

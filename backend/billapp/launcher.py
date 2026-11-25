@@ -113,6 +113,14 @@ def acquire_single_instance_mutex() -> bool:
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
     kernel32.CreateMutexW.restype = wintypes.HANDLE
     kernel32.GetLastError.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+    user32.FindWindowW.restype = wintypes.HWND
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
 
     # Attempt Global mutex first; fallback to Local
     handle = kernel32.CreateMutexW(None, True, MUTEX_NAME)
@@ -139,7 +147,12 @@ def release_single_instance_mutex() -> None:
     """Release single instance mutex upon application termination."""
     global _MUTEX_HANDLE
     if _MUTEX_HANDLE and sys.platform == "win32":
-        ctypes.windll.kernel32.CloseHandle(_MUTEX_HANDLE)
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(_MUTEX_HANDLE)
         _MUTEX_HANDLE = None
 
 
@@ -173,13 +186,25 @@ def _ensure_stdio() -> None:
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
+def _format_url_host(host: str) -> str:
+    h = (host or "127.0.0.1").strip()
+    if h in ("", "0.0.0.0"):
+        return "127.0.0.1"
+    if h == "::":
+        return "[::1]"
+    if ":" in h and not (h.startswith("[") and h.endswith("]")):
+        return f"[{h}]"
+    return h
+
+
 def wait_for_server(
     port: int,
     timeout: float = 10.0,
     server_thread: Optional[threading.Thread] = None,
+    host: str = "127.0.0.1",
 ) -> bool:
     """Poll health check endpoint (bypassing HTTP proxies) until server is ready or timeout expires."""
-    url = f"http://127.0.0.1:{port}/api/health"
+    url = f"http://{_format_url_host(host)}:{port}/api/health"
     start_time = time.time()
     while time.time() - start_time < timeout:
         if server_thread is not None and not server_thread.is_alive():
@@ -313,13 +338,13 @@ def main() -> None:
         server_thread = threading.Thread(target=_run_server, name="billapp-uvicorn", daemon=True)
         server_thread.start()
 
-        if not wait_for_server(port, timeout=15.0, server_thread=server_thread):
+        if not wait_for_server(port, timeout=15.0, server_thread=server_thread, host=args.host):
             msg = f"Failed to start BillApp backend server (see {log_path or 'launcher.log'})."
             logger.error("%s port=%s, db=%s", msg, port, resolved_db)
             print(msg, file=sys.stderr, flush=True)
             sys.exit(1)
 
-        base_url = f"http://{args.host}:{port}"
+        base_url = f"http://{_format_url_host(args.host)}:{port}"
         logger.info("Backend server ready at %s", base_url)
 
         if args.selftest:

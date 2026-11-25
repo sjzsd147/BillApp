@@ -69,26 +69,49 @@
                   <span v-else class="text-sub">待解析</span>
                 </template>
               </el-table-column>
-              <el-table-column label="状态" width="140">
+              <el-table-column label="状态" width="160">
                 <template #default="{ row }">
-                  <el-tag v-if="row.status === 'ready'" type="success" size="small">就绪</el-tag>
-                  <el-tag v-else-if="row.status === 'need_password'" type="warning" size="small">
-                    需输入密码
-                  </el-tag>
-                  <el-tag v-else-if="row.status === 'need_mapping'" type="info" size="small">
-                    需配置映射
-                  </el-tag>
-                  <el-tag v-else-if="row.status === 'parsing'" type="primary" size="small">
-                    解析中...
-                  </el-tag>
-                  <el-tag v-else-if="row.status === 'error'" type="danger" size="small">
-                    解析失败
-                  </el-tag>
-                  <el-tag v-else size="small">等待中</el-tag>
+                  <div class="status-cell">
+                    <el-tag v-if="row.status === 'ready'" type="success" size="small">就绪</el-tag>
+                    <el-tag v-else-if="row.status === 'need_password'" type="warning" size="small">
+                      需输入密码
+                    </el-tag>
+                    <el-tag v-else-if="row.status === 'need_mapping'" type="info" size="small">
+                      需配置映射
+                    </el-tag>
+                    <el-tag v-else-if="row.status === 'parsing'" type="primary" size="small">
+                      解析中...
+                    </el-tag>
+                    <el-tooltip
+                      v-else-if="row.status === 'error'"
+                      :content="row.errorMsg || '解析失败'"
+                      placement="top"
+                    >
+                      <el-tag type="danger" size="small">解析失败</el-tag>
+                    </el-tooltip>
+                    <el-tag v-else size="small">等待中</el-tag>
+                    <el-tag
+                      v-if="row.preview?.existing_batch_id"
+                      type="warning"
+                      size="small"
+                      effect="plain"
+                    >
+                      重导 #{{ row.preview.existing_batch_id }}
+                    </el-tag>
+                  </div>
                 </template>
               </el-table-column>
-              <el-table-column label="操作" width="180" fixed="right">
+              <el-table-column label="操作" width="200" fixed="right">
                 <template #default="{ row }">
+                  <el-button
+                    v-if="row.status === 'ready' && row.preview"
+                    type="primary"
+                    link
+                    size="small"
+                    @click="selectPreviewItem(row)"
+                  >
+                    预览
+                  </el-button>
                   <el-button
                     v-if="row.status === 'queued' || row.status === 'error'"
                     type="primary"
@@ -152,9 +175,22 @@
                   :loading="committing"
                   @click="commitActivePreview"
                 >
-                  确认导入 ({{ importStore.activePreview.total_rows }} 笔)
+                  {{ importStore.activePreview.existing_batch_id ? '重新解析并覆盖导入' : '确认导入' }}
+                  ({{ importStore.activePreview.total_rows }} 笔)
                 </el-button>
               </div>
+            </div>
+
+            <!-- Warnings (e.g. duplicate batch re-import, multi-file ZIP notice, AI chunk truncation) -->
+            <div v-if="importStore.activePreview.warnings?.length" class="preview-warnings">
+              <el-alert
+                v-for="(warn, wIdx) in importStore.activePreview.warnings"
+                :key="wIdx"
+                :title="warn"
+                type="warning"
+                show-icon
+                :closable="false"
+              />
             </div>
 
             <!-- Preview Metric Tiles -->
@@ -199,6 +235,7 @@
                 <el-option label="借记卡" value="bank_debit" />
                 <el-option label="信用卡" value="bank_credit" />
                 <el-option label="第三方钱包" value="wallet" />
+                <el-option label="第三方平台" value="platform" />
               </el-select>
               <el-input
                 v-model="accountDraft.holder"
@@ -399,23 +436,74 @@ const accountDraft = reactive({
   holder: '',
 });
 
+const accountDraftBaseline = reactive({
+  bank: '',
+  tail: '',
+  kind: 'bank_debit',
+  holder: '',
+});
+
+function buildModifiedAccountOverrides(): Record<string, any> | undefined {
+  const overrides: Record<string, any> = {};
+  if (accountDraft.bank.trim() !== accountDraftBaseline.bank) {
+    if (accountDraft.bank.trim()) overrides.bank = accountDraft.bank.trim();
+  }
+  if (accountDraft.tail.trim() !== accountDraftBaseline.tail) {
+    overrides.tail = accountDraft.tail.trim() || null;
+  }
+  if (accountDraft.kind !== accountDraftBaseline.kind) {
+    overrides.kind = accountDraft.kind;
+  }
+  if (accountDraft.holder.trim() !== accountDraftBaseline.holder) {
+    if (accountDraft.holder.trim()) overrides.holder = accountDraft.holder.trim();
+  }
+  return Object.keys(overrides).length > 0 ? overrides : undefined;
+}
+
 watch(
   () => importStore.activePreview,
   (preview) => {
     const first = preview?.accounts?.[0];
-    accountDraft.bank = first?.bank || '';
-    accountDraft.tail = first?.tail || '';
-    accountDraft.kind = first?.kind || 'bank_debit';
-    accountDraft.holder = first?.holder || '';
+    const baseBank = first?.bank || '';
+    const baseTail = first?.tail || '';
+    const baseKind = first?.kind || 'bank_debit';
+    const baseHolder = first?.holder || '';
+    accountDraftBaseline.bank = baseBank;
+    accountDraftBaseline.tail = baseTail;
+    accountDraftBaseline.kind = baseKind;
+    accountDraftBaseline.holder = baseHolder;
+
+    const queueItem = preview
+      ? importStore.queue.find((i) => i.preview?.token === preview.token)
+      : undefined;
+    const savedOv = queueItem?.accountOverrides;
+    accountDraft.bank = savedOv?.bank ?? baseBank;
+    accountDraft.tail = savedOv && 'tail' in savedOv ? (savedOv.tail || '') : baseTail;
+    accountDraft.kind = savedOv?.kind ?? baseKind;
+    accountDraft.holder = savedOv?.holder ?? baseHolder;
   },
   { immediate: true }
 );
 
-// Ephemeral PDF Password
+watch(
+  accountDraft,
+  () => {
+    const activeToken = importStore.activePreview?.token;
+    if (!activeToken) return;
+    const queueItem = importStore.queue.find((i) => i.preview?.token === activeToken);
+    if (queueItem) {
+      queueItem.accountOverrides = buildModifiedAccountOverrides();
+    }
+  },
+  { deep: true }
+);
+
+// Ephemeral PDF/ZIP Password
 const showPasswordModal = ref(false);
 const ephemeralPassword = ref('');
 const verifyingPassword = ref(false);
 const currentPasswordItem = ref<FileQueueItem | null>(null);
+const pendingPasswordContext = ref<{ profileId?: string; useLlm?: boolean }>({});
 
 // Profiles
 const profiles = ref<ProfileSummary[]>([]);
@@ -428,6 +516,12 @@ const hasReadyItems = computed(() => {
 const readyCount = computed(() => {
   return importStore.queue.filter((i) => i.status === 'ready').length;
 });
+
+function selectPreviewItem(item: FileQueueItem) {
+  if (item.preview) {
+    importStore.activePreview = item.preview;
+  }
+}
 
 function triggerFileInput() {
   fileInputRef.value?.click();
@@ -456,7 +550,7 @@ async function processAllQueued() {
       try {
         await importStore.parseFile(item);
       } catch {
-        // Error recorded in item.status
+        // Error recorded in item.status and errorMsg
       }
     }
   }
@@ -466,12 +560,18 @@ async function processQueueItem(item: FileQueueItem) {
   try {
     await importStore.parseFile(item);
   } catch (err: any) {
-    ElMessage.error(err.message || '解析失败');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '解析失败');
+    }
   }
 }
 
-function openPasswordModal(item: FileQueueItem) {
+function openPasswordModal(item: FileQueueItem, options?: { profileId?: string; useLlm?: boolean }) {
   currentPasswordItem.value = item;
+  pendingPasswordContext.value = {
+    profileId: options?.profileId ?? item.profileId,
+    useLlm: options?.useLlm,
+  };
   ephemeralPassword.value = '';
   showPasswordModal.value = true;
 }
@@ -480,11 +580,25 @@ async function submitPassword() {
   if (!currentPasswordItem.value || !ephemeralPassword.value) return;
   verifyingPassword.value = true;
   try {
-    await importStore.parseFile(currentPasswordItem.value, ephemeralPassword.value);
+    const preview = await importStore.parseFile(
+      currentPasswordItem.value,
+      ephemeralPassword.value,
+      pendingPasswordContext.value.profileId,
+      pendingPasswordContext.value.useLlm
+    );
     showPasswordModal.value = false;
-    ElMessage.success('密码验证通过，账单已成功解析');
+    pendingPasswordContext.value = {};
+    if (preview?.need_mapping) {
+      ElMessage.info('密码验证通过，该账单格式需配置字段映射或使用 AI 整单识别');
+    } else if (preview?.need_password) {
+      ElMessage.warning('仍需输入密码解锁内层加密文件');
+    } else {
+      ElMessage.success('密码验证通过，账单已成功解析');
+    }
   } catch (err: any) {
-    ElMessage.error(err.message || '密码错误，请重试');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '密码错误，请重试');
+    }
   } finally {
     verifyingPassword.value = false;
     ephemeralPassword.value = ''; // Strictly discard from memory
@@ -496,14 +610,16 @@ async function handleAiFullParse(item: FileQueueItem) {
   try {
     const preview = await importStore.parseFile(item, undefined, undefined, true);
     if (preview && preview.need_password) {
-      openPasswordModal(item);
+      openPasswordModal(item, { useLlm: true });
     } else if (preview && !preview.need_mapping) {
       ElMessage.success('AI 整单识别成功');
     } else {
       ElMessage.warning('AI 未能识别出完整交易明细，请进入映射向导设置');
     }
   } catch (err: any) {
-    ElMessage.error(err?.message || 'AI 整单识别失败，请检查设置中的 AI 配置');
+    if (!err?.toasted) {
+      ElMessage.error(err?.message || 'AI 整单识别失败，请检查设置中的 AI 配置');
+    }
   } finally {
     aiParsingId.value = null;
   }
@@ -522,24 +638,30 @@ function goToMappingWizard() {
 
 async function commitActivePreview() {
   if (!importStore.activePreview) return;
+  const activeToken = importStore.activePreview.token;
+  const committedItem = importStore.queue.find((i) => i.preview?.token === activeToken);
   committing.value = true;
   try {
-    const overrides: Record<string, any> = {};
-    if (accountDraft.bank.trim()) overrides.bank = accountDraft.bank.trim();
-    if (accountDraft.tail.trim()) overrides.tail = accountDraft.tail.trim();
-    if (accountDraft.kind) overrides.kind = accountDraft.kind;
-    if (accountDraft.holder.trim()) overrides.holder = accountDraft.holder.trim();
-    const hasOverrides = Object.keys(overrides).length > 0;
-    const res = await importStore.commitActivePreview(
-      importStore.activePreview.token,
-      hasOverrides ? overrides : undefined
-    );
-    ElMessage.success(`导入成功: 写入 ${res.imported_count} 条交易`);
-    importStore.clearQueue();
-    await appStore.fetchMeta();
-    router.push('/transactions');
+    const overrides = buildModifiedAccountOverrides();
+    const res = await importStore.commitActivePreview(activeToken, overrides);
+    if (res.replaced_batch_id) {
+      ElMessage.success(
+        `重复批次 #${res.replaced_batch_id} 已重新解析并入库（新批次 #${res.batch_id}，写入 ${res.imported_count} 条交易）`
+      );
+    } else {
+      ElMessage.success(`导入成功: 写入 ${res.imported_count} 条交易`);
+    }
+    if (committedItem) {
+      importStore.removeQueueItem(committedItem.id);
+    }
+    await Promise.all([appStore.fetchMeta(), importStore.fetchBatches()]);
+    if (importStore.queue.length === 0) {
+      router.push('/transactions');
+    }
   } catch (err: any) {
-    ElMessage.error(err.message || '导入提交失败');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '导入提交失败');
+    }
   } finally {
     committing.value = false;
   }
@@ -548,21 +670,31 @@ async function commitActivePreview() {
 async function commitAllReady() {
   committing.value = true;
   let successCount = 0;
-  for (const item of importStore.queue) {
+  let replacedCount = 0;
+  const succeededIds: string[] = [];
+  for (const item of [...importStore.queue]) {
     if (item.status === 'ready' && item.preview) {
       try {
-        await importStore.commitActivePreview(item.preview.token);
+        const res = await importStore.commitActivePreview(item.preview.token, item.accountOverrides);
         item.status = 'success';
+        succeededIds.push(item.id);
         successCount++;
-      } catch (e) {
+        if (res.replaced_batch_id) replacedCount++;
+      } catch (e: any) {
         item.status = 'error';
+        item.errorMsg = e?.message || '导入提交失败';
       }
     }
   }
+  for (const id of succeededIds) {
+    importStore.removeQueueItem(id);
+  }
   committing.value = false;
-  ElMessage.success(`完成导入，共提交 ${successCount} 个文件`);
-  await appStore.fetchMeta();
-  importStore.clearQueue();
+  if (successCount > 0) {
+    const replaceNote = replacedCount > 0 ? `（含 ${replacedCount} 个重复批次重新解析入库）` : '';
+    ElMessage.success(`完成导入，共提交 ${successCount} 个文件${replaceNote}`);
+  }
+  await Promise.all([appStore.fetchMeta(), importStore.fetchBatches()]);
 }
 
 async function confirmRollback(batch: BatchItem) {
@@ -615,7 +747,9 @@ async function confirmDeleteProfile(profile: ProfileSummary) {
     ElMessage.success(`银行配置「${profile.name}」已删除`);
     await loadProfilesList();
   } catch (err: any) {
-    ElMessage.error(err?.message || '删除银行配置失败');
+    if (!err?.toasted) {
+      ElMessage.error(err?.message || '删除银行配置失败');
+    }
   }
 }
 
@@ -722,6 +856,19 @@ onMounted(() => {
   border-radius: var(--radius-sm);
   font-size: 11.5px;
   font-weight: 500;
+}
+
+.status-cell {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.preview-warnings {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 /* Preview Panel */

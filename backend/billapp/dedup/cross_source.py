@@ -515,5 +515,16 @@ def match_cross_source(
                 "UPDATE transactions SET duplicate_of = ? WHERE id = ?",
                 (c["p_id"], c["b_id"]),
             )
+            # Retire competing pending duplicate links involving the auto-deduped secondary transaction
+            conn.execute(
+                """
+                DELETE FROM match_links
+                WHERE kind = 'duplicate'
+                  AND status = 'pending'
+                  AND id != ?
+                  AND (secondary_id = ? OR primary_id = ?)
+                """,
+                (c["link_id"], c["b_id"], c["b_id"]),
+            )
 
     return final_matches

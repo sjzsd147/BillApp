@@ -156,25 +156,37 @@ def _macos_keychain_get_or_create(create: bool = True) -> Optional[bytes]:
         if not create:
             return None
         new_hex = secrets.token_hex(32)
+        # Pass the secret via interactive stdin (`security -i`) so it never appears in process argv.
+        interactive_cmd = (
+            f'add-generic-password -U -s "{_KEYCHAIN_SERVICE}" -a "{_KEYCHAIN_ACCOUNT}" -w "{new_hex}"\n'
+        )
         add_res = subprocess.run(
-            [
-                "/usr/bin/security",
-                "add-generic-password",
-                "-U",
-                "-s",
-                _KEYCHAIN_SERVICE,
-                "-a",
-                _KEYCHAIN_ACCOUNT,
-                "-w",
-                new_hex,
-            ],
+            ["/usr/bin/security", "-i"],
+            input=interactive_cmd,
             capture_output=True,
             text=True,
             timeout=5,
             check=False,
         )
-        if add_res.returncode == 0:
-            return bytes.fromhex(new_hex)
+        # `security -i` exits with code 0 even when subcommands fail; verify stderr and read back key.
+        if add_res.returncode == 0 and not (add_res.stderr or "").strip():
+            verify_res = subprocess.run(
+                [
+                    "/usr/bin/security",
+                    "find-generic-password",
+                    "-s",
+                    _KEYCHAIN_SERVICE,
+                    "-a",
+                    _KEYCHAIN_ACCOUNT,
+                    "-w",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if verify_res.returncode == 0 and verify_res.stdout.strip() == new_hex:
+                return bytes.fromhex(new_hex)
     except Exception as exc:
         logger.warning("macOS Keychain access unavailable: %s", exc)
     return None
@@ -239,8 +251,14 @@ def _local_keyfile_get_or_create(create: bool = True) -> Optional[bytes]:
             return None
         key_path.parent.mkdir(parents=True, exist_ok=True)
         new_hex = secrets.token_hex(32)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        fd = os.open(str(key_path), flags, 0o600)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            fd = os.open(str(key_path), flags, 0o600)
+        except FileExistsError:
+            raw = key_path.read_text(encoding="ascii").strip()
+            if raw:
+                return _decode_master_key_material(raw)
+            fd = os.open(str(key_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
             os.write(fd, new_hex.encode("ascii"))
         finally:

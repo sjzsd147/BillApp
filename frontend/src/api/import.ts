@@ -44,7 +44,9 @@ export function previewImport(
 }
 
 export function commitImport(data: CommitRequest): Promise<ImportCommitResponse> {
-  return apiClient.post('/import/commit', data);
+  return apiClient.post('/import/commit', data, {
+    timeout: 120000,
+  });
 }
 
 export function getBatches(): Promise<BatchItem[]> {

@@ -17,6 +17,7 @@ import ipaddress
 import json
 import logging
 import re
+import socket
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -42,7 +43,7 @@ def normalize_url_origin(url: str) -> Tuple[str, str, int]:
     """Return canonical (scheme, lowercase_host, effective_port) for origin comparison."""
     parsed = urlparse((url or "").strip())
     scheme = (parsed.scheme or "").lower()
-    host = (parsed.hostname or "").lower()
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
     if parsed.port is not None:
         port = parsed.port
     elif scheme == "https":
@@ -52,6 +53,29 @@ def normalize_url_origin(url: str) -> Tuple[str, str, int]:
     else:
         port = 0
     return scheme, host, port
+
+
+_NON_CANONICAL_IPV4_RE = re.compile(
+    r"^(?:0x[0-9a-f]+|0[0-7]*|\d+)(?:\.(?:0x[0-9a-f]+|0[0-7]*|\d+)){0,3}$",
+    re.IGNORECASE,
+)
+
+
+def _parse_literal_ip(host: str) -> Optional[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]]:
+    """Parse canonical or alternate-radix/short-form literal IP addresses without DNS."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+        if _NON_CANONICAL_IPV4_RE.match(host):
+            try:
+                packed = socket.inet_aton(host)
+                ip = ipaddress.IPv4Address(packed)
+            except OSError as exc:
+                raise ValueError(f"已拦截非法或非标准 IP 地址格式: {host}") from exc
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip
 
 
 def validate_llm_base_url(base_url: str) -> str:
@@ -68,7 +92,12 @@ def validate_llm_base_url(base_url: str) -> str:
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("API 服务地址不允许包含内嵌认证凭据 (@)")
 
-    host = (parsed.hostname or "").strip().lower()
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("API 服务地址端口无效（必须在 1-65535 之间）") from exc
+
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
     if not host:
         raise ValueError("API 服务地址缺少有效主机名")
 
@@ -76,10 +105,7 @@ def validate_llm_base_url(base_url: str) -> str:
         raise ValueError(f"已拦截禁止访问的元数据主机地址: {host}")
 
     # Validate literal IP addresses (allow loopback for local Ollama/vLLM; block link-local/IMDS/unspecified)
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        ip = None
+    ip = _parse_literal_ip(host)
 
     if ip is not None:
         if ip.is_link_local or ip.is_unspecified or ip.is_multicast:
@@ -113,6 +139,7 @@ class LLMConfig:
     auto_confirm_dedup: bool = False
     auto_confirm_threshold: float = 0.90
     api_key_decryption_failed: bool = False
+    raw_api_key_encrypted: str = ""
 
     @classmethod
     def load_from_db(cls, conn: sqlite3.Connection) -> LLMConfig:
@@ -128,7 +155,7 @@ class LLMConfig:
             logger.warning("Failed to parse llm_config JSON from settings: %s", exc)
             return cls()
 
-        api_key_enc = data.get("api_key_encrypted", "")
+        api_key_enc = str(data.get("api_key_encrypted", "") or "")
         plain_key = ""
         decryption_failed = False
         if api_key_enc:
@@ -159,6 +186,7 @@ class LLMConfig:
                 auto_confirm_dedup=bool(data.get("auto_confirm_dedup", False)),
                 auto_confirm_threshold=float(data.get("auto_confirm_threshold", 0.90)),
                 api_key_decryption_failed=decryption_failed,
+                raw_api_key_encrypted=api_key_enc,
             )
         except Exception as exc:
             logger.warning("Failed to construct LLMConfig from settings: %s", exc)
@@ -166,7 +194,12 @@ class LLMConfig:
 
     def save_to_db(self, conn: sqlite3.Connection) -> None:
         """Persist LLM configuration to SQLite settings table with encrypted API key."""
-        enc_key = encrypt_secret(self.api_key) if self.api_key else ""
+        if self.api_key:
+            enc_key = encrypt_secret(self.api_key)
+        elif self.api_key_decryption_failed and self.raw_api_key_encrypted:
+            enc_key = self.raw_api_key_encrypted
+        else:
+            enc_key = ""
         payload = {
             "base_url": self.base_url,
             "api_key_encrypted": enc_key,
@@ -293,10 +326,12 @@ class LLMClient:
         config: Optional[LLMConfig] = None,
         conn: Optional[sqlite3.Connection] = None,
         transport: Optional[httpx.BaseTransport] = None,
+        auto_commit: bool = True,
     ):
         self.config = config or LLMConfig()
         self.conn = conn
         self.transport = transport
+        self.auto_commit = auto_commit
         self.total_prompt_tokens: int = 0
         self.total_completion_tokens: int = 0
         self.total_requests: int = 0
@@ -381,7 +416,8 @@ class LLMClient:
                 """,
                 (task_type, input_hash, resp_str, model, prompt_tokens, completion_tokens),
             )
-            self.conn.commit()
+            if self.auto_commit:
+                self.conn.commit()
         except Exception as exc:
             logger.debug("llm_cache write error: %s", exc)
 
@@ -633,8 +669,10 @@ class LLMClient:
         }
 
         start_time = time.perf_counter()
+        timeout = min(max(float(self.config.timeout_sec or 10.0), 1.0), 180.0)
+        req_timeout = httpx.Timeout(timeout, connect=min(timeout, 10.0))
         try:
-            with httpx.Client(transport=self.transport, timeout=10.0, follow_redirects=False) as client:
+            with httpx.Client(transport=self.transport, timeout=req_timeout, follow_redirects=False) as client:
                 resp = client.post(url, headers=headers, json=payload)
                 resp.raise_for_status()
                 latency_ms = round((time.perf_counter() - start_time) * 1000)
@@ -666,9 +704,10 @@ class LLMClient:
         if self.config.api_key.strip():
             headers["Authorization"] = f"Bearer {self.config.api_key.strip()}"
 
-        timeout = min(max(float(self.config.timeout_sec or 10.0), 5.0), 15.0)
+        timeout = min(max(float(self.config.timeout_sec or 10.0), 1.0), 180.0)
+        req_timeout = httpx.Timeout(timeout, connect=min(timeout, 10.0))
         try:
-            with httpx.Client(transport=self.transport, timeout=timeout, follow_redirects=False) as client:
+            with httpx.Client(transport=self.transport, timeout=req_timeout, follow_redirects=False) as client:
                 resp = client.get(url, headers=headers)
                 resp.raise_for_status()
                 payload = resp.json()

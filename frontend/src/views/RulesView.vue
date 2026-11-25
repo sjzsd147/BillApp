@@ -125,7 +125,13 @@
                   <strong>「{{ item.category_name }}」</strong>
                 </div>
                 <div class="card-actions">
-                  <el-button type="primary" size="small" @click="adoptSuggestion(item)">
+                  <el-button
+                    type="primary"
+                    size="small"
+                    :loading="adoptingKey === suggestionKey(item)"
+                    :disabled="adoptingKey !== null"
+                    @click="adoptSuggestion(item)"
+                  >
                     采纳并生成规则
                   </el-button>
                 </div>
@@ -144,15 +150,69 @@
           <el-input v-model="categoryForm.name" placeholder="请输入分类名称" />
         </el-form-item>
         <el-form-item label="收支类型">
-          <el-radio-group v-model="categoryForm.direction">
+          <el-radio-group v-model="categoryForm.direction" :disabled="Boolean(parentCategory)">
             <el-radio label="expense">支出</el-radio>
             <el-radio label="income">收入</el-radio>
           </el-radio-group>
+          <div v-if="parentCategory" class="tip-text" style="margin-top: 4px; width: 100%">
+            子分类默认继承父分类收支类型
+          </div>
         </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="showCategoryDialog = false">取消</el-button>
         <el-button type="primary" @click="submitCategoryForm">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- Category Delete & Reassign Dialog -->
+    <el-dialog v-model="showDeleteCategoryDialog" title="删除分类" width="440px">
+      <div v-if="deletingCategory" style="display: flex; flex-direction: column; gap: 12px">
+        <div style="font-size: 13.5px; color: var(--text)">
+          确定要删除自定义分类 <strong>「{{ deletingCategory.name }}」</strong> 吗？
+        </div>
+        <div
+          v-if="
+            deletingCategory.transaction_count > 0 ||
+            (deletingCategory.rule_count || 0) > 0 ||
+            (deletingCategory.children && deletingCategory.children.length > 0)
+          "
+          class="tip-text"
+          style="color: var(--warning)"
+        >
+          该分类当前关联了 {{ deletingCategory.transaction_count }} 笔交易
+          <template v-if="(deletingCategory.rule_count || 0) > 0">
+            、{{ deletingCategory.rule_count }} 条规则
+          </template>
+          <template v-if="deletingCategory.children && deletingCategory.children.length > 0">
+            及 {{ deletingCategory.children.length }} 个子分类（仅支持迁移至一级根分类）
+          </template>
+          ，请选择一个同方向分类以自动迁移关联数据。
+        </div>
+        <el-form label-position="top">
+          <el-form-item label="迁移目标分类（存在关联交易/规则/子分类时必填）">
+            <el-select
+              v-model="deleteReassignToId"
+              clearable
+              filterable
+              style="width: 100%"
+              placeholder="若无关联数据可留空，否则请选择迁移分类"
+            >
+              <el-option
+                v-for="opt in deleteReassignOptions"
+                :key="opt.id"
+                :value="opt.id"
+                :label="opt.label"
+              />
+            </el-select>
+          </el-form-item>
+        </el-form>
+      </div>
+      <template #footer>
+        <el-button @click="showDeleteCategoryDialog = false">取消</el-button>
+        <el-button type="danger" :loading="deletingCategoryLoading" @click="confirmDeleteCategory">
+          确认删除
+        </el-button>
       </template>
     </el-dialog>
 
@@ -281,6 +341,42 @@ const categoryForm = reactive({
   direction: 'expense' as 'expense' | 'income',
 });
 
+// Category Delete & Reassign Dialog
+const showDeleteCategoryDialog = ref(false);
+const deletingCategory = ref<CategoryItemOut | null>(null);
+const deleteReassignToId = ref<number | null>(null);
+const deletingCategoryLoading = ref(false);
+const adoptingKey = ref<string | null>(null);
+
+function suggestionKey(item: RuleSuggestionOut): string {
+  return `${item.brand}::${item.category_id}`;
+}
+
+const deleteReassignOptions = computed(() => {
+  const target = deletingCategory.value;
+  if (!target) return [];
+  const hasChildren = Boolean(target.children && target.children.length > 0);
+  const excludedIds = new Set<number>([target.id]);
+  for (const ch of target.children || []) {
+    excludedIds.add(ch.id);
+  }
+  const opts: Array<{ id: number; label: string }> = [];
+  for (const root of categoryTree.value) {
+    if (root.direction !== target.direction) continue;
+    if (!excludedIds.has(root.id)) {
+      opts.push({ id: root.id, label: root.name });
+    }
+    // Only allow reassigning to 2nd-level subcategories when target itself has no children (depth <= 2)
+    if (!hasChildren) {
+      for (const child of root.children || []) {
+        if (child.direction !== target.direction || excludedIds.has(child.id)) continue;
+        opts.push({ id: child.id, label: `${root.name} / ${child.name}` });
+      }
+    }
+  }
+  return opts;
+});
+
 // Rule Dialog
 const showRuleDialog = ref(false);
 const editingRuleId = ref<number | null>(null);
@@ -360,23 +456,43 @@ async function submitCategoryForm() {
     await loadCategories();
     await appStore.fetchMeta();
   } catch (err: any) {
-    ElMessage.error(err.message || '分类创建失败');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '分类创建失败');
+    }
   }
 }
 
-async function handleDeleteCategory(cat: CategoryItemOut) {
+function handleDeleteCategory(cat: CategoryItemOut) {
+  deletingCategory.value = cat;
+  deleteReassignToId.value = null;
+  showDeleteCategoryDialog.value = true;
+}
+
+async function confirmDeleteCategory() {
+  if (!deletingCategory.value) return;
+  const needsTarget =
+    deletingCategory.value.transaction_count > 0 ||
+    (deletingCategory.value.rule_count || 0) > 0 ||
+    Boolean(deletingCategory.value.children && deletingCategory.value.children.length > 0);
+  if (needsTarget && !deleteReassignToId.value) {
+    ElMessage.warning('该分类存在关联数据，请先选择迁移目标分类');
+    return;
+  }
+  deletingCategoryLoading.value = true;
   try {
-    await ElMessageBox.confirm(
-      `确定要删除分类「${cat.name}」吗？`,
-      '删除分类确认',
-      { type: 'warning' }
-    );
-    await deleteCategory(cat.id);
+    await deleteCategory(deletingCategory.value.id, deleteReassignToId.value || undefined);
     ElMessage.success('分类已删除');
+    showDeleteCategoryDialog.value = false;
+    deletingCategory.value = null;
     await loadCategories();
+    await loadRules();
     await appStore.fetchMeta();
-  } catch {
-    // Cancelled or errored
+  } catch (err: any) {
+    if (!err?.toasted) {
+      ElMessage.error(err?.message || '删除分类失败');
+    }
+  } finally {
+    deletingCategoryLoading.value = false;
   }
 }
 
@@ -403,27 +519,33 @@ function openEditRuleDialog(r: RuleOut) {
 }
 
 async function submitRuleForm() {
-  if (!ruleForm.pattern_value.trim() || !ruleForm.category_id) {
+  const trimmedName = ruleForm.name.trim();
+  const trimmedPattern = ruleForm.pattern_value.trim();
+  if (!trimmedName) {
+    ElMessage.warning('请输入规则名称');
+    return;
+  }
+  if (!trimmedPattern || !ruleForm.category_id) {
     ElMessage.warning('请填写匹配内容并选择目标分类');
     return;
   }
   try {
     if (editingRuleId.value) {
       await updateRule(editingRuleId.value, {
-        name: ruleForm.name,
+        name: trimmedName,
         field: ruleForm.field,
         pattern_type: ruleForm.pattern_type,
-        pattern_value: ruleForm.pattern_value,
+        pattern_value: trimmedPattern,
         category_id: ruleForm.category_id,
         priority: ruleForm.priority,
       });
       ElMessage.success('规则更新成功');
     } else {
       await createRule({
-        name: ruleForm.name,
+        name: trimmedName,
         field: ruleForm.field,
         pattern_type: ruleForm.pattern_type,
-        pattern_value: ruleForm.pattern_value,
+        pattern_value: trimmedPattern,
         category_id: ruleForm.category_id,
         priority: ruleForm.priority,
       });
@@ -432,7 +554,9 @@ async function submitRuleForm() {
     showRuleDialog.value = false;
     await loadRules();
   } catch (err: any) {
-    ElMessage.error(err.message || '操作失败');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '操作失败');
+    }
   }
 }
 
@@ -450,6 +574,9 @@ async function handleDeleteRule(r: RuleOut) {
 }
 
 async function adoptSuggestion(item: RuleSuggestionOut) {
+  const key = suggestionKey(item);
+  if (adoptingKey.value !== null) return;
+  adoptingKey.value = key;
   try {
     const res = await applyProposal({
       name: `${item.brand} 自动规则`,
@@ -464,7 +591,11 @@ async function adoptSuggestion(item: RuleSuggestionOut) {
     await loadRules();
     await loadSuggestions();
   } catch (err: any) {
-    ElMessage.error(err.message || '应用建议失败');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '应用建议失败');
+    }
+  } finally {
+    adoptingKey.value = null;
   }
 }
 
@@ -484,7 +615,9 @@ async function runRuleTest() {
       pattern_value: testerForm.pattern_value.trim(),
     });
   } catch (err: any) {
-    ElMessage.error(err.message || '测试失败');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '测试失败');
+    }
   } finally {
     testingRule.value = false;
   }

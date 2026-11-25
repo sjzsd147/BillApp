@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from html.parser import HTMLParser
 import io
 import re
 from datetime import datetime
@@ -347,7 +348,15 @@ class BankProfile(BaseModel):
     delimiter: str = ","
     currency: str = "CNY"
     version: int = 1
+    auto_detect: bool = True
     description: Optional[str] = None
+
+    @field_validator("currency", mode="before")
+    @classmethod
+    def normalize_profile_currency(cls, v: Any) -> str:
+        if not v:
+            return "CNY"
+        return _normalize_currency_token(str(v)) or "CNY"
 
     table_detection: TableDetectionConfig = Field(default_factory=TableDetectionConfig)
     metadata_extraction: MetadataExtractionConfig = Field(default_factory=MetadataExtractionConfig)
@@ -410,6 +419,8 @@ class ProfileImporter(Importer):
 
     def detect(self, probe: FileProbe) -> float:
         """Score file probe confidence against this profile."""
+        if not self.profile.auto_detect:
+            return 0.0
         if self.profile.file_type != "auto":
             if self.profile.file_type == "csv" and not probe.is_csv():
                 return 0.0
@@ -581,21 +592,64 @@ class ProfileImporter(Importer):
 
     def _read_excel_grid(self, probe: FileProbe, max_rows: Optional[int] = None) -> List[List[Any]]:
         row_limit = min(max_rows, MAX_PROFILE_EXCEL_ROWS) if max_rows else MAX_PROFILE_EXCEL_ROWS
-        wb = openpyxl.load_workbook(io.BytesIO(probe.content), read_only=True, data_only=True)
         try:
-            ws = wb.active
-            if ws is None:
-                return []
-            grid: List[List[Any]] = []
-            for r, row in enumerate(
-                ws.iter_rows(max_row=row_limit, max_col=MAX_PROFILE_EXCEL_COLS, values_only=True)
-            ):
-                if r >= row_limit:
-                    break
-                grid.append(list(row))
-            return grid
-        finally:
-            wb.close()
+            wb = openpyxl.load_workbook(io.BytesIO(probe.content), read_only=True, data_only=True)
+            try:
+                ws = wb.active
+                if ws is None:
+                    return []
+                grid: List[List[Any]] = []
+                for r, row in enumerate(
+                    ws.iter_rows(max_row=row_limit, max_col=MAX_PROFILE_EXCEL_COLS, values_only=True)
+                ):
+                    if r >= row_limit:
+                        break
+                    grid.append(list(row))
+                return grid
+            finally:
+                wb.close()
+        except Exception:
+            # Fallback for HTML-table disguised .xls bank exports
+            enc = self.profile.encoding if self.profile.encoding != "auto" else detect_encoding(probe.content)
+            text = "".join(probe.read_text(encoding=enc))
+            if "<tr" in text.lower():
+                class _ProfileHTMLTableParser(HTMLParser):
+                    def __init__(self) -> None:
+                        super().__init__()
+                        self.rows: List[List[str]] = []
+                        self._in_tr = False
+                        self._in_cell = False
+                        self._curr_row: List[str] = []
+                        self._curr_cell: List[str] = []
+
+                    def handle_starttag(self, tag: str, attrs: Any) -> None:
+                        t = tag.lower()
+                        if t == "tr":
+                            self._in_tr = True
+                            self._curr_row = []
+                        elif t in ("td", "th") and self._in_tr:
+                            self._in_cell = True
+                            self._curr_cell = []
+
+                    def handle_endtag(self, tag: str) -> None:
+                        t = tag.lower()
+                        if t in ("td", "th") and self._in_cell:
+                            self._in_cell = False
+                            self._curr_row.append("".join(self._curr_cell).strip())
+                        elif t == "tr" and self._in_tr:
+                            self._in_tr = False
+                            if any(c.strip() for c in self._curr_row):
+                                self.rows.append(self._curr_row)
+
+                    def handle_data(self, data: str) -> None:
+                        if self._in_cell:
+                            self._curr_cell.append(data)
+
+                parser = _ProfileHTMLTableParser()
+                parser.feed(text)
+                if parser.rows:
+                    return parser.rows[:row_limit]
+            raise
 
     def _read_pdf_grid(self, probe: FileProbe) -> List[List[Any]]:
         from billapp.importers.pdf import extract_pdf_tables
@@ -608,9 +662,6 @@ class ProfileImporter(Importer):
 
     def _find_header_row_index(self, grid: List[List[Any]]) -> Optional[int]:
         td = self.profile.table_detection
-        if td.header_row_index is not None and 0 <= td.header_row_index < len(grid):
-            return td.header_row_index
-
         pattern = (
             compile_safe_regex(td.header_row_pattern, max_len=PROFILE_MAX_PATTERN_LEN)
             if td.header_row_pattern
@@ -618,12 +669,28 @@ class ProfileImporter(Importer):
         )
         keywords = td.header_row_keywords or []
 
-        for idx, row in enumerate(grid[:50]):
+        def _row_matches_spec(row: List[Any]) -> bool:
             joined = " ".join(str(c).strip() for c in row if c is not None)
             if pattern and safe_search(pattern, joined, timeout=DEFAULT_REGEX_TIMEOUT):
-                return idx
+                return True
             if keywords and all(kw in joined for kw in keywords):
+                return True
+            return False
+
+        # Prefer fixed header_row_index when it still matches the configured header spec (or no spec exists).
+        # If preamble line count shifted in another statement from the same bank, scan dynamically before falling back.
+        has_valid_index = td.header_row_index is not None and 0 <= td.header_row_index < len(grid)
+        if has_valid_index:
+            assert td.header_row_index is not None
+            if (not pattern and not keywords) or _row_matches_spec(grid[td.header_row_index]):
+                return td.header_row_index
+
+        for idx, row in enumerate(grid[:50]):
+            if _row_matches_spec(row):
                 return idx
+
+        if has_valid_index:
+            return td.header_row_index
 
         # Fallback: check date column candidates in row
         date_cands = self.profile.column_mapping.date.header
@@ -862,7 +929,25 @@ class ProfileImporter(Importer):
                 direction = "transfer"
 
         detected_channel, merchant_norm = extract_channel_and_normalize(counterparty)
-        explicit_channel = get_val("channel")
+        raw_explicit_channel = get_val("channel")
+        explicit_channel = None
+        if raw_explicit_channel:
+            ch_text = raw_explicit_channel.strip()
+            low_ch = ch_text.lower()
+            if low_ch in ("alipay", "tenpay", "jdpay", "meituan", "unionpay"):
+                explicit_channel = low_ch
+            elif "支付宝" in ch_text or "alipay" in low_ch:
+                explicit_channel = "alipay"
+            elif "财付通" in ch_text or "微信" in ch_text or "tenpay" in low_ch or "wechat" in low_ch:
+                explicit_channel = "tenpay"
+            elif "网银在线" in ch_text or "京东" in ch_text or "jdpay" in low_ch:
+                explicit_channel = "jdpay"
+            elif "美团" in ch_text or "meituan" in low_ch:
+                explicit_channel = "meituan"
+            elif "云闪付" in ch_text or "银联" in ch_text or "unionpay" in low_ch:
+                explicit_channel = "unionpay"
+            else:
+                explicit_channel, _ = extract_channel_and_normalize(ch_text)
         channel = explicit_channel or detected_channel
 
         eff_bank = effective_bank or self.profile.bank

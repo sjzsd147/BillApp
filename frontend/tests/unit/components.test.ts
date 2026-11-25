@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import AmountText from '@/components/AmountText.vue';
+import CategoryPicker from '@/components/CategoryPicker.vue';
 import DirectionTag from '@/components/DirectionTag.vue';
 import ScoreBreakdown from '@/components/ScoreBreakdown.vue';
 import StatusTag from '@/components/StatusTag.vue';
@@ -115,5 +116,30 @@ describe('StatusTag component', () => {
     });
     expect(wrapper.text()).toContain('已排除');
     expect(wrapper.classes()).toContain('status-excluded');
+  });
+});
+
+describe('CategoryPicker component (R-FH2)', () => {
+  it('normalizes undefined clear emission to null so callers can clear category', async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const wrapper = mount(CategoryPicker, {
+      props: { modelValue: 42 },
+      global: {
+        plugins: [pinia],
+        stubs: {
+          'el-cascader': {
+            name: 'el-cascader',
+            props: ['modelValue', 'valueOnClear'],
+            emits: ['update:modelValue'],
+            template: '<button class="mock-clear" @click="$emit(\'update:modelValue\', undefined)">clear</button>',
+          },
+        },
+      },
+    });
+
+    await wrapper.find('.mock-clear').trigger('click');
+    expect(wrapper.emitted('update:modelValue')?.[0]).toEqual([null]);
+    expect(wrapper.emitted('change')?.[0]).toEqual([null]);
   });
 });

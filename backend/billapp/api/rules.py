@@ -301,8 +301,11 @@ def update_rule(
     update_vals: List[Any] = []
 
     if payload.name is not None:
+        cleaned_name = payload.name.strip()
+        if not cleaned_name:
+            raise ValidationError("规则名称不能为空")
         update_fields.append("name = ?")
-        update_vals.append(payload.name)
+        update_vals.append(cleaned_name)
     if payload.category_id is not None:
         update_fields.append("category_id = ?")
         update_vals.append(payload.category_id)
@@ -318,10 +321,10 @@ def update_rule(
     if payload.pattern_value is not None:
         update_fields.append("pattern_value = ?")
         update_vals.append(payload.pattern_value)
-    if payload.amount_min_cents is not None:
+    if "amount_min_cents" in payload.model_fields_set:
         update_fields.append("amount_min_cents = ?")
         update_vals.append(payload.amount_min_cents)
-    if payload.amount_max_cents is not None:
+    if "amount_max_cents" in payload.model_fields_set:
         update_fields.append("amount_max_cents = ?")
         update_vals.append(payload.amount_max_cents)
 

@@ -110,7 +110,7 @@ def open_pdf_document(
         raise PDFCorruptedError(f"Failed to open PDF stream for '{fname}': {exc}") from exc
 
     was_encrypted = bool(doc.is_encrypted or doc.needs_pass)
-    if was_encrypted:
+    if doc.needs_pass:
         if not pwd:
             doc.close()
             raise PDFPasswordRequiredError(f"PDF statement '{fname}' is encrypted. Password is required.")

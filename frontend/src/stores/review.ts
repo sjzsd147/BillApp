@@ -63,10 +63,15 @@ export const useReviewStore = defineStore('review', () => {
     await fetchList();
   }
 
-  function deferCurrent() {
-    if (items.value.length <= 1) return;
+  function deferCurrent(): boolean {
+    if (items.value.length <= 1) return false;
+    if (currentIndex.value >= items.value.length - 1) {
+      currentIndex.value = 0;
+      return true;
+    }
     const [current] = items.value.splice(currentIndex.value, 1);
     items.value.push(current);
+    return true;
   }
 
   function next() {

@@ -10,7 +10,9 @@ export interface FileQueueItem {
   size: number;
   status: 'queued' | 'parsing' | 'need_password' | 'need_mapping' | 'ready' | 'error' | 'success';
   errorMsg?: string;
+  profileId?: string;
   preview?: ImportPreviewItem;
+  accountOverrides?: Record<string, any>;
 }
 
 export const useImportStore = defineStore('import', () => {
@@ -33,7 +35,12 @@ export const useImportStore = defineStore('import', () => {
   }
 
   function removeQueueItem(id: string) {
+    const target = queue.value.find((item) => item.id === id);
     queue.value = queue.value.filter((item) => item.id !== id);
+    if (target?.preview && activePreview.value?.token === target.preview.token) {
+      const nextReady = queue.value.find((item) => item.status === 'ready' && item.preview);
+      activePreview.value = nextReady?.preview || null;
+    }
   }
 
   function clearQueue() {
@@ -49,8 +56,12 @@ export const useImportStore = defineStore('import', () => {
   ) {
     item.status = 'parsing';
     item.errorMsg = undefined;
+    const effectiveProfileId = profileId ?? item.profileId;
+    if (profileId) {
+      item.profileId = profileId;
+    }
     try {
-      const preview = await previewImport(item.file, password, profileId, useLlm);
+      const preview = await previewImport(item.file, password, effectiveProfileId, useLlm);
       item.preview = preview;
       if (preview.need_password) {
         item.status = 'need_password';
@@ -70,7 +81,12 @@ export const useImportStore = defineStore('import', () => {
 
   async function commitActivePreview(token: string, overrides?: Record<string, any>): Promise<ImportCommitResponse> {
     const res = await commitImport({ token, account_overrides: overrides });
-    activePreview.value = null;
+    // Leave activePreview advancement to removeQueueItem() when the item is in the queue;
+    // otherwise clear it immediately if it matches the committed token.
+    const inQueue = queue.value.some((i) => i.preview?.token === token);
+    if (!inQueue && activePreview.value?.token === token) {
+      activePreview.value = null;
+    }
     return res;
   }
 

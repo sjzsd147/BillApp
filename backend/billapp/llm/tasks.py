@@ -367,63 +367,91 @@ def classify_fallback_sync(
 # Task 2: Classification Review
 # =========================================================================
 
+def _parse_review_chunk_response(
+    resp: Any,
+    key_to_id: Dict[str, int],
+    name_to_id: Optional[Dict[str, int]] = None,
+) -> List[ReviewResult]:
+    raw_list = resp.get("reviews", []) if isinstance(resp, dict) else resp
+    if not isinstance(raw_list, list):
+        return []
+    reviews: List[ReviewResult] = []
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+        raw_id = item.get("id")
+        if raw_id is None or isinstance(raw_id, bool):
+            continue
+        try:
+            r_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        agree = bool(item.get("agree", True))
+        raw_sub = item.get("suggested_subcategory_key")
+        raw_cat = item.get("suggested_category_key")
+        sub_key = raw_sub.strip() if isinstance(raw_sub, str) and raw_sub.strip() else None
+        cat_key = raw_cat.strip() if isinstance(raw_cat, str) and raw_cat.strip() else None
+        conf = _parse_confidence(item.get("confidence", 0.0))
+        reason = str(item.get("reason", "") or "")
+
+        # Filter for disagreement with high confidence >= 0.80
+        if not agree and conf >= 0.80:
+            s_id, resolved_key = _resolve_category_key_and_id(cat_key, sub_key, key_to_id, name_to_id)
+            target_key = resolved_key or sub_key or cat_key
+            reviews.append(
+                ReviewResult(
+                    id=r_id,
+                    agree=agree,
+                    suggested_category_id=s_id,
+                    suggested_category_key=target_key,
+                    confidence=conf,
+                    reason=reason,
+                )
+            )
+    return reviews
+
+
 async def review_classification_async(
     transactions: List[Any],
     client: LLMClient,
     key_to_id: Dict[str, int],
     holder_name: Optional[str] = None,
+    chunk_size: int = 25,
+    taxonomy: Optional[List[Dict[str, Any]]] = None,
+    name_to_id: Optional[Dict[str, int]] = None,
+    raise_on_error: bool = False,
 ) -> List[ReviewResult]:
-    """Audit low-confidence classifications."""
+    """Audit low-confidence classifications in chunks."""
     if not transactions or not client.is_available() or not client.config.task_review_enabled:
         return []
 
-    sys_prompt, user_prompt = build_review_classification_prompt(
-        transactions, BUILTIN_TAXONOMY, holder_name
-    )
-    messages = [
-        {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+    active_taxonomy = taxonomy if taxonomy else BUILTIN_TAXONOMY
+    reviews: List[ReviewResult] = []
 
-    try:
-        resp = await client.chat_completion_async(
-            task_type="review",
-            messages=messages,
-            temperature=0.1,
-            use_json_mode=True,
+    for i in range(0, len(transactions), max(1, chunk_size)):
+        chunk = transactions[i : i + max(1, chunk_size)]
+        sys_prompt, user_prompt = build_review_classification_prompt(
+            chunk, active_taxonomy, holder_name
         )
-        raw_list = resp.get("reviews", []) if isinstance(resp, dict) else resp
-        reviews: List[ReviewResult] = []
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
-        for item in raw_list:
-            if not isinstance(item, dict):
-                continue
-            r_id = item.get("id")
-            agree = bool(item.get("agree", True))
-            sub_key = item.get("suggested_subcategory_key")
-            cat_key = item.get("suggested_category_key")
-            target_key = sub_key or cat_key
-            conf = float(item.get("confidence", 0.0))
-            reason = item.get("reason", "")
+        try:
+            resp = await client.chat_completion_async(
+                task_type="review",
+                messages=messages,
+                temperature=0.1,
+                use_json_mode=True,
+            )
+            reviews.extend(_parse_review_chunk_response(resp, key_to_id, name_to_id))
+        except Exception as exc:
+            logger.warning("LLM classification review failed: %s", exc)
+            if raise_on_error:
+                raise
 
-            # Filter for disagreement with high confidence >= 0.80
-            if not agree and conf >= 0.80 and r_id is not None:
-                s_id = key_to_id.get(target_key) if target_key else None
-                reviews.append(
-                    ReviewResult(
-                        id=r_id,
-                        agree=agree,
-                        suggested_category_id=s_id,
-                        suggested_category_key=target_key,
-                        confidence=conf,
-                        reason=reason,
-                    )
-                )
-
-        return reviews
-    except Exception as exc:
-        logger.warning("LLM classification review failed: %s", exc)
-        return []
+    return reviews
 
 
 def review_classification_sync(
@@ -431,58 +459,42 @@ def review_classification_sync(
     client: LLMClient,
     key_to_id: Dict[str, int],
     holder_name: Optional[str] = None,
+    chunk_size: int = 25,
+    taxonomy: Optional[List[Dict[str, Any]]] = None,
+    name_to_id: Optional[Dict[str, int]] = None,
+    raise_on_error: bool = False,
 ) -> List[ReviewResult]:
-    """Audit low-confidence classifications synchronously."""
+    """Audit low-confidence classifications synchronously in chunks."""
     if not transactions or not client.is_available() or not client.config.task_review_enabled:
         return []
 
-    sys_prompt, user_prompt = build_review_classification_prompt(
-        transactions, BUILTIN_TAXONOMY, holder_name
-    )
-    messages = [
-        {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+    active_taxonomy = taxonomy if taxonomy else BUILTIN_TAXONOMY
+    reviews: List[ReviewResult] = []
 
-    try:
-        resp = client.chat_completion_sync(
-            task_type="review",
-            messages=messages,
-            temperature=0.1,
-            use_json_mode=True,
+    for i in range(0, len(transactions), max(1, chunk_size)):
+        chunk = transactions[i : i + max(1, chunk_size)]
+        sys_prompt, user_prompt = build_review_classification_prompt(
+            chunk, active_taxonomy, holder_name
         )
-        raw_list = resp.get("reviews", []) if isinstance(resp, dict) else resp
-        reviews: List[ReviewResult] = []
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
-        for item in raw_list:
-            if not isinstance(item, dict):
-                continue
-            r_id = item.get("id")
-            agree = bool(item.get("agree", True))
-            sub_key = item.get("suggested_subcategory_key")
-            cat_key = item.get("suggested_category_key")
-            target_key = sub_key or cat_key
-            conf = float(item.get("confidence", 0.0))
-            reason = item.get("reason", "")
+        try:
+            resp = client.chat_completion_sync(
+                task_type="review",
+                messages=messages,
+                temperature=0.1,
+                use_json_mode=True,
+            )
+            reviews.extend(_parse_review_chunk_response(resp, key_to_id, name_to_id))
+        except Exception as exc:
+            logger.warning("LLM classification review failed: %s", exc)
+            if raise_on_error:
+                raise
 
-            # Filter for disagreement with high confidence >= 0.80
-            if not agree and conf >= 0.80 and r_id is not None:
-                s_id = key_to_id.get(target_key) if target_key else None
-                reviews.append(
-                    ReviewResult(
-                        id=r_id,
-                        agree=agree,
-                        suggested_category_id=s_id,
-                        suggested_category_key=target_key,
-                        confidence=conf,
-                        reason=reason,
-                    )
-                )
-
-        return reviews
-    except Exception as exc:
-        logger.warning("LLM classification review failed: %s", exc)
-        return []
+    return reviews
 
 
 # =========================================================================
@@ -525,7 +537,8 @@ async def dedup_arbitration_async(
             if raw_verdict in ("same", "different", "unsure"):
                 verdict = raw_verdict  # type: ignore
 
-            conf = float(resp.get("confidence", 0.5))
+            raw_conf = resp.get("confidence")
+            conf = _parse_confidence(raw_conf) if raw_conf is not None else 0.5
             reason = str(resp.get("reason", "LLM arbitration"))
             return ArbitrationResult(verdict=verdict, confidence=conf, reason=reason)
     except Exception as exc:
@@ -574,7 +587,8 @@ def dedup_arbitration_sync(
             if raw_verdict in ("same", "different", "unsure"):
                 verdict = raw_verdict  # type: ignore
 
-            conf = float(resp.get("confidence", 0.5))
+            raw_conf = resp.get("confidence")
+            conf = _parse_confidence(raw_conf) if raw_conf is not None else 0.5
             reason = str(resp.get("reason", "LLM arbitration"))
             return ArbitrationResult(verdict=verdict, confidence=conf, reason=reason)
     except Exception as exc:
@@ -1175,13 +1189,23 @@ def parse_statement_with_llm_sync(
 
     assign_fingerprints(transactions)
 
+    failed_chunks = len(chunks) - chunks_succeeded
+    if failed_chunks > 0:
+        warnings.append(
+            f"共 {len(chunks)} 个分段中有 {failed_chunks} 个分段 AI 识别失败（最近错误: {last_error or '未知'}），交易记录可能不完整，请核对账单明细"
+        )
+
     self_checks = [
         SelfCheckResult(
             name="AI 整单识别笔数",
             expected=len(transactions),
             actual=len(transactions),
-            passed=True,
-            description=f"LLM 共提取 {len(transactions)} 笔交易记录（分 {len(chunks)} 段处理）",
+            passed=(failed_chunks == 0 and truncated_chunks == 0),
+            description=(
+                f"LLM 共提取 {len(transactions)} 笔交易记录（分 {len(chunks)} 段处理，{failed_chunks} 段失败）"
+                if failed_chunks > 0
+                else f"LLM 共提取 {len(transactions)} 笔交易记录（分 {len(chunks)} 段处理）"
+            ),
         ),
         SelfCheckResult(
             name="顶部账户识别",
@@ -1218,6 +1242,7 @@ def parse_statement_with_llm_sync(
         "period_start": p_start,
         "period_end": p_end,
         "chunks": len(chunks),
+        "failed_chunks": failed_chunks,
         "used_llm": True,
     }
     return parse_result, meta

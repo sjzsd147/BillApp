@@ -34,5 +34,7 @@ describe('money utilities', () => {
   it('formats compact amounts correctly', () => {
     expect(formatCompact(50000)).toBe('¥500');
     expect(formatCompact(1500000)).toBe('¥1.5万');
+    expect(formatCompact(-50000)).toBe('-¥500');
+    expect(formatCompact(-1500000)).toBe('-¥1.5万');
   });
 });

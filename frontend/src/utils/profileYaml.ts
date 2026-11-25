@@ -27,14 +27,17 @@ export interface ProfileYamlParams {
   flagExpenseVal?: string;
   flagIncomeVal?: string;
   defaultCardTail?: string;
+  autoApplyNextTime?: boolean;
 }
 
 export function buildProfileYaml(params: ProfileYamlParams): string {
-  // 1. account_kind mapping: backend accepts only 'debit' or 'credit'
+  // 1. account_kind mapping: backend accepts 'debit', 'credit', or 'wallet'
   const mappedAccountKind =
     params.accountKind === 'bank_credit' || params.accountKind === 'credit'
       ? 'credit'
-      : 'debit';
+      : params.accountKind === 'wallet'
+        ? 'wallet'
+        : 'debit';
 
   // 2. table detection row indices (0-based for header_row_index, 1-based offset for data_start_offset)
   const headerIdx = Math.max(0, (params.headerRowIndex || 1) - 1);
@@ -65,6 +68,7 @@ export function buildProfileYaml(params: ProfileYamlParams): string {
     `account_kind: ${JSON.stringify(mappedAccountKind)}`,
     `file_type: ${JSON.stringify(fileType)}`,
     `currency: ${JSON.stringify(currency)}`,
+    ...(params.autoApplyNextTime === false ? ['auto_detect: false'] : []),
     'table_detection:',
     `  header_row_index: ${headerIdx}`,
     `  data_start_offset: ${dataStartOffset}`,

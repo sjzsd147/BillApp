@@ -27,7 +27,7 @@ from billapp.core.models import AccountCreate, AccountKind, AccountRef, ParseRes
 from billapp.dedup.engine import rollback_import_batch, run_dedup_pipeline
 from billapp.dedup.fingerprint import assign_fingerprints
 from billapp.importers.base import FileProbe
-from billapp.importers.common import detect_encoding
+from billapp.importers.common import detect_encoding, normalize_currency
 from billapp.importers.pdf import (
     PDFInvalidPasswordError,
     PDFPasswordRequiredError,
@@ -113,14 +113,10 @@ def _decode_zip_entry_name(info: zipfile.ZipInfo) -> str:
     return Path(name).name or name
 
 
-def _unwrap_zip_probe(probe: FileProbe) -> Tuple[FileProbe, bool]:
-    """Unpack a ZIP statement archive into the primary inner FileProbe.
-
-    Returns:
-        (unwrapped_probe, need_password)
-    """
+def _unwrap_zip_probe_with_warnings(probe: FileProbe) -> Tuple[FileProbe, bool, List[str]]:
+    """Unpack a ZIP statement archive into the primary inner FileProbe, returning any skip warnings."""
     if not probe.is_zip():
-        return probe, False
+        return probe, False, []
 
     try:
         zf = zipfile.ZipFile(io.BytesIO(probe.content))
@@ -131,6 +127,7 @@ def _unwrap_zip_probe(probe: FileProbe) -> Tuple[FileProbe, bool]:
     ignored_exts = {".sig", ".p7s", ".asc", ".sha1", ".sha256", ".md5"}
 
     candidates: List[Tuple[int, int, zipfile.ZipInfo, str]] = []
+    zip_warnings: List[str] = []
     with zf:
         for info in zf.infolist():
             if info.is_dir():
@@ -150,6 +147,13 @@ def _unwrap_zip_probe(probe: FileProbe) -> Tuple[FileProbe, bool]:
 
         candidates.sort(key=lambda item: (item[0], item[1]))
         _, _, target_info, target_name = candidates[0]
+        if len(candidates) > 1:
+            skipped_names = [item[3] for item in candidates[1:4]]
+            more_suffix = f" 等共 {len(candidates) - 1} 个文件" if len(candidates) > 4 else ""
+            zip_warnings.append(
+                f"ZIP 压缩包包含 {len(candidates)} 个账单候选文件，本次仅解析 '{target_name}'，"
+                f"已跳过 {', '.join(skipped_names)}{more_suffix}（如需全部导入请解压后分别上传）"
+            )
 
         # ZIP bomb defenses: enforce uncompressed size ceiling and compression ratio ceiling (S-07)
         if target_info.file_size > MAX_STATEMENT_UPLOAD_BYTES:
@@ -170,7 +174,7 @@ def _unwrap_zip_probe(probe: FileProbe) -> Tuple[FileProbe, bool]:
 
         is_encrypted = bool(target_info.flag_bits & 0x1)
         if is_encrypted and not probe.password:
-            return probe, True
+            return probe, True, zip_warnings
 
         pwd_attempts: List[Optional[bytes]]
         if is_encrypted and probe.password is not None:
@@ -225,7 +229,17 @@ def _unwrap_zip_probe(probe: FileProbe) -> Tuple[FileProbe, bool]:
                 message="解压密码不正确，请检查后重试",
             )
 
-    return FileProbe(inner_bytes, file_name=target_name, password=probe.password), False
+    return FileProbe(inner_bytes, file_name=target_name, password=probe.password), False, zip_warnings
+
+
+def _unwrap_zip_probe(probe: FileProbe) -> Tuple[FileProbe, bool]:
+    """Unpack a ZIP statement archive into the primary inner FileProbe.
+
+    Returns:
+        (unwrapped_probe, need_password)
+    """
+    unwrapped, need_pwd, _ = _unwrap_zip_probe_with_warnings(probe)
+    return unwrapped, need_pwd
 
 
 def extract_raw_rows_from_probe(probe: FileProbe, max_rows: int = 30) -> Tuple[str, List[List[str]]]:
@@ -431,6 +445,10 @@ def _apply_account_to_parse_result(
     if clean_holder and (override_explicit or not parse_result.holder_name):
         parse_result.holder_name = clean_holder
 
+    old_bank: Optional[str] = None
+    old_tail: Optional[str] = None
+    is_multi_account = len(parse_result.accounts) > 1
+
     if not parse_result.accounts:
         if not (clean_bank or clean_tail or norm_kind):
             return
@@ -466,6 +484,8 @@ def _apply_account_to_parse_result(
             acc.alias = f"{acc.bank} ({acc.tail})" if acc.tail else acc.bank
 
     primary = parse_result.accounts[0]
+    is_platform_or_wallet = primary.kind in ("platform", "wallet")
+
     for t in parse_result.transactions:
         if t.account_ref is None:
             t.account_ref = AccountRef(
@@ -475,22 +495,44 @@ def _apply_account_to_parse_result(
                 alias=primary.alias,
                 holder=primary.holder,
             )
+            belongs_to_primary = True
         else:
-            if override_explicit or (t.account_ref.bank or "").strip() in _GENERIC_BANK_NAMES:
-                t.account_ref.bank = primary.bank
-            if override_explicit or not t.account_ref.kind:
-                t.account_ref.kind = primary.kind
-            if override_explicit or not t.account_ref.tail:
-                t.account_ref.tail = primary.tail
-            if override_explicit or not t.account_ref.holder:
-                t.account_ref.holder = primary.holder
-            if override_explicit or not t.account_ref.alias:
-                t.account_ref.alias = primary.alias
-        eff_b = t.account_ref.bank or primary.bank
-        eff_t = t.account_ref.tail or primary.tail
-        t.pay_method = f"{eff_b}({eff_t})" if eff_t else eff_b
-        if clean_curr and override_explicit:
-            t.currency = clean_curr
+            if not is_multi_account:
+                belongs_to_primary = True
+            else:
+                ref_bank = (t.account_ref.bank or "").strip()
+                ref_tail = t.account_ref.tail
+                belongs_to_primary = (
+                    (ref_tail == old_tail or not ref_tail)
+                    and (not ref_bank or ref_bank == (old_bank or "").strip() or ref_bank in _GENERIC_BANK_NAMES)
+                )
+
+            if belongs_to_primary:
+                if override_explicit or (t.account_ref.bank or "").strip() in _GENERIC_BANK_NAMES:
+                    t.account_ref.bank = primary.bank
+                if override_explicit or not t.account_ref.kind:
+                    t.account_ref.kind = primary.kind
+                if override_explicit or not t.account_ref.tail:
+                    t.account_ref.tail = primary.tail
+                if override_explicit or not t.account_ref.holder:
+                    t.account_ref.holder = primary.holder
+                if override_explicit or not t.account_ref.alias:
+                    t.account_ref.alias = primary.alias
+            else:
+                # Preserve distinct card tails on multi-card statements (e.g. ICBC multi-card PDF)
+                if clean_holder and not t.account_ref.holder:
+                    t.account_ref.holder = clean_holder
+
+        if belongs_to_primary:
+            eff_b = t.account_ref.bank or primary.bank
+            eff_t = t.account_ref.tail or primary.tail
+            # Never clobber real funding pay_method on platform/wallet bills (Alipay/WeChat)
+            # or existing pay_method during passive top-account enrichment
+            preserve_pay_method = is_platform_or_wallet or t.source in ("alipay", "wechat")
+            if not preserve_pay_method and (override_explicit or not t.pay_method):
+                t.pay_method = f"{eff_b}({eff_t})" if eff_t else eff_b
+            if clean_curr and override_explicit:
+                t.currency = clean_curr
 
     assign_fingerprints(parse_result.transactions)
 
@@ -503,6 +545,9 @@ def _enrich_parse_result_top_account(
 ) -> None:
     """Fill missing top-of-statement account info (bank / 4-digit tail / holder) when absent."""
     primary = parse_result.accounts[0] if parse_result.accounts else None
+    # Platform and wallet accounts (e.g. WeChat Pay, Alipay) legitimately omit a 4-digit bank card tail
+    if primary is not None and primary.kind in ("platform", "wallet") and primary.bank.strip() not in _GENERIC_BANK_NAMES:
+        return
     needs_enrich = (
         primary is None
         or not primary.tail
@@ -517,7 +562,11 @@ def _enrich_parse_result_top_account(
         top_rows = []
     if not top_rows and not file_name:
         return
-    rec = recognize_statement_account_sync(top_rows, llm_client, file_name=file_name)
+    if llm_client.is_available() and llm_client.config.task_suggest_profile_enabled:
+        rec = recognize_statement_account_sync(top_rows, llm_client, file_name=file_name)
+    else:
+        disabled_cfg = LLMConfig(enabled=False)
+        rec = recognize_statement_account_sync(top_rows, LLMClient(disabled_cfg), file_name=file_name)
     _apply_account_to_parse_result(
         parse_result,
         bank=rec.bank,
@@ -540,6 +589,7 @@ class ImportPreviewItem(BaseModel):
     file_name: str
     source: str
     profile_id: Optional[str] = None
+    existing_batch_id: Optional[int] = None
     total_rows: int
     need_password: bool = False
     need_mapping: bool = False
@@ -568,6 +618,7 @@ class CommitRequest(BaseModel):
 
 class ImportCommitResponse(BaseModel):
     batch_id: int
+    replaced_batch_id: Optional[int] = None
     imported_count: int
     duplicate_count: int
     refund_count: int
@@ -658,31 +709,33 @@ def _import_preview_sync(
 ) -> ImportPreviewItem:
     sha1 = hashlib.sha1(content).hexdigest()
 
-    # 1. SHA1 Duplicate File Check
+    # 1. SHA1 Duplicate File Detection (allow re-parse and replace existing batch on commit)
     existing = db.execute("SELECT id FROM import_batches WHERE file_sha1 = ?", (sha1,)).fetchone()
-    if existing:
-        raise AppException(
-            status_code=409,
-            code="IMPORT_DUPLICATE_FILE",
-            message=f"账单文件 '{file_name}' 已导入过（批次 #{existing['id']}）",
-            details={"file_sha1": sha1, "existing_batch_id": existing["id"]},
+    existing_batch_id: Optional[int] = int(existing["id"]) if existing else None
+    pre_warnings: List[str] = []
+    if existing_batch_id is not None:
+        pre_warnings.append(
+            f"账单文件 '{file_name}' 此前已导入（原批次 #{existing_batch_id}），确认导入后将重新解析并替换原批次入库"
         )
 
     # 2. Ephemeral Probe, ZIP Unpack, & PDF Password Detection
     probe = FileProbe(content, file_name=file_name, password=password)
     if probe.is_zip():
-        probe, zip_needs_pwd = _unwrap_zip_probe(probe)
+        probe, zip_needs_pwd, zip_warnings = _unwrap_zip_probe_with_warnings(probe)
+        pre_warnings.extend(zip_warnings)
         if zip_needs_pwd:
             return ImportPreviewItem(
                 token="",
                 file_name=file_name,
                 source="zip",
+                existing_batch_id=existing_batch_id,
                 total_rows=0,
                 need_password=True,
                 need_mapping=False,
                 accounts=[],
                 self_checks=[],
                 rows=[],
+                warnings=pre_warnings,
                 expires_at="",
             )
 
@@ -690,19 +743,21 @@ def _import_preview_sync(
         import pymupdf
         try:
             doc = pymupdf.open(stream=probe.content, filetype="pdf")
-            if doc.is_encrypted or doc.needs_pass:
+            if doc.needs_pass:
                 if not password:
                     doc.close()
                     return ImportPreviewItem(
                         token="",
                         file_name=file_name,
                         source="pdf",
+                        existing_batch_id=existing_batch_id,
                         total_rows=0,
                         need_password=True,
                         need_mapping=False,
                         accounts=[],
                         self_checks=[],
                         rows=[],
+                        warnings=pre_warnings,
                         expires_at="",
                     )
                 auth = doc.authenticate(password)
@@ -797,6 +852,7 @@ def _import_preview_sync(
                     token="",
                     file_name=file_name,
                     source="unknown",
+                    existing_batch_id=existing_batch_id,
                     total_rows=0,
                     need_password=False,
                     need_mapping=True,
@@ -806,6 +862,7 @@ def _import_preview_sync(
                     raw_rows=raw_rows,
                     preamble_rows=preamble_rows,
                     detected_file_type=detected_type,
+                    warnings=pre_warnings,
                     expires_at="",
                 )
         else:
@@ -821,12 +878,14 @@ def _import_preview_sync(
                     token="",
                     file_name=file_name,
                     source=importer.source_id,
+                    existing_batch_id=existing_batch_id,
                     total_rows=0,
                     need_password=True,
                     need_mapping=False,
                     accounts=[],
                     self_checks=[],
                     rows=[],
+                    warnings=pre_warnings,
                     expires_at="",
                 )
             except Exception as exc:
@@ -838,6 +897,7 @@ def _import_preview_sync(
                     try:
                         parse_result = _run_llm_full_takeover()
                         resolved_source = "llm_statement"
+                        profile_id = None
                     except Exception:
                         pass
                 if parse_result is None:
@@ -852,6 +912,7 @@ def _import_preview_sync(
         raise AppException(status_code=400, code="IMPORT_EMPTY", message="未解析到有效交易记录")
 
     # 5. In-Memory Preview Token Store (15-min TTL, bounded capacity)
+    combined_warnings = pre_warnings + list(parse_result.warnings)
     _prune_preview_store()
     token = uuid.uuid4().hex
     expires_at = datetime.now() + timedelta(minutes=15)
@@ -862,6 +923,7 @@ def _import_preview_sync(
         "file_size": len(content),
         "source": resolved_source,
         "profile_id": profile_id,
+        "existing_batch_id": existing_batch_id,
         "expires_at": expires_at,
     }
 
@@ -883,13 +945,14 @@ def _import_preview_sync(
         file_name=file_name,
         source=resolved_source,
         profile_id=profile_id,
+        existing_batch_id=existing_batch_id,
         total_rows=len(parse_result.transactions),
         need_password=False,
         need_mapping=False,
         accounts=[a.model_dump() for a in parse_result.accounts],
         self_checks=[sc.model_dump() for sc in parse_result.self_checks],
         rows=sample_rows,
-        warnings=parse_result.warnings,
+        warnings=combined_warnings,
         expires_at=expires_at.isoformat(),
     )
 
@@ -899,7 +962,12 @@ def import_commit(
     payload: CommitRequest,
     db: sqlite3.Connection = Depends(get_db_conn),
 ):
-    """Commit verified statement transactions into database, triggering dedup and classification pipelines."""
+    """Commit verified statement transactions into database, triggering dedup and classification pipelines.
+
+    When re-importing an already imported file (matching file_sha1), atomically rolls back the
+    previous batch (preserving any manual category/excluded markings by fingerprint) and commits
+    the freshly parsed batch in its place.
+    """
     item = _PREVIEW_STORE.pop(payload.token, None)
     if not item or datetime.now() > item["expires_at"]:
         raise AppException(status_code=410, code="IMPORT_TOKEN_EXPIRED", message="预览已过期，请重新上传解析")
@@ -923,6 +991,38 @@ def import_commit(
             currency=ov.get("currency"),
             override_explicit=True,
         )
+
+    # 0. Duplicate Batch Replacement (re-parse & re-import atomically inside current DB transaction)
+    replaced_batch_id: Optional[int] = None
+    preserved_manual_state: Dict[str, Dict[str, Any]] = {}
+    existing_batch = db.execute(
+        "SELECT id FROM import_batches WHERE file_sha1 = ?",
+        (file_sha1,),
+    ).fetchone()
+    if existing_batch:
+        replaced_batch_id = int(existing_batch["id"])
+        manual_rows = db.execute(
+            """
+            SELECT fingerprint, category_id, category_source, category_confidence, excluded, note
+            FROM transactions
+            WHERE batch_id = ?
+              AND (
+                COALESCE(category_source, '') = 'manual'
+                OR excluded = 1
+                OR COALESCE(TRIM(note), '') != ''
+              )
+            """,
+            (replaced_batch_id,),
+        ).fetchall()
+        for mr in manual_rows:
+            preserved_manual_state[mr["fingerprint"]] = {
+                "category_id": mr["category_id"],
+                "category_source": mr["category_source"],
+                "category_confidence": mr["category_confidence"],
+                "excluded": mr["excluded"],
+                "note": mr["note"],
+            }
+        rollback_import_batch(db, replaced_batch_id, manage_transaction=False)
 
     # 1. Resolve & Upsert Accounts
     account_id_map: Dict[str, int] = {}
@@ -958,8 +1058,12 @@ def import_commit(
     assign_fingerprints(parse_result.transactions)
     inserted_count = 0
     duplicate_count = 0
+    fx_online_cache: Dict[Tuple[str, str], Optional[float]] = {}
 
     for t in parse_result.transactions:
+        # Normalize transaction currency to canonical ISO code (R-BM4)
+        curr = normalize_currency(t.currency, default="CNY") if t.currency else "CNY"
+
         # Resolve main account_id
         main_acc_id = t.account_id
         if not main_acc_id and t.account_ref:
@@ -974,6 +1078,23 @@ def import_commit(
             first_acc = parse_result.accounts[0]
             main_acc_id = account_id_map.get(f"{first_acc.kind}:{first_acc.bank}:{first_acc.tail or ''}")
 
+        if not main_acc_id:
+            fb_bank = (t.account_ref.bank if t.account_ref and t.account_ref.bank else None) or "未知银行/机构"
+            fb_kind = (t.account_ref.kind if t.account_ref and t.account_ref.kind else None) or "bank_debit"
+            fb_tail = t.account_ref.tail if t.account_ref else None
+            row = db.execute(
+                "SELECT id FROM accounts WHERE kind = ? AND bank = ? AND tail IS ?",
+                (fb_kind, fb_bank, fb_tail),
+            ).fetchone()
+            if row:
+                main_acc_id = row["id"]
+            else:
+                acc_cur = db.execute(
+                    "INSERT INTO accounts (kind, bank, tail, alias, holder, currency) VALUES (?, ?, ?, ?, ?, ?)",
+                    (fb_kind, fb_bank, fb_tail, f"{fb_bank} ({fb_tail})" if fb_tail else fb_bank, parse_result.holder_name, curr),
+                )
+                main_acc_id = acc_cur.lastrowid
+
         # Resolve funding account_id
         fund_acc_id = t.fund_account_id
         if not fund_acc_id and t.fund_account_ref:
@@ -981,12 +1102,21 @@ def import_commit(
             row = db.execute("SELECT id FROM accounts WHERE bank = ? AND tail IS ?", (fref.bank, fref.tail)).fetchone()
             fund_acc_id = row["id"] if row else None
 
-        # Convert FX if foreign currency (M6 integration)
-        curr = (t.currency or "CNY").strip().upper()
+        # Convert FX if foreign currency (M6 integration, memoized per batch)
         if curr != "CNY":
-            amt_cny, fx_rate, fx_rate_at, fx_rate_source = convert_transaction(db, curr, t.amount_cents, t.txn_time)
+            amt_cny, fx_rate, fx_rate_at, fx_rate_source = convert_transaction(
+                db, curr, t.amount_cents, t.txn_time, online_cache=fx_online_cache
+            )
         else:
             amt_cny, fx_rate, fx_rate_at, fx_rate_source = t.amount_cents, None, None, None
+
+        # Restore preserved manual classification/excluded/note when replacing a duplicate batch
+        preserved = preserved_manual_state.get(t.fingerprint or "")
+        cat_id = preserved["category_id"] if preserved and preserved.get("category_source") == "manual" else None
+        cat_src = "manual" if preserved and preserved.get("category_source") == "manual" else None
+        cat_conf = preserved["category_confidence"] if preserved and preserved.get("category_source") == "manual" else 1.0
+        excluded_val = preserved["excluded"] if preserved else 0
+        note_val = preserved["note"] if (preserved and preserved.get("note")) else t.note
 
         try:
             db.execute(
@@ -995,15 +1125,17 @@ def import_commit(
                     batch_id, source, account_id, fund_account_id, txn_time, time_precision, post_date,
                     amount_cents, currency, direction, counterparty, description, pay_method, channel,
                     merchant_norm, order_id, merchant_order_id, status, platform_category, raw_json,
-                    fingerprint, refund_of, refunded_cents,
+                    fingerprint, category_id, category_source, category_confidence,
+                    refund_of, refunded_cents, note, excluded,
                     amount_cny, fx_rate, fx_rate_at, fx_rate_source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     batch_id, source, main_acc_id, fund_acc_id, t.txn_time, t.time_precision, t.post_date,
-                    t.amount_cents, t.currency, t.direction, t.counterparty, t.description, t.pay_method,
+                    t.amount_cents, curr, t.direction, t.counterparty, t.description, t.pay_method,
                     t.channel, t.merchant_norm, t.order_id, t.merchant_order_id, t.status, t.platform_category,
-                    t.raw_json, t.fingerprint, t.refund_of, t.refunded_cents,
+                    t.raw_json, t.fingerprint, cat_id, cat_src, cat_conf,
+                    None, 0, note_val, excluded_val,
                     amt_cny, fx_rate, fx_rate_at, fx_rate_source
                 ),
             )
@@ -1015,22 +1147,26 @@ def import_commit(
             else:
                 raise
 
-    # 4. Deduplication Pipeline
-    dedup_summary = run_dedup_pipeline(db, batch_id=batch_id)
+    # Update batch row_count to reflect actual persisted transactions after L1 fingerprint dedup
+    db.execute("UPDATE import_batches SET row_count = ? WHERE id = ?", (inserted_count, batch_id))
 
-    # 5. Classification Pipeline (with optional LLM fallback when enabled)
+    # 4. Deduplication Pipeline (L2 refunds, L3 cross-source, L4 internal transfers)
+    dedup_summary = run_dedup_pipeline(db, batch_id=batch_id, auto_commit=False)
+
+    # 5. Classification Pipeline (with optional LLM fallback when enabled; keep outer transaction atomic)
     llm_cfg = LLMConfig.load_from_db(db)
     llm_client = (
-        LLMClient(llm_cfg, conn=db)
+        LLMClient(llm_cfg, conn=db, auto_commit=False)
         if (llm_cfg.enabled and llm_cfg.task_classify_enabled and llm_cfg.base_url.strip())
         else None
     )
-    pipeline = ClassificationPipeline(db, llm_client=llm_client)
+    pipeline = ClassificationPipeline(db, llm_client=llm_client, auto_init_builtins=False)
     batch_txns = db.execute("SELECT * FROM transactions WHERE batch_id = ?", (batch_id,)).fetchall()
-    _, class_summary = pipeline.classify_batch(batch_txns, update_db=True)
+    _, class_summary = pipeline.classify_batch(batch_txns, update_db=True, auto_commit=False)
 
     return ImportCommitResponse(
         batch_id=batch_id,
+        replaced_batch_id=replaced_batch_id,
         imported_count=inserted_count,
         duplicate_count=duplicate_count + dedup_summary.duplicates_auto,
         refund_count=dedup_summary.refunds_linked,

@@ -5,6 +5,7 @@
     :props="cascaderProps"
     :placeholder="placeholder"
     :clearable="clearable"
+    :value-on-clear="null"
     :filterable="true"
     :size="size"
     class="category-picker"
@@ -68,8 +69,9 @@ const cascaderOptions = computed(() => {
 });
 
 function handleChange(val: any) {
-  emit('update:modelValue', val);
-  emit('change', val);
+  const normalized = val === undefined ? null : val;
+  emit('update:modelValue', normalized);
+  emit('change', normalized);
 }
 </script>
 

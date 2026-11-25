@@ -128,9 +128,11 @@ def _has_nested_quantifiers(pattern: str) -> bool:
                 is_multi, next_pos = _read_quantifier_repeat_bound(pattern, i + 1)
                 if is_multi and (inner_has_q or inner_has_alt):
                     return True
-                # Propagate quantifier existence upward so ((a)+)+ is caught at any depth
+                # Propagate quantifier and alternation existence upward so ((a)+)+ and ((a|aa))+ are caught
                 if inner_has_q or is_multi:
                     stack[-1][0] = True
+                if inner_has_alt:
+                    stack[-1][1] = True
                 i = next_pos
                 continue
             i += 1

@@ -740,13 +740,16 @@ async function handleAiSuggest(options?: { autoTriggered?: boolean } | Event) {
       pushPreambleRow(cells);
     });
 
-    const res = await suggestMapping({
-      headers: detectedHeaders.value,
-      sample_rows: sampleRowsForAi.length > 0 ? sampleRowsForAi : undefined,
-      preamble_rows: preambleRowsForAi.length > 0 ? preambleRowsForAi.slice(0, 15) : undefined,
-      file_name: fileName.value || undefined,
-      file_type: detectedFileType.value || 'csv',
-    });
+    const res = await suggestMapping(
+      {
+        headers: detectedHeaders.value,
+        sample_rows: sampleRowsForAi.length > 0 ? sampleRowsForAi : undefined,
+        preamble_rows: preambleRowsForAi.length > 0 ? preambleRowsForAi.slice(0, 15) : undefined,
+        file_name: fileName.value || undefined,
+        file_type: detectedFileType.value || 'csv',
+      },
+      { silent: autoTriggered }
+    );
     if (res.amount_mode) {
       amountMode.value = res.amount_mode;
     }
@@ -772,6 +775,8 @@ async function handleAiSuggest(options?: { autoTriggered?: boolean } | Event) {
     }
     if (res.account_kind === 'credit' || res.account_kind === 'debit') {
       accountKind.value = res.account_kind === 'credit' ? 'bank_credit' : 'bank_debit';
+    } else if (res.account_kind === 'wallet') {
+      accountKind.value = 'wallet';
     }
     if (res.card_tail && /^\d{4}$/.test(res.card_tail)) {
       defaultCardTail.value = res.card_tail;
@@ -793,7 +798,7 @@ async function handleAiSuggest(options?: { autoTriggered?: boolean } | Event) {
       }
     }
   } catch (err: any) {
-    if (!autoTriggered) {
+    if (!autoTriggered && !err?.toasted) {
       ElMessage.error(err?.message || 'AI 服务请求失败，请检查系统设置中的 AI 配置');
     }
   } finally {
@@ -855,6 +860,7 @@ async function handleSaveAndFinish() {
       flagExpenseVal: flagExpenseVal.value,
       flagIncomeVal: flagIncomeVal.value,
       defaultCardTail: defaultCardTail.value.trim() || undefined,
+      autoApplyNextTime: autoApplyNextTime.value,
     });
 
     const savedId = profileId.value.trim();
@@ -864,19 +870,36 @@ async function handleSaveAndFinish() {
       yaml_content: yamlConfig,
     });
     const pendingItem = importStore.queue.find(
-      (i) => i.status === 'need_mapping' && (!fileName.value || i.name === fileName.value)
+      (i) =>
+        (i.status === 'need_mapping' || i.status === 'error') &&
+        (!fileName.value || i.name === fileName.value)
     );
+    let needsPasswordAgain = false;
+    let reparseSucceeded = true;
     if (pendingItem) {
       try {
-        await importStore.parseFile(pendingItem, undefined, savedId);
+        const reparse = await importStore.parseFile(pendingItem, undefined, savedId);
+        if (reparse?.need_password) {
+          needsPasswordAgain = true;
+        } else if (reparse?.need_mapping) {
+          reparseSucceeded = false;
+        }
       } catch {
-        // Ignore re-parse error here; ImportView still lets the user inspect or retry
+        reparseSucceeded = false;
       }
     }
-    ElMessage.success('配置已保存并生效');
+    if (needsPasswordAgain) {
+      ElMessage.info('配置已保存，请返回导入页输入解密密码完成解析');
+    } else if (!reparseSucceeded) {
+      ElMessage.warning('配置已保存，但使用该配置重解析当前文件未成功，请返回导入页查看或调整映射');
+    } else {
+      ElMessage.success('配置已保存并生效');
+    }
     router.push('/import');
   } catch (err: any) {
-    ElMessage.error(err.message || '保存配置失败');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '保存配置失败');
+    }
   } finally {
     saving.value = false;
   }
@@ -891,14 +914,19 @@ async function handleDirectAiTakeover() {
   aiFullParsing.value = true;
   try {
     const preview = await importStore.parseFile(targetItem, undefined, undefined, true);
-    if (preview && !preview.need_mapping && !preview.need_password) {
+    if (preview?.need_password) {
+      ElMessage.info('该账单受密码保护，请返回导入页输入密码后使用 AI 整单识别');
+      router.push('/import');
+    } else if (preview && !preview.need_mapping) {
       ElMessage.success('AI 整单识别成功');
       router.push('/import');
     } else {
       ElMessage.warning('AI 整单识别未提取到完整交易明细，请尝试手动映射');
     }
   } catch (err: any) {
-    ElMessage.error(err?.message || 'AI 整单识别失败，请检查设置中的 AI 配置');
+    if (!err?.toasted) {
+      ElMessage.error(err?.message || 'AI 整单识别失败，请检查设置中的 AI 配置');
+    }
   } finally {
     aiFullParsing.value = false;
   }

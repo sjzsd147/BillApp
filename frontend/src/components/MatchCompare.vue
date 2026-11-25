@@ -10,7 +10,13 @@
         <div class="field-row amount-row">
           <div class="field-label">金额</div>
           <div class="field-value">
-            <AmountText :value="item.left.amount_cents" bold size="22px" />
+            <AmountText
+              :value="item.left.amount_cents"
+              :currency="item.left.currency || 'CNY'"
+              :amount-cny="item.left.amount_cny"
+              bold
+              size="22px"
+            />
           </div>
         </div>
         <div class="field-row">
@@ -47,7 +53,13 @@
         <div class="field-row amount-row">
           <div class="field-label">金额</div>
           <div class="field-value">
-            <AmountText :value="item.right.amount_cents" bold size="22px" />
+            <AmountText
+              :value="item.right.amount_cents"
+              :currency="item.right.currency || 'CNY'"
+              :amount-cny="item.right.amount_cny"
+              bold
+              size="22px"
+            />
           </div>
         </div>
         <div class="field-row">

@@ -30,7 +30,7 @@
             v-for="acc in appStore.accounts"
             :key="acc.id"
             :value="acc.id"
-            :label="`${acc.bank}${acc.tail ? ` (${acc.tail})` : ''}`"
+            :label="acc.alias || `${acc.bank}${acc.tail ? ` (${acc.tail})` : ''}`"
           />
         </el-select>
 
@@ -270,7 +270,7 @@
         <el-button size="small" @click="openBulkCategoryModal">批量修改分类</el-button>
         <el-button size="small" @click="handleBulkExclude(1)">批量排除</el-button>
         <el-button size="small" @click="handleBulkExclude(0)">恢复正常</el-button>
-        <el-button size="small" @click="txnStore.selectedIds = []">取消选择</el-button>
+        <el-button size="small" @click="clearTableSelection">取消选择</el-button>
       </div>
     </div>
 
@@ -315,6 +315,7 @@
             :direction="activeDetailTxn.direction"
             bold
             size="24px"
+            @click-pending-fx="openManualRateDialog(activeDetailTxn)"
           />
         </div>
 
@@ -403,7 +404,13 @@
                     {{ formatSourceName(item.txn.source) }} · {{ item.txn.account_bank || '关联账户' }}<template v-if="item.txn.account_tail">({{ item.txn.account_tail }})</template>
                   </span>
                   <span class="merged-card-amount">
-                    ¥{{ ((item.txn.amount_cents || 0) / 100).toFixed(2) }}
+                    <AmountText
+                      :value="item.txn.amount_cents || 0"
+                      :currency="item.txn.currency || 'CNY'"
+                      :amount-cny="item.txn.amount_cny"
+                      :direction="item.txn.direction"
+                      bold
+                    />
                   </span>
                 </div>
                 <div class="merged-card-meta">
@@ -433,7 +440,12 @@
                 </div>
                 <div class="merged-card-meta">
                   <span>{{ rel.txn.txn_time }}</span>
-                  <span>¥{{ ((rel.txn.amount_cents || 0) / 100).toFixed(2) }}</span>
+                  <AmountText
+                    :value="rel.txn.amount_cents || 0"
+                    :currency="rel.txn.currency || 'CNY'"
+                    :amount-cny="rel.txn.amount_cny"
+                    :direction="rel.txn.direction"
+                  />
                 </div>
               </div>
             </div>
@@ -498,8 +510,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick } from 'vue';
-import { useRoute } from 'vue-router';
+import { ref, reactive, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
+import dayjs from 'dayjs';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { Search, Download, Edit } from '@element-plus/icons-vue';
 import { useTransactionsStore } from '@/stores/transactions';
@@ -516,6 +529,7 @@ import RuleProposalModal from '@/components/RuleProposalModal.vue';
 import type { TransactionItem, RelatedTxnInfo } from '@/types/api';
 
 const route = useRoute();
+const router = useRouter();
 const txnStore = useTransactionsStore();
 const appStore = useAppStore();
 
@@ -885,7 +899,7 @@ function openManualRateDialog(row?: TransactionItem | null) {
   if (!target) return;
   manualFxForm.currency = target.currency || 'USD';
   manualFxForm.rate = target.fx_rate ? Number(target.fx_rate) : undefined;
-  manualFxForm.effective_date = (target.txn_time || '').slice(0, 10) || new Date().toISOString().slice(0, 10);
+  manualFxForm.effective_date = (target.txn_time || '').slice(0, 10) || dayjs().format('YYYY-MM-DD');
   manualFxForm.note = '';
   manualFxForm.apply_to_all_missing = false;
   showManualRateDialog.value = true;
@@ -917,10 +931,20 @@ async function handleSaveManualFx() {
       const refreshed = txnStore.items.find((i) => i.id === activeDetailTxn.value?.id);
       if (refreshed) {
         activeDetailTxn.value = refreshed;
+      } else {
+        try {
+          const detail = await getTransaction(activeDetailTxn.value.id);
+          activeDetailTxn.value = detail.transaction;
+          activeDetailRelated.value = detail.related || [];
+        } catch {
+          // ignore refresh failure
+        }
       }
     }
   } catch (err: any) {
-    ElMessage.error(err?.message || '保存汇率失败');
+    if (!err?.toasted) {
+      ElMessage.error(err?.message || '保存汇率失败');
+    }
   } finally {
     savingFx.value = false;
   }
@@ -935,10 +959,12 @@ async function handleRetryFx(row: TransactionItem) {
     } else {
       ElMessage.warning('未能获取在线汇率，可点击补录汇率手动录入');
     }
-    await txnStore.fetchList();
     activeDetailTxn.value = updated;
+    await txnStore.fetchList();
   } catch (err: any) {
-    ElMessage.error(err?.message || '重试获取汇率失败');
+    if (!err?.toasted) {
+      ElMessage.error(err?.message || '重试获取汇率失败');
+    }
   } finally {
     retryingFx.value = false;
   }
@@ -954,6 +980,9 @@ function handleReset() {
   mergeDuplicates.value = true;
   filterUnclassified.value = false;
   filterMissingFx.value = false;
+  if (Object.keys(route.query || {}).length > 0) {
+    router.replace('/transactions');
+  }
   txnStore.resetFilters();
 }
 
@@ -983,6 +1012,11 @@ function handlePaginationChange() {
 
 function handleSelectionChange(selection: TransactionItem[]) {
   txnStore.selectedIds = selection.map((i) => i.id);
+}
+
+function clearTableSelection() {
+  tableRef.value?.clearSelection?.();
+  txnStore.selectedIds = [];
 }
 
 function handleExport() {
@@ -1025,7 +1059,9 @@ async function handleAiClassify() {
       ElMessage.info('AI 已评估待分类交易，暂无高置信度可自动落库的结果');
     }
   } catch (err: any) {
-    ElMessage.error(err?.message || 'AI 分类失败');
+    if (!err?.toasted) {
+      ElMessage.error(err?.message || 'AI 分类失败');
+    }
   } finally {
     aiClassifying.value = false;
   }
@@ -1040,12 +1076,13 @@ function openInlineCategoryEdit(row: TransactionItem) {
 async function saveCategoryEdit() {
   if (!editingTxn.value) return;
   savingCategory.value = true;
+  const targetCategoryId = editingCategoryId.value ?? null;
   try {
     const res = await patchTransaction(editingTxn.value.id, {
-      category_id: editingCategoryId.value,
+      category_id: targetCategoryId,
     });
     showCategoryDialog.value = false;
-    ElMessage.success('分类已更新');
+    ElMessage.success(targetCategoryId === null ? '已清除分类' : '分类已更新');
     await txnStore.fetchList();
 
     // Check if backend returned rule proposal suggestion!
@@ -1053,7 +1090,9 @@ async function saveCategoryEdit() {
       ruleProposalModalRef.value?.open(res.rule_proposal);
     }
   } catch (err: any) {
-    ElMessage.error(err.message || '更新分类失败');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '更新分类失败');
+    }
   } finally {
     savingCategory.value = false;
   }
@@ -1069,13 +1108,20 @@ function openBulkCategoryModal() {
 }
 
 async function saveBulkCategory() {
+  if (bulkCategoryId.value == null) {
+    ElMessage.warning('请先选择目标分类');
+    return;
+  }
   savingCategory.value = true;
   try {
     await txnStore.bulkSetCategory(bulkCategoryId.value);
+    tableRef.value?.clearSelection?.();
     showBulkCategoryDialog.value = false;
     ElMessage.success('批量修改分类成功');
   } catch (err: any) {
-    ElMessage.error(err.message || '批量修改失败');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '批量修改失败');
+    }
   } finally {
     savingCategory.value = false;
   }
@@ -1084,9 +1130,12 @@ async function saveBulkCategory() {
 async function handleBulkExclude(excluded: number) {
   try {
     await txnStore.bulkSetExcluded(excluded);
+    tableRef.value?.clearSelection?.();
     ElMessage.success(excluded ? '已批量排除选中记录' : '已恢复选中记录');
   } catch (err: any) {
-    ElMessage.error(err.message || '批量操作失败');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '批量操作失败');
+    }
   }
 }
 
@@ -1114,7 +1163,9 @@ async function jumpToRelatedTxn(id: number) {
     activeDetailTxn.value = detail.transaction;
     activeDetailRelated.value = detail.related || [];
   } catch (err: any) {
-    ElMessage.error(err?.message || '加载关联交易详情失败');
+    if (!err?.toasted) {
+      ElMessage.error(err?.message || '加载关联交易详情失败');
+    }
   }
 }
 
@@ -1133,6 +1184,73 @@ async function deleteSingleTxn(id: number) {
 
 let lastFittedWidth = 0;
 let resizeRafId: number | null = null;
+
+function syncCheckboxesFromStore() {
+  showExcluded.value = txnStore.filters.excluded === null;
+  mergeDuplicates.value = txnStore.filters.mergeDuplicates;
+  filterUnclassified.value = txnStore.filters.unclassified;
+  filterMissingFx.value = txnStore.filters.fx === 'missing';
+}
+
+function applyRouteQuery(query: Record<string, any>) {
+  const hasQuery = Object.keys(query || {}).length > 0;
+  if (hasQuery) {
+    // Clear stale filters when drilling down from Dashboard / Global Search
+    txnStore.filters.dateRange = null;
+    txnStore.filters.accountId = null;
+    txnStore.filters.fundAccountId = null;
+    txnStore.filters.source = null;
+    txnStore.filters.categoryId = null;
+    txnStore.filters.direction = null;
+    txnStore.filters.status = null;
+    txnStore.filters.q = '';
+    txnStore.filters.excluded = 0;
+    txnStore.filters.mergeDuplicates = true;
+    txnStore.filters.unclassified = false;
+    txnStore.filters.currency = null;
+    txnStore.filters.fx = null;
+    txnStore.pagination.page = 1;
+
+    if (query.direction) {
+      txnStore.filters.direction = query.direction as any;
+    }
+    if (query.q) {
+      txnStore.filters.q = String(query.q);
+    }
+    if (query.from && query.to) {
+      txnStore.filters.dateRange = [String(query.from), String(query.to)];
+    }
+    if (query.currency) {
+      txnStore.filters.currency = String(query.currency);
+    }
+    if (query.account_id) {
+      const aid = Number(query.account_id);
+      if (Number.isFinite(aid)) txnStore.filters.accountId = aid;
+    }
+    if (query.category_id) {
+      const cid = Number(query.category_id);
+      if (Number.isFinite(cid)) txnStore.filters.categoryId = cid;
+    }
+    if (query.unclassified === '1' || query.unclassified === 'true') {
+      txnStore.filters.unclassified = true;
+    }
+    if (query.fx === 'missing') {
+      txnStore.filters.fx = 'missing';
+    }
+  }
+  syncCheckboxesFromStore();
+}
+
+watch(
+  () => route.query,
+  (newQuery) => {
+    if (Object.keys(newQuery || {}).length > 0) {
+      applyRouteQuery(newQuery as Record<string, any>);
+      txnStore.fetchList();
+    }
+  },
+  { deep: true }
+);
 
 onMounted(() => {
   loadSavedColWidths();
@@ -1159,27 +1277,8 @@ onMounted(() => {
     gridResizeObserver.observe(gridCardRef.value);
   }
 
-  // Sync query params if present (from Dashboard drill-down or global search)
-  if (route.query.direction) {
-    txnStore.filters.direction = route.query.direction as any;
-  }
-  if (route.query.q) {
-    txnStore.filters.q = route.query.q as string;
-  }
-  if (route.query.from && route.query.to) {
-    txnStore.filters.dateRange = [route.query.from as string, route.query.to as string];
-  }
-  if (route.query.currency) {
-    txnStore.filters.currency = route.query.currency as string;
-  }
-  if (route.query.unclassified === '1' || route.query.unclassified === 'true') {
-    filterUnclassified.value = true;
-    txnStore.filters.unclassified = true;
-  }
-  if (route.query.fx === 'missing') {
-    filterMissingFx.value = true;
-    txnStore.filters.fx = 'missing';
-  }
+  // Sync query params and checkbox states from store
+  applyRouteQuery(route.query as Record<string, any>);
   txnStore.fetchList();
 });
 

@@ -30,6 +30,7 @@ class MergedSourceItem(BaseModel):
     txn_time: str
     amount_cents: int
     currency: str = "CNY"
+    amount_cny: Optional[int] = None
     direction: str
     counterparty: Optional[str] = None
     description: Optional[str] = None
@@ -142,11 +143,11 @@ def list_transactions(
     where_clauses = ["1=1"]
     params: List[Any] = []
 
-    # Dates
+    # Dates (use raw 'YYYY-MM-DD' for start so day-precision txn_time rows are included)
     start = start_date or from_
     if start:
         where_clauses.append("t.txn_time >= ?")
-        params.append(start if len(start) > 10 else f"{start} 00:00:00")
+        params.append(start)
     end = end_date or to
     if end:
         where_clauses.append("t.txn_time <= ?")
@@ -268,7 +269,7 @@ def list_transactions(
         child_rows = db.execute(
             f"""
             SELECT t.id, t.duplicate_of, t.source, t.account_id, t.txn_time, t.amount_cents,
-                   t.currency, t.direction, t.counterparty, t.description, t.pay_method, t.channel,
+                   t.currency, t.amount_cny, t.direction, t.counterparty, t.description, t.pay_method, t.channel,
                    a.bank AS account_bank, a.tail AS account_tail, a.alias AS account_alias
             FROM transactions t
             LEFT JOIN accounts a ON t.account_id = a.id
@@ -288,7 +289,7 @@ def list_transactions(
             p_rows = db.execute(
                 f"""
                 SELECT t.id, t.source, t.account_id, t.txn_time, t.amount_cents,
-                       t.currency, t.direction, t.counterparty, t.description, t.pay_method, t.channel,
+                       t.currency, t.amount_cny, t.direction, t.counterparty, t.description, t.pay_method, t.channel,
                        a.bank AS account_bank, a.tail AS account_tail, a.alias AS account_alias
                 FROM transactions t
                 LEFT JOIN accounts a ON t.account_id = a.id
@@ -351,17 +352,23 @@ def get_transaction_detail(
     # Related items (refunds, duplicate primary & children, transfer peer)
     related = []
     if d["refund_of"]:
-        p_row = db.execute("SELECT id, txn_time, amount_cents, direction, counterparty FROM transactions WHERE id = ?", (d["refund_of"],)).fetchone()
+        p_row = db.execute(
+            "SELECT id, txn_time, amount_cents, currency, amount_cny, direction, counterparty FROM transactions WHERE id = ?",
+            (d["refund_of"],),
+        ).fetchone()
         if p_row:
             related.append({"relation": "refund_parent", "txn": dict(p_row)})
-    refund_children = db.execute("SELECT id, txn_time, amount_cents, direction, counterparty FROM transactions WHERE refund_of = ?", (txn_id,)).fetchall()
+    refund_children = db.execute(
+        "SELECT id, txn_time, amount_cents, currency, amount_cny, direction, counterparty FROM transactions WHERE refund_of = ?",
+        (txn_id,),
+    ).fetchall()
     for rc in refund_children:
         related.append({"relation": "refund_child", "txn": dict(rc)})
 
     if d["duplicate_of"]:
         dup_parent = db.execute(
             """
-            SELECT t.id, t.txn_time, t.amount_cents, t.currency, t.direction,
+            SELECT t.id, t.txn_time, t.amount_cents, t.currency, t.amount_cny, t.direction,
                    t.counterparty, t.description, t.source, t.pay_method, t.channel,
                    t.account_id, a.bank AS account_bank, a.tail AS account_tail, a.alias AS account_alias
             FROM transactions t
@@ -377,7 +384,7 @@ def get_transaction_detail(
 
     dup_children = db.execute(
         """
-        SELECT t.id, t.txn_time, t.amount_cents, t.currency, t.direction,
+        SELECT t.id, t.txn_time, t.amount_cents, t.currency, t.amount_cny, t.direction,
                t.counterparty, t.description, t.source, t.pay_method, t.channel,
                t.account_id, a.bank AS account_bank, a.tail AS account_tail, a.alias AS account_alias
         FROM transactions t
@@ -394,7 +401,10 @@ def get_transaction_detail(
         related.append({"relation": "duplicate_child", "txn": dc})
 
     if d["transfer_peer"]:
-        peer_row = db.execute("SELECT id, txn_time, amount_cents, direction, counterparty, source FROM transactions WHERE id = ?", (d["transfer_peer"],)).fetchone()
+        peer_row = db.execute(
+            "SELECT id, txn_time, amount_cents, currency, amount_cny, direction, counterparty, source FROM transactions WHERE id = ?",
+            (d["transfer_peer"],),
+        ).fetchone()
         if peer_row:
             related.append({"relation": "transfer_peer", "txn": dict(peer_row)})
 
@@ -415,7 +425,16 @@ def bulk_update_transactions(
 
     placeholders = ",".join("?" for _ in payload.ids)
 
-    if payload.category_id is not None:
+    if "category_id" in payload.model_fields_set and payload.category_id is None:
+        db.execute(
+            f"""
+            UPDATE transactions
+            SET category_id = NULL, category_source = 'none', category_confidence = 0.0
+            WHERE id IN ({placeholders})
+            """,
+            payload.ids,
+        )
+    elif payload.category_id is not None:
         cat = CategoryService.get_by_id(db, payload.category_id)
         if not cat:
             raise NotFoundError(f"分类 #{payload.category_id} 不存在")
@@ -459,7 +478,16 @@ def update_transaction(
 
     rule_proposal = None
 
-    if payload.category_id is not None:
+    if "category_id" in payload.model_fields_set and payload.category_id is None:
+        db.execute(
+            """
+            UPDATE transactions
+            SET category_id = NULL, category_source = 'none', category_confidence = 0.0
+            WHERE id = ?
+            """,
+            (txn_id,),
+        )
+    elif payload.category_id is not None:
         cat = CategoryService.get_by_id(db, payload.category_id)
         if not cat:
             raise NotFoundError(f"分类 #{payload.category_id} 不存在")
@@ -555,12 +583,14 @@ def delete_transaction(
         # 2. Clear refund_of references on any refunds pointing to this transaction
         db.execute("UPDATE transactions SET refund_of = NULL WHERE refund_of = ?", (txn_id,))
 
-        # 3. Revert transfer peer direction and transfer_peer link using match_links metadata
+        # 3. Revert transfer peer direction and transfer_peer link using ACTIVE match_links only
         transfer_links = db.execute(
             """
             SELECT id, primary_id, secondary_id, features_json
             FROM match_links
-            WHERE kind = 'transfer' AND (primary_id = ? OR secondary_id = ?)
+            WHERE kind = 'transfer'
+              AND status IN ('auto', 'confirmed')
+              AND (primary_id = ? OR secondary_id = ?)
             """,
             (txn_id, txn_id),
         ).fetchall()
@@ -579,13 +609,13 @@ def delete_transaction(
                 orig_dir = feat.get("orig_dir_out")
             if orig_dir:
                 db.execute(
-                    "UPDATE transactions SET transfer_peer = NULL, direction = ? WHERE id = ?",
-                    (orig_dir, peer_id),
+                    "UPDATE transactions SET transfer_peer = NULL, direction = ? WHERE id = ? AND transfer_peer = ?",
+                    (orig_dir, peer_id, txn_id),
                 )
             else:
                 db.execute(
-                    "UPDATE transactions SET transfer_peer = NULL WHERE id = ?",
-                    (peer_id,),
+                    "UPDATE transactions SET transfer_peer = NULL WHERE id = ? AND transfer_peer = ?",
+                    (peer_id, txn_id),
                 )
         db.execute("UPDATE transactions SET transfer_peer = NULL WHERE transfer_peer = ?", (txn_id,))
 

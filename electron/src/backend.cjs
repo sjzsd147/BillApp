@@ -291,7 +291,7 @@ async function waitForBackendReady({ port, host = '127.0.0.1', timeoutMs = 20000
  * Terminate child process gracefully via stdin EOF + SIGTERM, escalating if needed.
  */
 async function stopChildProcess(child, { gracefulMs = 2500, platform = process.platform } = {}) {
-  if (!child || child.exitCode !== null || child.signalCode !== null) {
+  if (!child || !child.pid || child.exitCode !== null || child.signalCode !== null) {
     return;
   }
 
@@ -393,19 +393,26 @@ async function startBackend({
 
   let exited = false;
   let exitCode = null;
+  let spawnError = null;
   let readyInfo = null;
   let stdoutBuf = '';
   let stderrTail = '';
-
-  child.once('exit', (code) => {
-    exited = true;
-    exitCode = code;
-  });
 
   const appendStderr = (text) => {
     stderrTail = `${stderrTail}${text}`.slice(-4000);
     if (onLog) onLog('stderr', text);
   };
+
+  child.once('error', (err) => {
+    exited = true;
+    spawnError = err;
+    appendStderr(`spawn error: ${err?.message || err}\n`);
+  });
+
+  child.once('exit', (code) => {
+    exited = true;
+    exitCode = code;
+  });
 
   child.stderr.on('data', (chunk) => {
     appendStderr(chunk.toString('utf8'));
@@ -434,7 +441,7 @@ async function startBackend({
       host,
       timeoutMs,
       isExited: () => exited,
-      getStderr: () => `exitCode=${exitCode}\n${stderrTail}`,
+      getStderr: () => `${spawnError ? `spawnError=${spawnError.message}\n` : ''}exitCode=${exitCode}\n${stderrTail}`,
     });
   } catch (err) {
     await stopChildProcess(child, { gracefulMs: 500, platform });

@@ -45,7 +45,13 @@
               {{ item.left.counterparty || item.right.counterparty || '未知商户' }}
             </div>
             <div class="item-footer">
-              <AmountText :value="item.left.amount_cents" size="13px" bold />
+              <AmountText
+                :value="item.left.amount_cents"
+                :currency="item.left.currency || 'CNY'"
+                :amount-cny="item.left.amount_cny"
+                size="13px"
+                bold
+              />
               <span class="item-date">{{ item.left.txn_time.substring(5, 16) }}</span>
             </div>
           </div>
@@ -120,36 +126,44 @@ const reviewStore = useReviewStore();
 const actionLoading = ref(false);
 
 async function handleAccept() {
-  if (!reviewStore.currentItem) return;
+  if (!reviewStore.currentItem || actionLoading.value) return;
   actionLoading.value = true;
   try {
     const id = reviewStore.currentItem.id;
     await reviewStore.accept(id);
     ElMessage.success('已确认合并流水');
   } catch (err: any) {
-    ElMessage.error(err.message || '操作失败');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '操作失败');
+    }
   } finally {
     actionLoading.value = false;
   }
 }
 
 async function handleReject() {
-  if (!reviewStore.currentItem) return;
+  if (!reviewStore.currentItem || actionLoading.value) return;
   actionLoading.value = true;
   try {
     const id = reviewStore.currentItem.id;
     await reviewStore.reject(id);
     ElMessage.info('已排除该候选关联并记入黑名单');
   } catch (err: any) {
-    ElMessage.error(err.message || '操作失败');
+    if (!err?.toasted) {
+      ElMessage.error(err.message || '操作失败');
+    }
   } finally {
     actionLoading.value = false;
   }
 }
 
 function handleDefer() {
-  reviewStore.deferCurrent();
-  ElMessage.info('已将该候选移至队列末尾');
+  const moved = reviewStore.deferCurrent();
+  if (!moved) {
+    ElMessage.info('当前队列仅剩一条候选记录');
+    return;
+  }
+  ElMessage.info('已将该候选延后处理');
 }
 
 async function handleBulkAccept() {
@@ -175,6 +189,12 @@ async function handleBulkAccept() {
 
 // Single keystroke listener (Y / N / U / J / K)
 function handleKeydown(e: KeyboardEvent) {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (actionLoading.value) return;
+  const hasVisibleModal = Array.from(document.querySelectorAll('.el-message-box, .el-dialog')).some(
+    (el) => el.getClientRects().length > 0
+  );
+  if (hasVisibleModal) return;
   const target = e.target as HTMLElement | null;
   const isInput = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
   if (isInput) return;

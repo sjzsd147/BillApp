@@ -159,7 +159,12 @@ def classify_with_llm(
     params: List[Any] = []
     if payload.transaction_ids:
         placeholders = ",".join("?" for _ in payload.transaction_ids)
-        query = f"SELECT * FROM transactions WHERE id IN ({placeholders})"
+        query = f"""
+            SELECT * FROM transactions
+            WHERE id IN ({placeholders})
+              AND COALESCE(category_source, '') != 'manual'
+              AND duplicate_of IS NULL
+        """
         params = list(payload.transaction_ids)
     elif payload.batch_id:
         query += " AND batch_id = ?"
@@ -225,16 +230,25 @@ def classify_with_llm(
     updated_count = 0
 
     id_to_key = {c.id: c.key for c in all_categories if c.key}
+    id_to_direction = {c.id: c.direction for c in all_categories}
 
     for txn, res in zip(txns, class_results):
         txn_id = _get_val(txn, "id")
+        txn_dir = _get_val(txn, "direction")
         cat_id = res.category_id
         conf = res.confidence
         rsn = res.reason or ""
 
+        if cat_id is not None and txn_dir in ("expense", "income"):
+            cat_dir = id_to_direction.get(cat_id)
+            if cat_dir is not None and cat_dir != txn_dir:
+                cat_id = None
+                conf = 0.0
+                rsn = f"已过滤与交易方向 ({txn_dir}) 冲突的分类建议"
+
         updated = False
         if payload.update_db and cat_id is not None and conf >= 0.70 and txn_id:
-            db.execute(
+            cur = db.execute(
                 """
                 UPDATE transactions
                 SET category_id = ?, category_source = 'llm', category_confidence = ?
@@ -242,8 +256,9 @@ def classify_with_llm(
                 """,
                 (cat_id, conf, txn_id),
             )
-            updated = True
-            updated_count += 1
+            if cur.rowcount and cur.rowcount > 0:
+                updated = True
+                updated_count += 1
 
         out_items.append(
             LLMClassifyItemOut(
@@ -284,11 +299,22 @@ def review_with_llm(
             reason="LLM is not enabled or configured.",
         )
 
+    if not config.task_review_enabled:
+        return LLMReviewResponse(
+            success=False,
+            status="disabled",
+            reviews=[],
+            reason="已在设置中关闭「低置信度分类复核」任务开关。",
+        )
+
     query = """
         SELECT t.*, c.key AS category_key, c.name AS category_name
         FROM transactions t
         LEFT JOIN categories c ON t.category_id = c.id
-        WHERE t.category_id IS NOT NULL AND t.category_confidence <= ?
+        WHERE t.category_id IS NOT NULL
+          AND t.category_confidence <= ?
+          AND t.duplicate_of IS NULL
+          AND t.excluded = 0
     """
     params: List[Any] = [payload.max_confidence]
 
@@ -313,12 +339,50 @@ def review_with_llm(
 
     all_categories = CategoryService.list_all(db)
     key_to_id = {c.key: c.id for c in all_categories if c.key}
+    name_to_id = {c.name: c.id for c in all_categories if c.name}
+    cat_tree = CategoryService.get_tree(db)
+    live_taxonomy = [
+        {
+            "key": r.key or str(r.id),
+            "name": r.name,
+            "direction": r.direction,
+            "subcategories": [
+                {"key": c.key or str(c.id), "name": c.name}
+                for c in r.children
+            ],
+        }
+        for r in cat_tree
+    ]
 
     holder_names = collect_known_holder_names(db, payload.holder_name)
     try:
-        review_results = review_classification_sync(
-            txns, client, key_to_id=key_to_id, holder_name=holder_names or payload.holder_name
+        extra_kwargs: Dict[str, Any] = {
+            "key_to_id": key_to_id,
+            "holder_name": holder_names or payload.holder_name,
+            "taxonomy": live_taxonomy or None,
+            "name_to_id": name_to_id,
+            "raise_on_error": True,
+        }
+        sig = inspect.signature(review_classification_sync)
+        accepts_var_kw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
         )
+        if not accepts_var_kw:
+            extra_kwargs = {
+                k: v for k, v in extra_kwargs.items() if k in sig.parameters
+            }
+        review_results = review_classification_sync(txns, client, **extra_kwargs)
+        out_reviews = [
+            LLMReviewItemOut(
+                id=int(r.id),
+                agree=bool(r.agree),
+                suggested_category_id=r.suggested_category_id,
+                suggested_category_key=str(r.suggested_category_key) if r.suggested_category_key is not None else None,
+                confidence=float(r.confidence),
+                reason=str(r.reason or ""),
+            )
+            for r in review_results
+        ]
     except Exception as exc:
         return LLMReviewResponse(
             success=False,
@@ -326,18 +390,6 @@ def review_with_llm(
             reviews=[],
             reason=f"LLM review error: {exc}",
         )
-
-    out_reviews = [
-        LLMReviewItemOut(
-            id=r.id,
-            agree=r.agree,
-            suggested_category_id=r.suggested_category_id,
-            suggested_category_key=r.suggested_category_key,
-            confidence=r.confidence,
-            reason=r.reason,
-        )
-        for r in review_results
-    ]
 
     return LLMReviewResponse(
         success=True,

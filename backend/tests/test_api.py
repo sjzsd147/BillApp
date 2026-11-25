@@ -116,13 +116,23 @@ def test_import_commit_and_batch_rollback(client: TestClient):
     assert expired_resp.status_code == 410
     assert expired_resp.json()["code"] == "IMPORT_TOKEN_EXPIRED"
 
-    # 5. Attempting to re-upload exact same file -> 409 IMPORT_DUPLICATE_FILE
+    # 5. Re-uploading exact same file re-parses and replaces the previous batch on commit
     dup_resp = client.post(
         "/api/import/preview",
         files={"file": ("alipay.csv", io.BytesIO(alipay_bytes), "text/csv")},
     )
-    assert dup_resp.status_code == 409
-    assert dup_resp.json()["code"] == "IMPORT_DUPLICATE_FILE"
+    assert dup_resp.status_code == 200
+    dup_preview = dup_resp.json()
+    assert dup_preview["existing_batch_id"] == batch_id
+    assert len(dup_preview["token"]) > 0
+    assert dup_preview["total_rows"] == 5
+
+    recommit_resp = client.post("/api/import/commit", json={"token": dup_preview["token"]})
+    assert recommit_resp.status_code == 200
+    re_data = recommit_resp.json()
+    assert re_data["replaced_batch_id"] == batch_id
+    assert re_data["imported_count"] == 5
+    batch_id = re_data["batch_id"]
 
     # 6. List batches
     batches_resp = client.get("/api/import/batches")

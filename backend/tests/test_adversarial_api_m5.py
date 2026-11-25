@@ -163,7 +163,7 @@ def test_ingest_encrypted_pdf_missing_and_wrong_password(client: TestClient):
 
 
 def test_ingest_duplicate_file_prevention_and_rollback_reuse(client: TestClient):
-    """Duplicate file upload must be rejected with 409; after rollback, the same file must be importable again."""
+    """Duplicate file upload must re-parse and replace the previous batch cleanly; after rollback, re-import also works."""
     csv_bytes = generate_synthetic_alipay_csv(rows=[
         AlipayRow(
             txn_time="2026-11-09 11:44:08",
@@ -192,26 +192,40 @@ def test_ingest_duplicate_file_prevention_and_rollback_reuse(client: TestClient)
     assert resp_commit.status_code == 200
     batch_id = resp_commit.json()["batch_id"]
 
-    # 2. Re-uploading the exact same file must return 409 IMPORT_DUPLICATE_FILE
+    # 2. Re-uploading the exact same file re-parses and atomically replaces the existing batch
     resp_dup = client.post(
         "/api/import/preview",
         files={"file": ("alipay_dup.csv", csv_bytes, "text/csv")},
     )
-    assert resp_dup.status_code == 409
+    assert resp_dup.status_code == 200
     data_dup = resp_dup.json()
-    assert data_dup["code"] == "IMPORT_DUPLICATE_FILE"
-    assert data_dup["details"]["existing_batch_id"] == batch_id
+    assert data_dup["existing_batch_id"] == batch_id
+    assert len(data_dup["token"]) > 0
 
-    # 3. Roll back the batch
-    resp_del = client.delete(f"/api/import/batches/{batch_id}")
+    resp_recommit = client.post("/api/import/commit", json={"token": data_dup["token"]})
+    assert resp_recommit.status_code == 200
+    re_commit_data = resp_recommit.json()
+    assert re_commit_data["replaced_batch_id"] == batch_id
+    assert re_commit_data["imported_count"] == 1
+    new_batch_id = re_commit_data["batch_id"]
+    assert new_batch_id != batch_id
+
+    # Verify DB contains only the freshly replaced single transaction (no duplicate bloat)
+    txns_resp = client.get("/api/transactions")
+    assert txns_resp.status_code == 200
+    assert txns_resp.json()["total"] == 1
+
+    # 3. Roll back the replaced batch
+    resp_del = client.delete(f"/api/import/batches/{new_batch_id}")
     assert resp_del.status_code == 200
 
-    # 4. Previewing the same file again must now succeed
+    # 4. Previewing the same file again must now succeed as a fresh batch
     resp_retry = client.post(
         "/api/import/preview",
         files={"file": ("alipay_dup.csv", csv_bytes, "text/csv")},
     )
     assert resp_retry.status_code == 200
+    assert resp_retry.json()["existing_batch_id"] is None
     assert len(resp_retry.json()["token"]) > 0
 
 

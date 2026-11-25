@@ -45,13 +45,15 @@ class BOCDebitImporter(Importer):
         try:
             with open_pdf_document(probe) as doc:
                 first_page_text = doc[0].get_text() if len(doc) > 0 else ""
+                if ("信用卡" in first_page_text or "贷记卡" in first_page_text) and "借记卡" not in first_page_text:
+                    return 0.0
                 if "中国银行交易流水明细清单" in first_page_text:
                     return 1.0
                 if "中国银行" in first_page_text and "借记卡号" in first_page_text:
                     return 0.95
                 if "中国银行" in first_page_text:
                     return 0.8
-                return 0.5 if has_boc_hint else 0.0
+                return 0.0
         except PDFPasswordRequiredError:
             return 0.85 if has_boc_hint else 0.2
         except Exception:

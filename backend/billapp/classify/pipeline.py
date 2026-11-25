@@ -11,6 +11,7 @@ Key Invariants:
 
 from __future__ import annotations
 
+import inspect
 import logging
 import sqlite3
 from dataclasses import dataclass, field
@@ -104,15 +105,18 @@ class ClassificationPipeline:
         self.llm_client = llm_client
         self.key_to_id: Dict[str, int] = {}
         self.id_to_key: Dict[int, str] = {}
+        self.id_to_direction: Dict[int, str] = {}
 
         # 1. Build category key mapping
         if self.conn:
             if auto_init_builtins:
                 CategoryService.init_builtin_categories(self.conn)
-            rows = self.conn.execute("SELECT id, key FROM categories WHERE key IS NOT NULL").fetchall()
+            rows = self.conn.execute("SELECT id, key, direction FROM categories").fetchall()
             for r in rows:
-                self.key_to_id[r[1]] = r[0]
-                self.id_to_key[r[0]] = r[1]
+                if r[1] is not None:
+                    self.key_to_id[r[1]] = r[0]
+                    self.id_to_key[r[0]] = r[1]
+                self.id_to_direction[r[0]] = r[2]
 
         # 2. Load builtin rules
         if builtin_rules is not None:
@@ -163,6 +167,16 @@ class ClassificationPipeline:
             )
         self.user_rules = rules
 
+    def _is_direction_compatible(self, txn: Any, category_id: Optional[int]) -> bool:
+        """Ensure expense/income transactions are never assigned opposite-direction categories."""
+        if category_id is None:
+            return True
+        txn_dir = _get_val(txn, "direction")
+        if txn_dir not in ("expense", "income"):
+            return True
+        cat_dir = self.id_to_direction.get(category_id)
+        return cat_dir is None or txn_dir == cat_dir
+
     def classify_transaction(
         self,
         txn: Any,
@@ -207,7 +221,7 @@ class ClassificationPipeline:
         # Stage 3: builtin_rule
         # -------------------------------------------------------------
         for rule in self.builtin_rules:
-            if rule_matches(rule, txn):
+            if rule_matches(rule, txn) and self._is_direction_compatible(txn, rule.category_id):
                 rule.hit_count += 1
                 return ClassificationResult(
                     category_id=rule.category_id,
@@ -231,7 +245,7 @@ class ClassificationPipeline:
             if mapping:
                 target_key, conf = mapping
                 target_id = self.key_to_id.get(target_key)
-                if target_id is not None and conf >= 0.70:
+                if target_id is not None and conf >= 0.70 and self._is_direction_compatible(txn, target_id):
                     return ClassificationResult(
                         category_id=target_id,
                         source="platform",
@@ -255,7 +269,12 @@ class ClassificationPipeline:
                     self.key_to_id,
                     holder_name=holders or None,
                 )
-                if llm_res and llm_res[0].category_id is not None and llm_res[0].confidence >= 0.70:
+                if (
+                    llm_res
+                    and llm_res[0].category_id is not None
+                    and llm_res[0].confidence >= 0.70
+                    and self._is_direction_compatible(txn, llm_res[0].category_id)
+                ):
                     res = llm_res[0]
                     res.category_key = self.id_to_key.get(res.category_id)
                     return res
@@ -279,6 +298,7 @@ class ClassificationPipeline:
         transactions: List[Any],
         force_reclassify: bool = False,
         update_db: bool = False,
+        auto_commit: bool = True,
     ) -> Tuple[List[ClassificationResult], ClassificationSummary]:
         """Classify a batch of transactions and optionally update DB."""
         results: List[ClassificationResult] = []
@@ -289,10 +309,21 @@ class ClassificationPipeline:
 
         for idx, txn in enumerate(transactions):
             # Evaluate Stages 1-4 first
-            res = self._classify_stages_1_to_4(txn, force_reclassify)
+            res = self._classify_stages_1_to_4(txn, force_reclassify, update_hit_count=update_db)
             if res is not None:
                 results.append(res)
                 self._tally_summary(summary, res.source)
+            elif _get_val(txn, "duplicate_of") is not None or _get_val(txn, "direction") == "neutral":
+                # Do not spend LLM tokens classifying suppressed duplicates or neutral rows
+                results.append(
+                    ClassificationResult(
+                        category_id=None,
+                        source="none",
+                        confidence=0.0,
+                        reason="Unclassified",
+                    )
+                )
+                self._tally_summary(summary, "none")
             else:
                 # Needs stage 5 (LLM) or stage 6
                 results.append(
@@ -312,17 +343,53 @@ class ClassificationPipeline:
                 from billapp.llm.tasks import classify_fallback_sync
                 holders = collect_known_holder_names(self.conn)
                 pending_txns = [transactions[i] for i in pending_llm_indices]
+
+                extra_kwargs: Dict[str, Any] = {
+                    "holder_name": holders or None,
+                }
+                if self.conn is not None:
+                    all_categories = CategoryService.list_all(self.conn)
+                    name_to_id = {c.name: c.id for c in all_categories if c.name}
+                    cat_tree = CategoryService.get_tree(self.conn)
+                    live_taxonomy = [
+                        {
+                            "key": r.key or str(r.id),
+                            "name": r.name,
+                            "direction": r.direction,
+                            "subcategories": [
+                                {"key": c.key or str(c.id), "name": c.name}
+                                for c in r.children
+                            ],
+                        }
+                        for r in cat_tree
+                    ]
+                    if live_taxonomy:
+                        extra_kwargs["taxonomy"] = live_taxonomy
+                    if name_to_id:
+                        extra_kwargs["name_to_id"] = name_to_id
+
+                sig = inspect.signature(classify_fallback_sync)
+                accepts_var_kw = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                )
+                if not accepts_var_kw:
+                    extra_kwargs = {k: v for k, v in extra_kwargs.items() if k in sig.parameters}
+
                 llm_results = classify_fallback_sync(
                     pending_txns,
                     self.llm_client,
                     self.key_to_id,
-                    holder_name=holders or None,
+                    **extra_kwargs,
                 )
 
                 for sub_idx, orig_idx in enumerate(pending_llm_indices):
                     if sub_idx < len(llm_results):
                         l_res = llm_results[sub_idx]
-                        if l_res.category_id is not None and l_res.confidence >= 0.70:
+                        if (
+                            l_res.category_id is not None
+                            and l_res.confidence >= 0.70
+                            and self._is_direction_compatible(transactions[orig_idx], l_res.category_id)
+                        ):
                             l_res.category_key = self.id_to_key.get(l_res.category_id)
                             results[orig_idx] = l_res
                             self._tally_summary(summary, "llm")
@@ -368,7 +435,8 @@ class ClassificationPipeline:
                         """,
                         (res.category_id, res.source, res.confidence, txn_id),
                     )
-            self.conn.commit()
+            if auto_commit:
+                self.conn.commit()
 
         return results, summary
 
@@ -376,6 +444,7 @@ class ClassificationPipeline:
         self,
         txn: Any,
         force_reclassify: bool,
+        update_hit_count: bool = True,
     ) -> Optional[ClassificationResult]:
         """Evaluate Stages 1 to 4; return None if candidate needs Stage 5/6."""
         # Stage 1: manual
@@ -394,9 +463,10 @@ class ClassificationPipeline:
         # Stage 2: user_rule
         for rule in self.user_rules:
             if rule_matches(rule, txn):
-                rule.hit_count += 1
-                if self.conn and rule.id:
-                    self.conn.execute("UPDATE rules SET hit_count = hit_count + 1 WHERE id = ?", (rule.id,))
+                if update_hit_count:
+                    rule.hit_count += 1
+                    if self.conn and rule.id:
+                        self.conn.execute("UPDATE rules SET hit_count = hit_count + 1 WHERE id = ?", (rule.id,))
                 return ClassificationResult(
                     category_id=rule.category_id,
                     source="user_rule",
@@ -408,8 +478,9 @@ class ClassificationPipeline:
 
         # Stage 3: builtin_rule
         for rule in self.builtin_rules:
-            if rule_matches(rule, txn):
-                rule.hit_count += 1
+            if rule_matches(rule, txn) and self._is_direction_compatible(txn, rule.category_id):
+                if update_hit_count:
+                    rule.hit_count += 1
                 return ClassificationResult(
                     category_id=rule.category_id,
                     source="builtin_rule",
@@ -429,7 +500,7 @@ class ClassificationPipeline:
             if mapping:
                 target_key, conf = mapping
                 target_id = self.key_to_id.get(target_key)
-                if target_id is not None and conf >= 0.70:
+                if target_id is not None and conf >= 0.70 and self._is_direction_compatible(txn, target_id):
                     return ClassificationResult(
                         category_id=target_id,
                         source="platform",

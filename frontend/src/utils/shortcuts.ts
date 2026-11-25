@@ -39,7 +39,7 @@ export function setupGlobalShortcuts(router: Router, handlers: ShortcutHandlers 
         handlers.onSearch?.();
         return;
       }
-      if (e.key.toLowerCase() === 'i') {
+      if (e.key.toLowerCase() === 'i' && !e.shiftKey && !e.altKey) {
         e.preventDefault();
         router.push('/import');
         return;
@@ -49,9 +49,9 @@ export function setupGlobalShortcuts(router: Router, handlers: ShortcutHandlers 
         router.push('/settings');
         return;
       }
-      if (e.key.toLowerCase() === 'z') {
+      if (e.key.toLowerCase() === 'z' && !e.shiftKey && !e.altKey && handlers.onUndo) {
         e.preventDefault();
-        handlers.onUndo?.();
+        handlers.onUndo();
         return;
       }
 

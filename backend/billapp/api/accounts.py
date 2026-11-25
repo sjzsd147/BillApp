@@ -36,8 +36,8 @@ class AccountOut(BaseModel):
 
 
 class AccountUpdateRequest(BaseModel):
-    alias: Optional[str] = Field(None, min_length=1, max_length=50)
-    holder: Optional[str] = Field(None, min_length=1, max_length=50)
+    alias: Optional[str] = Field(None, max_length=50)
+    holder: Optional[str] = Field(None, max_length=50)
 
 
 class AccountMergeRequest(BaseModel):
@@ -66,20 +66,24 @@ def list_accounts(
             (SELECT COUNT(*) FROM transactions WHERE account_id = a.id) AS txn_count,
             (SELECT COUNT(*) FROM transactions WHERE fund_account_id = a.id) AS funded_count,
             COALESCE((
-                SELECT SUM(CASE 
-                    WHEN direction = 'income' THEN COALESCE(amount_cny, amount_cents)
-                    WHEN direction = 'expense' THEN CASE
-                        WHEN fx_rate IS NOT NULL AND currency != 'CNY' THEN -ROUND((amount_cents - refunded_cents) * fx_rate)
-                        ELSE -(COALESCE(amount_cny, amount_cents) - refunded_cents)
+                SELECT SUM(CASE
+                    WHEN t.direction = 'income' THEN COALESCE(t.amount_cny, t.amount_cents)
+                    WHEN t.direction = 'refund' AND t.refund_of IS NULL THEN COALESCE(t.amount_cny, t.amount_cents)
+                    WHEN t.direction = 'expense' THEN CASE
+                        WHEN t.fx_rate IS NOT NULL AND t.currency != 'CNY' THEN -ROUND((t.amount_cents - t.refunded_cents) * t.fx_rate)
+                        ELSE -(COALESCE(t.amount_cny, t.amount_cents) - t.refunded_cents)
                     END
-                    ELSE 0 
+                    ELSE 0
                 END)
-                FROM transactions
-                WHERE account_id = a.id
-                  AND duplicate_of IS NULL
-                  AND excluded = 0
-                  AND transfer_peer IS NULL
-                  AND (currency = 'CNY' OR currency IS NULL OR amount_cny IS NOT NULL)
+                FROM transactions t
+                LEFT JOIN categories c ON t.category_id = c.id
+                WHERE t.account_id = a.id
+                  AND t.duplicate_of IS NULL
+                  AND t.excluded = 0
+                  AND t.transfer_peer IS NULL
+                  AND (c.key IS NULL OR c.key != 'financial.internal_transfer')
+                  AND (c.name IS NULL OR c.name NOT IN ('内部转账', '资金互转'))
+                  AND (t.currency = 'CNY' OR t.currency IS NULL OR t.amount_cny IS NOT NULL)
             ), 0) AS computed_balance_cents,
             (SELECT MIN(txn_time) FROM transactions WHERE account_id = a.id) AS first_txn_time,
             (SELECT MAX(txn_time) FROM transactions WHERE account_id = a.id) AS last_txn_time
@@ -122,12 +126,14 @@ def _update_account_record(account_id: int, payload: AccountUpdateRequest, db: s
     update_fields = []
     update_vals: List[Any] = []
 
-    if payload.alias is not None:
+    if "alias" in payload.model_fields_set:
+        clean_alias = (payload.alias or "").strip() or None
         update_fields.append("alias = ?")
-        update_vals.append(payload.alias)
-    if payload.holder is not None:
+        update_vals.append(clean_alias)
+    if "holder" in payload.model_fields_set:
+        clean_holder = (payload.holder or "").strip() or None
         update_fields.append("holder = ?")
-        update_vals.append(payload.holder)
+        update_vals.append(clean_holder)
 
     if update_fields:
         update_vals.append(account_id)

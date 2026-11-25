@@ -34,11 +34,12 @@ apiClient.interceptors.response.use(
 
     // Suppress noisy UI error toasts for silent background checks if requested
     const config = error.config as (AxiosRequestConfig & { silent?: boolean }) | undefined;
-    if (!config?.silent) {
+    const toasted = !config?.silent;
+    if (toasted) {
       ElMessage.error(message);
     }
 
-    return Promise.reject({ code, message, original: error });
+    return Promise.reject({ code, message, original: error, toasted });
   }
 );
 

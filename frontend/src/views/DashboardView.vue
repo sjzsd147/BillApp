@@ -36,7 +36,7 @@
             v-for="acc in appStore.accounts"
             :key="acc.id"
             :value="acc.id"
-            :label="`${acc.bank}${acc.tail ? ` (${acc.tail})` : ''}`"
+            :label="acc.alias || `${acc.bank}${acc.tail ? ` (${acc.tail})` : ''}`"
           />
         </el-select>
 
@@ -97,10 +97,10 @@
           />
         </div>
         <div class="kpi-footnote">
-          <span v-if="incomeMoM !== null" :class="incomeMoM >= 0 ? 'mom-up' : 'mom-down'">
+          <span v-if="incomeMoM !== null" :class="incomeMoM >= 0 ? 'mom-good' : 'mom-bad'">
             {{ incomeMoM >= 0 ? '↑' : '↓' }} {{ Math.abs(incomeMoM) }}% 较上期
           </span>
-          <span v-else class="text-sub">较上期</span>
+          <span v-else class="text-sub">无上期对比</span>
           <span class="text-sub">· 收入 {{ summary?.income_count ?? 0 }} 笔</span>
         </div>
       </div>
@@ -198,7 +198,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, watch, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { Refresh, InfoFilled, WarningFilled } from '@element-plus/icons-vue';
 import { useAppStore } from '@/stores/app';
@@ -231,6 +231,12 @@ const includeTransfer = ref(false);
 
 const summary = ref<StatsSummary | null>(null);
 const merchantItems = ref<MerchantRankItem[]>([]);
+const lastChartPayloads = {
+  trend: null as TrendItem[] | null,
+  category: null as any,
+  account: null as any,
+  heatmap: null as any,
+};
 
 // Chart Container Refs
 const trendChartRef = ref<HTMLElement | null>(null);
@@ -274,7 +280,10 @@ function handleTimePresetChange() {
   }
 }
 
+let dashboardFetchSeq = 0;
+
 async function fetchDashboardData() {
+  const seq = ++dashboardFetchSeq;
   loading.value = true;
   const [from, to] = dateFilter.value;
   const params: Record<string, any> = {
@@ -296,21 +305,32 @@ async function fetchDashboardData() {
       getSpendingHeatmap({ ...params, mode: 'weekday_hour' }),
     ]);
 
+    if (seq !== dashboardFetchSeq) return;
+
     summary.value = sumData;
     merchantItems.value = merData.items;
+    lastChartPayloads.trend = trendData;
+    lastChartPayloads.category = catData;
+    lastChartPayloads.account = accData;
+    lastChartPayloads.heatmap = heatData;
 
     renderTrendChart(trendData);
     renderCategoryChart(catData);
     renderAccountChart(accData);
     renderHeatmapChart(heatData);
   } catch (e) {
-    console.error('Failed to load dashboard data', e);
+    if (seq === dashboardFetchSeq) {
+      console.error('Failed to load dashboard data', e);
+    }
   } finally {
-    loading.value = false;
+    if (seq === dashboardFetchSeq) {
+      loading.value = false;
+    }
   }
 }
 
 function renderTrendChart(trends: TrendItem[]) {
+  const masked = appStore.amountPrivacy;
   const periods = trends.map((t) => t.period);
   const expenseSeries = trends.map((t) => t.expense_cents / 100);
   const incomeSeries = trends.map((t) => t.income_cents / 100);
@@ -321,9 +341,10 @@ function renderTrendChart(trends: TrendItem[]) {
       formatter: (params: any) => {
         let str = `<div style="font-weight:600;margin-bottom:4px;">${params[0].axisValue}</div>`;
         for (const item of params) {
+          const valText = masked ? '¥••••' : `¥${Number(item.value).toFixed(2)}`;
           str += `<div style="display:flex;justify-content:space-between;gap:12px;font-size:12px;">
             <span>${item.marker} ${item.seriesName}</span>
-            <span style="font-weight:600;">¥${item.value.toFixed(2)}</span>
+            <span style="font-weight:600;">${valText}</span>
           </div>`;
         }
         return str;
@@ -350,7 +371,11 @@ function renderTrendChart(trends: TrendItem[]) {
     yAxis: {
       type: 'value',
       axisLine: { show: false },
-      axisLabel: { color: '#8B94A3', fontSize: 11 },
+      axisLabel: {
+        color: '#8B94A3',
+        fontSize: 11,
+        formatter: masked ? () => '••••' : '{value}',
+      },
       splitLine: { lineStyle: { color: '#F0F1F3', type: 'dashed' } },
     },
     series: [
@@ -374,6 +399,7 @@ function renderTrendChart(trends: TrendItem[]) {
 }
 
 function renderCategoryChart(data: any) {
+  const masked = appStore.amountPrivacy;
   const items = data.items || [];
   const pieData = items.map((c: any) => ({
     name: c.name,
@@ -383,7 +409,7 @@ function renderCategoryChart(data: any) {
   setCategoryOption({
     tooltip: {
       trigger: 'item',
-      formatter: '{b}: ¥{c} ({d}%)',
+      formatter: masked ? '{b}: ¥•••• ({d}%)' : '{b}: ¥{c} ({d}%)',
     },
     series: [
       {
@@ -410,6 +436,7 @@ function renderCategoryChart(data: any) {
 }
 
 function renderAccountChart(data: any) {
+  const masked = appStore.amountPrivacy;
   const items = data.items || [];
   const pieData = items.map((a: any) => ({
     name: a.name || '未指定账户',
@@ -419,7 +446,7 @@ function renderAccountChart(data: any) {
   setAccountOption({
     tooltip: {
       trigger: 'item',
-      formatter: '{b}: 出资 ¥{c} ({d}%)',
+      formatter: masked ? '{b}: 出资 ¥•••• ({d}%)' : '{b}: 出资 ¥{c} ({d}%)',
     },
     series: [
       {
@@ -429,7 +456,7 @@ function renderAccountChart(data: any) {
         data: pieData,
         label: {
           show: true,
-          formatter: '{b}\n¥{c}',
+          formatter: masked ? '{b}\n¥••••' : '{b}\n¥{c}',
           fontSize: 10,
           color: '#5B6472',
         },
@@ -439,6 +466,7 @@ function renderAccountChart(data: any) {
 }
 
 function renderHeatmapChart(data: any) {
+  const masked = appStore.amountPrivacy;
   const items = data.weekday_hour_items || [];
   // 7 days x 24 hours format: [hour, day, count]
   const heatData = items.map((h: any) => [h.hour, h.weekday - 1, h.expense_cents / 100]);
@@ -448,7 +476,8 @@ function renderHeatmapChart(data: any) {
   setHeatmapOption({
     tooltip: {
       position: 'top',
-      formatter: (p: any) => `${days[p.value[1]]} ${p.value[0]}:00 支出: ¥${p.value[2].toFixed(2)}`,
+      formatter: (p: any) =>
+        `${days[p.value[1]]} ${p.value[0]}:00 支出: ${masked ? '¥••••' : `¥${Number(p.value[2]).toFixed(2)}`}`,
     },
     grid: {
       top: 10,
@@ -511,6 +540,16 @@ function searchMerchant(name: string) {
     },
   });
 }
+
+watch(
+  () => appStore.amountPrivacy,
+  () => {
+    if (lastChartPayloads.trend) renderTrendChart(lastChartPayloads.trend);
+    if (lastChartPayloads.category) renderCategoryChart(lastChartPayloads.category);
+    if (lastChartPayloads.account) renderAccountChart(lastChartPayloads.account);
+    if (lastChartPayloads.heatmap) renderHeatmapChart(lastChartPayloads.heatmap);
+  }
+);
 
 onMounted(() => {
   fetchDashboardData();
@@ -624,12 +663,14 @@ onMounted(() => {
   align-items: center;
 }
 
-.mom-down {
-  color: var(--success); /* Drop in expense is green per D6 */
+.mom-down,
+.mom-good {
+  color: var(--success); /* Drop in expense / rise in income is green */
   font-weight: 600;
 }
 
-.mom-up {
+.mom-up,
+.mom-bad {
   color: var(--warning);
   font-weight: 600;
 }

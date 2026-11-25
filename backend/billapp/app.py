@@ -355,7 +355,17 @@ def create_app(
     @app.get("/api/meta", tags=["system"])
     async def get_system_meta(db: sqlite3.Connection = Depends(get_db_conn)):
         pending_review_count = db.execute(
-            "SELECT COUNT(*) FROM match_links WHERE status = 'pending'"
+            """
+            SELECT COUNT(*)
+            FROM match_links ml
+            JOIN transactions t1 ON ml.primary_id = t1.id
+            JOIN transactions t2 ON ml.secondary_id = t2.id
+            WHERE ml.status = 'pending'
+              AND (
+                (ml.kind = 'duplicate' AND t1.duplicate_of IS NULL AND t2.duplicate_of IS NULL)
+                OR (ml.kind = 'transfer' AND t1.transfer_peer IS NULL AND t2.transfer_peer IS NULL)
+              )
+            """
         ).fetchone()[0]
         categories_tree = CategoryService.get_tree(db)
         accounts_rows = db.execute("SELECT id, kind, bank, tail, alias FROM accounts").fetchall()

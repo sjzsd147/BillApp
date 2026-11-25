@@ -171,9 +171,9 @@ def build_stats_filters(
     params: List[Any] = []
 
     if start_date:
-        val = f"{start_date} 00:00:00" if len(start_date) == 10 else start_date
+        # Use raw 'YYYY-MM-DD' for 10-char dates so day-precision txn_time ('YYYY-MM-DD') is included
         clauses.append(f"{alias}.txn_time >= ?")
-        params.append(val)
+        params.append(start_date)
 
     if end_date:
         val = f"{end_date} 23:59:59" if len(end_date) == 10 else end_date
@@ -208,9 +208,9 @@ def build_fx_pending_filters(
     params: List[Any] = []
 
     if start_date:
-        val = f"{start_date} 00:00:00" if len(start_date) == 10 else start_date
+        # Use raw 'YYYY-MM-DD' for 10-char dates so day-precision txn_time ('YYYY-MM-DD') is included
         clauses.append(f"{alias}.txn_time >= ?")
-        params.append(val)
+        params.append(start_date)
 
     if end_date:
         val = f"{end_date} 23:59:59" if len(end_date) == 10 else end_date
@@ -234,6 +234,7 @@ def _calculate_previous_period_summary(
     days: int,
     account_id: Optional[int] = None,
     fund_account_id: Optional[int] = None,
+    include_transfer: bool = False,
 ) -> Optional[StatsSummaryPrev]:
     """Calculate summary for preceding period of same duration for 环比 calculation."""
     try:
@@ -246,6 +247,7 @@ def _calculate_previous_period_summary(
         where_prev, prev_params = build_stats_filters(
             prev_s_str, prev_e_str, account_id, fund_account_id, alias="t"
         )
+        transfer_cond = _transfer_filter_sql(include_transfer)
         refund_mode = get_refund_mode(conn)
         if refund_mode == "refund_month":
             sql_exp = f"""
@@ -254,9 +256,7 @@ def _calculate_previous_period_summary(
                 LEFT JOIN categories c ON t.category_id = c.id
                 WHERE {where_prev}
                   AND t.direction = 'expense'
-                  AND t.transfer_peer IS NULL
-                  AND (c.key IS NULL OR c.key != 'financial.internal_transfer')
-                  AND (c.name IS NULL OR c.name NOT IN ('内部转账', '资金互转'))
+                  {transfer_cond}
             """
             exp_row = conn.execute(sql_exp, prev_params).fetchone()
             exp_val = int(exp_row[0]) if exp_row else 0
@@ -278,9 +278,7 @@ def _calculate_previous_period_summary(
                 LEFT JOIN categories c ON t.category_id = c.id
                 WHERE {where_prev}
                   AND t.direction = 'expense'
-                  AND t.transfer_peer IS NULL
-                  AND (c.key IS NULL OR c.key != 'financial.internal_transfer')
-                  AND (c.name IS NULL OR c.name NOT IN ('内部转账', '资金互转'))
+                  {transfer_cond}
             """
             exp_row = conn.execute(sql_exp, prev_params).fetchone()
             exp_val = int(exp_row[0]) if exp_row else 0
@@ -303,9 +301,7 @@ def _calculate_previous_period_summary(
             LEFT JOIN categories c ON t.category_id = c.id
             WHERE {where_prev}
               AND t.direction = 'income'
-              AND t.transfer_peer IS NULL
-              AND (c.key IS NULL OR c.key != 'financial.internal_transfer')
-              AND (c.name IS NULL OR c.name NOT IN ('内部转账', '资金互转'))
+              {transfer_cond}
         """
         inc_row = conn.execute(sql_inc, prev_params).fetchone()
         inc_val = int(inc_row[0]) if inc_row else 0
@@ -430,21 +426,49 @@ def calculate_stats_summary(
             days = max(1, (d2 - d1).days + 1)
         except Exception:
             days = 1
+    else:
+        span_row = conn.execute(
+            f"""
+            SELECT MIN(substr(t.txn_time, 1, 10)), MAX(substr(t.txn_time, 1, 10))
+            FROM transactions t
+            LEFT JOIN categories c ON t.category_id = c.id
+            WHERE {where_base}
+              AND t.direction IN ('expense', 'income')
+              {transfer_cond}
+            """,
+            base_params,
+        ).fetchone()
+        if span_row and span_row[0] and span_row[1]:
+            try:
+                d1 = date.fromisoformat(start_date[:10]) if start_date else date.fromisoformat(span_row[0])
+                d2 = date.fromisoformat(end_date[:10]) if end_date else date.fromisoformat(span_row[1])
+                days = max(1, (d2 - d1).days + 1)
+            except Exception:
+                days = 1
     daily_average_cents = round(net_expense_cents / days) if days > 0 else 0
 
     # 5. Period Comparison (prev) for 环比
     prev = None
     if start_date and end_date:
         prev = _calculate_previous_period_summary(
-            conn, start_date, end_date, days, account_id, fund_account_id
+            conn,
+            start_date,
+            end_date,
+            days,
+            account_id,
+            fund_account_id,
+            include_transfer=include_transfer,
         )
 
-    # 6. Foreign Currency (FX) Included calculation (§8.2)
+    # 6. Foreign Currency (FX) Included calculation (§8.2) — exclude neutral & internal transfers
     sql_fx_inc = f"""
         SELECT COUNT(*) AS cnt,
-               COALESCE(SUM({SQL_CNY_AMOUNT}), 0) AS sum_cny
+               COALESCE(SUM(CASE WHEN t.direction = 'expense' THEN {SQL_CNY_NET_EXPENSE} ELSE {SQL_CNY_AMOUNT} END), 0) AS sum_cny
         FROM transactions t
+        LEFT JOIN categories c ON t.category_id = c.id
         WHERE {where_base}
+          AND t.direction IN ('expense', 'income')
+          {transfer_cond}
           AND t.currency IS NOT NULL
           AND t.currency != 'CNY'
           AND t.amount_cny IS NOT NULL
@@ -462,7 +486,10 @@ def calculate_stats_summary(
                COUNT(*) AS cnt,
                COALESCE(SUM(t.amount_cents), 0) AS sum_cents
         FROM transactions t
+        LEFT JOIN categories c ON t.category_id = c.id
         WHERE {where_fx}
+          AND t.direction IN ('expense', 'income')
+          {transfer_cond}
         GROUP BY t.currency
         ORDER BY t.currency ASC
     """
@@ -644,11 +671,15 @@ def calculate_stats_category(
         (direction,),
     ).fetchall()
 
-    # 2. Query transactions grouped by category_id
+    # 2. Query transactions grouped by category_id (respecting refund_mode & unlinked refunds)
+    refund_mode = get_refund_mode(conn)
+    refund_deduct_rows: List[sqlite3.Row] = []
+
     if direction == "expense":
+        exp_expr = SQL_CNY_AMOUNT if refund_mode == "refund_month" else SQL_CNY_NET_EXPENSE
         sql_cat = f"""
             SELECT t.category_id,
-                   COALESCE(SUM({SQL_CNY_NET_EXPENSE}), 0) AS net_cents,
+                   COALESCE(SUM({exp_expr}), 0) AS net_cents,
                    COUNT(*) AS txn_count
             FROM transactions t
             LEFT JOIN categories c ON t.category_id = c.id
@@ -657,6 +688,28 @@ def calculate_stats_category(
               {transfer_cond}
             GROUP BY t.category_id
         """
+        if refund_mode == "refund_month":
+            sql_ref_cat = f"""
+                SELECT COALESCE(orig.category_id, t.category_id) AS category_id,
+                       COALESCE(SUM({SQL_CNY_AMOUNT}), 0) AS ref_cents
+                FROM transactions t
+                LEFT JOIN transactions orig ON t.refund_of = orig.id
+                WHERE {where_base}
+                  AND t.direction = 'refund'
+                GROUP BY COALESCE(orig.category_id, t.category_id)
+            """
+            refund_deduct_rows = conn.execute(sql_ref_cat, base_params).fetchall()
+        else:
+            sql_ref_cat = f"""
+                SELECT t.category_id AS category_id,
+                       COALESCE(SUM({SQL_CNY_AMOUNT}), 0) AS ref_cents
+                FROM transactions t
+                WHERE {where_base}
+                  AND t.direction = 'refund'
+                  AND t.refund_of IS NULL
+                GROUP BY t.category_id
+            """
+            refund_deduct_rows = conn.execute(sql_ref_cat, base_params).fetchall()
     else:
         sql_cat = f"""
             SELECT t.category_id,
@@ -672,10 +725,11 @@ def calculate_stats_category(
 
     cat_txn_rows = conn.execute(sql_cat, base_params).fetchall()
 
-    # 3. Accumulate amounts into 2-tier tree
+    # 3. Accumulate amounts into 2-tier tree (keep root direct_cents separate from sub_nodes)
     root_nodes: Dict[int, Dict[str, Any]] = {}
     sub_nodes: Dict[int, Dict[str, Any]] = {}
     unclassified_cents = 0
+    unallocated_refund_cents = 0
 
     for r in cat_rows:
         if r["parent_id"] is None:
@@ -683,6 +737,7 @@ def calculate_stats_category(
                 "id": r["id"],
                 "key": r["key"],
                 "name": r["name"],
+                "direct_cents": 0,
                 "amount_cents": 0,
                 "color": r["color"],
                 "icon": r["icon"],
@@ -701,41 +756,124 @@ def calculate_stats_category(
                 "sort_order": r["sort_order"],
             }
 
-    for row in cat_txn_rows:
-        cid = row["category_id"]
-        cents = int(row["net_cents"])
-
+    def _apply_delta(cid: Optional[int], delta_cents: int, is_refund: bool = False) -> None:
+        nonlocal unclassified_cents, unallocated_refund_cents
         if cid is None:
-            unclassified_cents += cents
+            if is_refund:
+                unallocated_refund_cents += -delta_cents
+            else:
+                unclassified_cents += delta_cents
         elif cid in sub_nodes:
-            sub = sub_nodes[cid]
-            sub["amount_cents"] += cents
+            sub_nodes[cid]["amount_cents"] += delta_cents
+        elif cid in root_nodes:
+            root_nodes[cid]["direct_cents"] += delta_cents
+        else:
+            if is_refund:
+                # Unlinked refund auto-tagged with an income/other category (e.g. reimbursement.refund)
+                unallocated_refund_cents += -delta_cents
+            else:
+                # Preserve cross-direction or orphaned categories under unclassified instead of dropping
+                unclassified_cents += delta_cents
+
+    for row in cat_txn_rows:
+        _apply_delta(row["category_id"], int(row["net_cents"]), is_refund=False)
+
+    for rrow in refund_deduct_rows:
+        _apply_delta(rrow["category_id"], -int(rrow["ref_cents"]), is_refund=True)
+
+    # Clamp negative leaves BEFORE rolling up to parents so a child NEVER exceeds its parent or 100%.
+    # Any negative remainder on a subcategory first reduces its own parent root proportionally,
+    # and any overflow beyond that root flows into unallocated_refund_cents to keep total_cents == summary.
+    parent_excess_refund: Dict[int, int] = {}
+    for sub in sub_nodes.values():
+        if sub["amount_cents"] < 0:
+            excess = -sub["amount_cents"]
             p_id = sub["parent_id"]
             if p_id in root_nodes:
-                root_nodes[p_id]["amount_cents"] += cents
-        elif cid in root_nodes:
-            root_nodes[cid]["amount_cents"] += cents
+                parent_excess_refund[p_id] = parent_excess_refund.get(p_id, 0) + excess
+            else:
+                unallocated_refund_cents += excess
+            sub["amount_cents"] = 0
+    for root_id, root in root_nodes.items():
+        if root["direct_cents"] < 0:
+            parent_excess_refund[root_id] = parent_excess_refund.get(root_id, 0) + (-root["direct_cents"])
+            root["direct_cents"] = 0
+        root["amount_cents"] = root["direct_cents"]
 
-    # Attach children to roots
     for sub in sub_nodes.values():
         if sub["amount_cents"] > 0:
             p_id = sub["parent_id"]
             if p_id in root_nodes:
                 root_nodes[p_id]["children"].append(sub)
+                root_nodes[p_id]["amount_cents"] += sub["amount_cents"]
+            else:
+                unclassified_cents += sub["amount_cents"]
 
+    def _scale_root_amount(root: Dict[str, Any], new_amt: int) -> None:
+        old_amt = root["amount_cents"]
+        root["amount_cents"] = new_amt
+        if root["children"] and old_amt > 0:
+            ratio = new_amt / old_amt
+            child_budget = new_amt
+            for sub in root["children"]:
+                sub["amount_cents"] = min(child_budget, round(sub["amount_cents"] * ratio))
+                child_budget -= sub["amount_cents"]
+            root["children"] = [s for s in root["children"] if s["amount_cents"] > 0]
+
+    for root_id, excess in parent_excess_refund.items():
+        root = root_nodes.get(root_id)
+        if not root or excess <= 0:
+            continue
+        if excess >= root["amount_cents"]:
+            unallocated_refund_cents += excess - root["amount_cents"]
+            _scale_root_amount(root, 0)
+        else:
+            _scale_root_amount(root, root["amount_cents"] - excess)
+
+    if unclassified_cents < 0:
+        unallocated_refund_cents += -unclassified_cents
+        unclassified_cents = 0
+
+    # Apply unallocated expense refunds proportionally so total_cents stays consistent with summary
+    # while keeping every category & child slice non-negative and child <= parent.
     active_roots = [r for r in root_nodes.values() if r["amount_cents"] > 0]
-    total_cents = sum(r["amount_cents"] for r in active_roots) + unclassified_cents
-
     if unclassified_cents > 0:
         active_roots.append({
             "id": None,
             "key": "unclassified",
             "name": "未分类",
+            "direct_cents": unclassified_cents,
             "amount_cents": unclassified_cents,
             "color": "#94A3B8",
             "icon": "QuestionFilled",
             "children": [],
         })
+
+    gross_total = sum(r["amount_cents"] for r in active_roots)
+    if unallocated_refund_cents > 0 and gross_total > 0:
+        if unallocated_refund_cents >= gross_total:
+            active_roots = []
+        else:
+            remaining_deduct = unallocated_refund_cents
+            for idx, root in enumerate(active_roots):
+                old_amt = root["amount_cents"]
+                if idx == len(active_roots) - 1:
+                    deduct = min(old_amt, remaining_deduct)
+                else:
+                    deduct = min(old_amt, remaining_deduct, round(unallocated_refund_cents * old_amt / gross_total))
+                remaining_deduct -= deduct
+                _scale_root_amount(root, max(0, old_amt - deduct))
+            # Absorb any residual cents due to rounding
+            for root in active_roots:
+                if remaining_deduct <= 0:
+                    break
+                if root["amount_cents"] > 0:
+                    deduct = min(root["amount_cents"], remaining_deduct)
+                    remaining_deduct -= deduct
+                    _scale_root_amount(root, root["amount_cents"] - deduct)
+            active_roots = [r for r in active_roots if r["amount_cents"] > 0]
+
+    total_cents = sum(r["amount_cents"] for r in active_roots)
 
     # Calculate percentages
     for root in active_roots:
@@ -767,10 +905,12 @@ def calculate_stats_merchant(
         start_date, end_date, account_id, fund_account_id, alias="t"
     )
     transfer_cond = _transfer_filter_sql(include_transfer)
+    refund_mode = get_refund_mode(conn)
+    exp_expr = SQL_CNY_AMOUNT if refund_mode == "refund_month" else SQL_CNY_NET_EXPENSE
 
     sql = f"""
         SELECT COALESCE(NULLIF(t.merchant_norm, ''), NULLIF(t.counterparty, ''), '其他') AS merchant_name,
-               COALESCE(SUM({SQL_CNY_NET_EXPENSE}), 0) AS expense_cents,
+               COALESCE(SUM({exp_expr}), 0) AS expense_cents,
                COUNT(*) AS txn_count
         FROM transactions t
         LEFT JOIN categories c ON t.category_id = c.id
@@ -781,25 +921,45 @@ def calculate_stats_merchant(
         ORDER BY expense_cents DESC
     """
     rows = conn.execute(sql, base_params).fetchall()
-    total_expense = sum(int(r["expense_cents"]) for r in rows)
 
-    top_rows = rows[:limit]
-    tail_rows = rows[limit:]
+    ref_cond = "" if refund_mode == "refund_month" else "AND t.refund_of IS NULL"
+    sql_ref = f"""
+        SELECT COALESCE(NULLIF(t.merchant_norm, ''), NULLIF(t.counterparty, ''), '其他') AS merchant_name,
+               COALESCE(SUM({SQL_CNY_AMOUNT}), 0) AS ref_cents
+        FROM transactions t
+        WHERE {where_base}
+          AND t.direction = 'refund'
+          {ref_cond}
+        GROUP BY merchant_name
+    """
+    ref_map = {r["merchant_name"]: int(r["ref_cents"]) for r in conn.execute(sql_ref, base_params).fetchall()}
+
+    merged: List[Tuple[str, int, int]] = []
+    for r in rows:
+        m_name = r["merchant_name"]
+        net_c = max(0, int(r["expense_cents"]) - ref_map.get(m_name, 0))
+        if net_c > 0:
+            merged.append((m_name, net_c, int(r["txn_count"])))
+
+    merged.sort(key=lambda item: item[1], reverse=True)
+    total_expense = sum(item[1] for item in merged)
+
+    top_rows = merged[:limit]
+    tail_rows = merged[limit:]
 
     items: List[MerchantRankItem] = []
-    for r in top_rows:
-        cents = int(r["expense_cents"])
+    for m_name, cents, cnt in top_rows:
         items.append(
             MerchantRankItem(
-                merchant=r["merchant_name"],
+                merchant=m_name,
                 expense_cents=cents,
-                transaction_count=int(r["txn_count"]),
+                transaction_count=cnt,
                 percentage=round((cents / total_expense) * 100.0, 2) if total_expense > 0 else 0.0,
             )
         )
 
-    other_cents = sum(int(r["expense_cents"]) for r in tail_rows)
-    other_count = sum(int(r["txn_count"]) for r in tail_rows)
+    other_cents = sum(item[1] for item in tail_rows)
+    other_count = sum(item[2] for item in tail_rows)
 
     return MerchantStatsResponse(
         total_expense_cents=total_expense,
@@ -821,15 +981,21 @@ def calculate_stats_heatmap(
 ) -> HeatmapResponse:
     """Calculate expense heatmap: daily calendar or 7x24 weekday-hour."""
     transfer_cond = _transfer_filter_sql(include_transfer)
+    refund_mode = get_refund_mode(conn)
+    exp_expr = SQL_CNY_AMOUNT if refund_mode == "refund_month" else SQL_CNY_NET_EXPENSE
+    ref_cond = "" if refund_mode == "refund_month" else "AND t.refund_of IS NULL"
+
     if mode == "weekday_hour":
+        eff_start = start_date or (f"{year}-01-01" if year is not None else None)
+        eff_end = end_date or (f"{year}-12-31" if year is not None else None)
         where_base, base_params = build_stats_filters(
-            start_date, end_date, account_id, fund_account_id, alias="t"
+            eff_start, eff_end, account_id, fund_account_id, alias="t"
         )
         # Exclude date-only precision per Frontend §6.5.9
         sql = f"""
             SELECT CAST(strftime('%w', t.txn_time) AS INT) AS wday_raw,
                    CAST(strftime('%H', t.txn_time) AS INT) AS hour_num,
-                   COALESCE(SUM({SQL_CNY_NET_EXPENSE}), 0) AS expense_cents,
+                   COALESCE(SUM({exp_expr}), 0) AS expense_cents,
                    COUNT(*) AS txn_count
             FROM transactions t
             LEFT JOIN categories c ON t.category_id = c.id
@@ -840,18 +1006,42 @@ def calculate_stats_heatmap(
             GROUP BY wday_raw, hour_num
         """
         rows = conn.execute(sql, base_params).fetchall()
+        ref_rows = conn.execute(
+            f"""
+            SELECT CAST(strftime('%w', t.txn_time) AS INT) AS wday_raw,
+                   CAST(strftime('%H', t.txn_time) AS INT) AS hour_num,
+                   COALESCE(SUM({SQL_CNY_AMOUNT}), 0) AS ref_cents
+            FROM transactions t
+            WHERE {where_base}
+              AND t.direction = 'refund'
+              AND t.time_precision != 'day'
+              {ref_cond}
+            GROUP BY wday_raw, hour_num
+            """,
+            base_params,
+        ).fetchall()
+        ref_wh_map = {
+            (r["wday_raw"], int(r["hour_num"])): int(r["ref_cents"])
+            for r in ref_rows
+            if r["wday_raw"] is not None and r["hour_num"] is not None
+        }
+
         wh_items: List[WeekdayHourHeatmapItem] = []
         for r in rows:
+            if r["wday_raw"] is None or r["hour_num"] is None:
+                continue
             wday = 7 if r["wday_raw"] == 0 else r["wday_raw"]
+            hour_num = int(r["hour_num"])
+            net_c = max(0, int(r["expense_cents"]) - ref_wh_map.get((r["wday_raw"], hour_num), 0))
             wh_items.append(
                 WeekdayHourHeatmapItem(
                     weekday=wday,
-                    hour=int(r["hour_num"]),
-                    expense_cents=int(r["expense_cents"]),
+                    hour=hour_num,
+                    expense_cents=net_c,
                     count=int(r["txn_count"]),
                 )
             )
-        return HeatmapResponse(mode="weekday_hour", weekday_hour_items=wh_items)
+        return HeatmapResponse(mode="weekday_hour", year=year, weekday_hour_items=wh_items)
 
     # Calendar mode
     target_year = year or datetime.now().year
@@ -864,7 +1054,7 @@ def calculate_stats_heatmap(
 
     sql = f"""
         SELECT strftime('%Y-%m-%d', t.txn_time) AS date_str,
-               COALESCE(SUM({SQL_CNY_NET_EXPENSE}), 0) AS expense_cents,
+               COALESCE(SUM({exp_expr}), 0) AS expense_cents,
                COUNT(*) AS txn_count
         FROM transactions t
         LEFT JOIN categories c ON t.category_id = c.id
@@ -875,13 +1065,28 @@ def calculate_stats_heatmap(
         ORDER BY date_str ASC
     """
     rows = conn.execute(sql, base_params).fetchall()
+    ref_rows = conn.execute(
+        f"""
+        SELECT strftime('%Y-%m-%d', t.txn_time) AS date_str,
+               COALESCE(SUM({SQL_CNY_AMOUNT}), 0) AS ref_cents
+        FROM transactions t
+        WHERE {where_base}
+          AND t.direction = 'refund'
+          {ref_cond}
+        GROUP BY date_str
+        """,
+        base_params,
+    ).fetchall()
+    ref_cal_map = {r["date_str"]: int(r["ref_cents"]) for r in ref_rows if r["date_str"]}
+
     cal_items = [
         HeatmapItem(
             date=r["date_str"],
-            expense_cents=int(r["expense_cents"]),
+            expense_cents=max(0, int(r["expense_cents"]) - ref_cal_map.get(r["date_str"], 0)),
             count=int(r["txn_count"]),
         )
         for r in rows
+        if r["date_str"]
     ]
     return HeatmapResponse(mode="calendar", year=target_year, calendar_items=cal_items)
 
@@ -898,14 +1103,22 @@ def calculate_stats_account(
         start_date, end_date, alias="t"
     )
     transfer_cond = _transfer_filter_sql(include_transfer)
+    refund_mode = get_refund_mode(conn)
+    exp_expr = SQL_CNY_AMOUNT if refund_mode == "refund_month" else SQL_CNY_NET_EXPENSE
+    ref_case = (
+        f"CASE WHEN t.direction = 'refund' THEN {SQL_CNY_AMOUNT} ELSE 0 END"
+        if refund_mode == "refund_month"
+        else f"CASE WHEN t.direction = 'refund' AND t.refund_of IS NULL THEN {SQL_CNY_AMOUNT} ELSE 0 END"
+    )
 
     target_col = "t.fund_account_id" if by == "fund_account" else "t.account_id"
 
     sql = f"""
         SELECT COALESCE({target_col}, t.account_id) AS effective_acc_id,
-               COALESCE(SUM(CASE WHEN t.direction = 'expense' THEN {SQL_CNY_NET_EXPENSE} ELSE 0 END), 0) AS total_out,
+               COALESCE(SUM(CASE WHEN t.direction = 'expense' THEN {exp_expr} ELSE 0 END), 0) AS gross_out,
+               COALESCE(SUM({ref_case}), 0) AS refund_deduct,
                COALESCE(SUM(CASE WHEN t.direction = 'income' THEN {SQL_CNY_AMOUNT} ELSE 0 END), 0) AS total_in,
-               COUNT(*) AS txn_count
+               COALESCE(SUM(CASE WHEN t.direction IN ('expense', 'income') THEN 1 ELSE 0 END), 0) AS txn_count
         FROM transactions t
         LEFT JOIN categories c ON t.category_id = c.id
         WHERE {where_base}
@@ -919,12 +1132,15 @@ def calculate_stats_account(
         for r in conn.execute("SELECT id, kind, bank, tail, alias, currency FROM accounts").fetchall()
     }
 
-    grand_total_out = sum(int(r["total_out"]) for r in rows)
-    grand_total_in = sum(int(r["total_in"]) for r in rows)
+    computed_rows = [
+        (r["effective_acc_id"], max(0, int(r["gross_out"]) - int(r["refund_deduct"])), int(r["total_in"]), int(r["txn_count"]))
+        for r in rows
+    ]
+    grand_total_out = sum(item[1] for item in computed_rows)
+    grand_total_in = sum(item[2] for item in computed_rows)
 
     items: List[AccountStatItem] = []
-    for r in rows:
-        acc_id = r["effective_acc_id"]
+    for acc_id, out_c, in_c, cnt in computed_rows:
         meta = acc_lookup.get(acc_id)
         if meta:
             name = meta["alias"] or (f"{meta['bank']}({meta['tail']})" if meta["tail"] else meta["bank"])
@@ -937,9 +1153,6 @@ def calculate_stats_account(
             tail = None
             acc_type = "unknown"
 
-        out_c = int(r["total_out"])
-        in_c = int(r["total_in"])
-
         items.append(
             AccountStatItem(
                 account_id=acc_id,
@@ -950,7 +1163,7 @@ def calculate_stats_account(
                 total_out_cents=out_c,
                 total_in_cents=in_c,
                 net_cents=in_c - out_c,
-                transaction_count=int(r["txn_count"]),
+                transaction_count=cnt,
                 percentage=round((out_c / grand_total_out) * 100.0, 2) if grand_total_out > 0 else 0.0,
             )
         )
