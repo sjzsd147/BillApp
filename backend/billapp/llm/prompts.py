@@ -102,21 +102,100 @@ def sanitize_transaction_for_llm(txn: Any, holder_name: HolderNamesArg = None) -
     t_id = _get_val(txn, "id")
     cat_key = _get_val(txn, "category_key")
     cat_name = _get_val(txn, "category_name")
+    txn_time = _get_val(txn, "txn_time")
+    time_precision = _get_val(txn, "time_precision")
+    post_date = _get_val(txn, "post_date")
+    channel = _get_val(txn, "channel")
+    source = _get_val(txn, "source")
+    currency = _get_val(txn, "currency")
 
     result: Dict[str, Any] = {
         "id": t_id,
         "counterparty": sanitize_prompt_text(cp or "", holder_name),
         "merchant_norm": sanitize_prompt_text(mn or "", holder_name),
         "description": sanitize_prompt_text(desc or "", holder_name),
-        "platform_category": plat_cat or "",
+        "platform_category": sanitize_prompt_text(str(plat_cat), holder_name) if plat_cat else "",
         "amount_yuan": round(amt_cents / 100.0, 2),
         "direction": direction or "expense",
     }
+    if txn_time:
+        clean_time = sanitize_prompt_text(str(txn_time).strip(), holder_name)
+        if clean_time:
+            result["txn_time"] = clean_time
+    if time_precision and str(time_precision).strip() in ("second", "minute", "day"):
+        result["time_precision"] = str(time_precision).strip()
+    if post_date:
+        clean_post = sanitize_prompt_text(str(post_date).strip(), holder_name)
+        if clean_post and clean_post != str(result.get("txn_time", ""))[:10]:
+            result["post_date"] = clean_post
+    if channel:
+        clean_channel = sanitize_prompt_text(str(channel).strip(), holder_name)
+        if clean_channel:
+            result["channel"] = clean_channel
+    if source:
+        clean_source = sanitize_prompt_text(str(source).strip(), holder_name)
+        if clean_source:
+            result["source"] = clean_source
+    if currency:
+        clean_curr = str(currency).strip().upper()
+        if clean_curr and clean_curr != "CNY":
+            result["currency"] = clean_curr
     if cat_key:
         result["category_key"] = str(cat_key)
     if cat_name:
         result["category_name"] = sanitize_prompt_text(str(cat_name), holder_name)
     return result
+
+
+def _compact_txn_for_prompt(sanitized: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop empty string fields and redundant merchant_norm to reduce prompt tokens."""
+    compact: Dict[str, Any] = {}
+    cp = sanitized.get("counterparty")
+    for k, v in sanitized.items():
+        if k in ("id", "amount_yuan", "direction"):
+            compact[k] = v
+            continue
+        if v is None or v == "":
+            continue
+        if k == "merchant_norm" and cp and v == cp:
+            continue
+        compact[k] = v
+    return compact
+
+
+def _filter_taxonomy_for_transactions(
+    transactions: List[Any],
+    candidate_categories: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Restrict candidate taxonomy by direction when all transactions share expense or income."""
+    if not transactions or not candidate_categories:
+        return candidate_categories
+    dirs = {
+        str(_get_val(t, "direction", "expense") or "expense").strip().lower()
+        for t in transactions
+    }
+    if dirs == {"expense"} or dirs == {"income"}:
+        only_dir = next(iter(dirs))
+        filtered = [c for c in candidate_categories if str(c.get("direction") or "").lower() == only_dir]
+        if filtered:
+            return filtered
+    return candidate_categories
+
+
+def _format_compact_taxonomy(categories: List[Dict[str, Any]]) -> str:
+    """Format category hierarchy compactly to save prompt tokens while keeping keys explicit."""
+    lines: List[str] = []
+    for cat in categories:
+        c_key = cat.get("key")
+        c_name = cat.get("name")
+        c_dir = cat.get("direction")
+        sub_keys = [f"{s.get('key')}({s.get('name')})" for s in cat.get("subcategories", [])]
+        header = f"{c_key}({c_name},{c_dir})" if c_dir else f"{c_key}({c_name})"
+        if sub_keys:
+            lines.append(f"- {header}: {', '.join(sub_keys)}")
+        else:
+            lines.append(f"- {header}")
+    return "\n".join(lines)
 
 
 # =========================================================================
@@ -127,11 +206,13 @@ def sanitize_transaction_for_llm(txn: Any, holder_name: HolderNamesArg = None) -
 # Task 1: Fallback Classification
 # -------------------------------------------------------------------------
 CLASSIFY_FALLBACK_SYSTEM = """你是一个专业的个人财务账单分类助手。
-你的任务是根据交易对方、商品描述、金额和收支方向，将账单记录精确归类到给定的分类体系中。
+你的任务是根据交易对方、商品描述、金额、交易时间、渠道和收支方向，将账单记录精确归类到给定的分类体系中。
 
 约束：
 1. 只能从【候选分类列表】中选择 category_key 和 subcategory_key，严禁自创分类！
-2. 返回 JSON 格式：
+2. 严格遵守收支方向一致：direction="expense" 只能选 expense 类，direction="income" 只能选 income 类。
+3. 可结合交易时间（如午/晚餐时段、深夜出行）、金额与渠道综合判断；reason 保持极简（10字以内）。
+4. 严格返回 JSON 格式：
 {
   "results": [
     {
@@ -139,11 +220,11 @@ CLASSIFY_FALLBACK_SYSTEM = """你是一个专业的个人财务账单分类助�
       "category_key": "food",
       "subcategory_key": "food.dining",
       "confidence": 0.95,
-      "reason": "简短分类理由（15字以内）"
+      "reason": "简短理由"
     }
   ]
 }
-3. 若完全无法判断，confidence 设为 0.0，category_key 设为 null。
+5. 若完全无法判断，confidence 设为 0.0，category_key 设为 null。
 """
 
 def build_classify_fallback_prompt(
@@ -152,18 +233,18 @@ def build_classify_fallback_prompt(
     holder_name: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Generate system and user prompts for Task 1: Fallback Classification."""
-    sanitized_txns = [sanitize_transaction_for_llm(t, holder_name) for t in transactions]
-
-    tax_summary = []
-    for cat in candidate_categories:
-        sub_keys = [f"{s.get('key')} ({s.get('name')})" for s in cat.get("subcategories", [])]
-        tax_summary.append(f"- 一级: {cat.get('key')} ({cat.get('name')}, {cat.get('direction')}) -> 子分类: {', '.join(sub_keys)}")
+    compact_txns = [
+        _compact_txn_for_prompt(sanitize_transaction_for_llm(t, holder_name))
+        for t in transactions
+    ]
+    scoped_categories = _filter_taxonomy_for_transactions(transactions, candidate_categories)
+    tax_block = _format_compact_taxonomy(scoped_categories)
 
     user_prompt = f"""【候选分类列表】:
-{chr(10).join(tax_summary)}
+{tax_block}
 
 【待分类交易记录】:
-{json.dumps(sanitized_txns, ensure_ascii=False, indent=2)}
+{json.dumps(compact_txns, ensure_ascii=False, separators=(",", ":"))}
 
 请对上述所有记录进行分类并输出 JSON。"""
 
@@ -174,7 +255,7 @@ def build_classify_fallback_prompt(
 # Task 2: Classification Review
 # -------------------------------------------------------------------------
 REVIEW_CLASSIFICATION_SYSTEM = """你是一名资深财务审核员。你的任务是复核可能被规则引擎误分类的交易记录。
-若当前分类合理，设置 agree=true；若当前分类明显错误，设置 agree=false 并从【候选分类列表】中给出修正建议。
+若当前分类合理，设置 agree=true；若当前分类明显错误，设置 agree=false 并从【候选分类列表】中给出修正建议（需与收支方向一致）。
 
 返回 JSON 格式：
 {
@@ -197,18 +278,18 @@ def build_review_classification_prompt(
     holder_name: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Generate system and user prompts for Task 2: Classification Review."""
-    sanitized_txns = [sanitize_transaction_for_llm(t, holder_name) for t in transactions]
-
-    tax_summary = []
-    for cat in candidate_categories:
-        sub_keys = [f"{s.get('key')} ({s.get('name')})" for s in cat.get("subcategories", [])]
-        tax_summary.append(f"- {cat.get('key')} ({cat.get('name')}): {', '.join(sub_keys)}")
+    compact_txns = [
+        _compact_txn_for_prompt(sanitize_transaction_for_llm(t, holder_name))
+        for t in transactions
+    ]
+    scoped_categories = _filter_taxonomy_for_transactions(transactions, candidate_categories)
+    tax_block = _format_compact_taxonomy(scoped_categories)
 
     user_prompt = f"""【候选分类列表】:
-{chr(10).join(tax_summary)}
+{tax_block}
 
 【待复核记录】:
-{json.dumps(sanitized_txns, ensure_ascii=False, indent=2)}
+{json.dumps(compact_txns, ensure_ascii=False, separators=(",", ":"))}
 
 请逐条复核并输出 JSON。"""
 
@@ -222,9 +303,9 @@ DEDUP_ARBITRATION_SYSTEM = """你是一个多源对账仲裁助手。你的任�
 一条记录来自支付平台（支付宝/微信），另一条来自银行卡流水（借记卡/信用卡）。
 
 请仔细比较：
-1. 金额是否一致
-2. 交易时间差距（银行入账可能有延迟或只精确到天）
-3. 商户名关系（例如 支付宝上的『麦当劳』与工行流水上的『支付宝-金拱门（中国）有限公司』是同一商户）
+1. 金额与币种是否一致
+2. 交易时间差距（参考 txn_time / time_precision / post_date；银行入账可能有延迟或只精确到天）
+3. 支付渠道（channel / source）与商户名关系（例如 支付宝上的『麦当劳』与工行流水上的『支付宝-金拱门（中国）有限公司』是同一商户）
 
 返回 JSON 格式：
 {
@@ -241,16 +322,16 @@ def build_dedup_arbitration_prompt(
     holder_name: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Generate system and user prompts for Task 3: Dedup Arbitration."""
-    p_info = sanitize_transaction_for_llm(primary_txn, holder_name)
-    s_info = sanitize_transaction_for_llm(secondary_txn, holder_name)
+    p_info = _compact_txn_for_prompt(sanitize_transaction_for_llm(primary_txn, holder_name))
+    s_info = _compact_txn_for_prompt(sanitize_transaction_for_llm(secondary_txn, holder_name))
 
     user_prompt = f"""【当前匹配得分】: {score:.2f}
 
 【主记录 (支付平台)】:
-{json.dumps(p_info, ensure_ascii=False, indent=2)}
+{json.dumps(p_info, ensure_ascii=False, separators=(",", ":"))}
 
 【候选记录 (银行流水)】:
-{json.dumps(s_info, ensure_ascii=False, indent=2)}
+{json.dumps(s_info, ensure_ascii=False, separators=(",", ":"))}
 
 请仲裁这两条记录是否为同笔交易并输出 JSON。"""
 

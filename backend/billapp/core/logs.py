@@ -345,7 +345,9 @@ def get_log_file_metadata(files: Sequence[Path]) -> List[Dict[str, Any]]:
                 {
                     "name": p.name,
                     "size_bytes": int(st.st_size),
-                    "modified_at": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                    "modified_at": format_local_log_timestamp(
+                        datetime.fromtimestamp(st.st_mtime), include_ms=False
+                    ),
                 }
             )
         except OSError:

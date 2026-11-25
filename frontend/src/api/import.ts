@@ -46,13 +46,13 @@ export async function previewImport(
     formData.append('use_llm', 'true');
   }
   return apiClient.post('/import/preview', formData, {
-    timeout: useLlm ? 120000 : 60000,
+    timeout: useLlm ? 300000 : 60000,
   });
 }
 
 export function commitImport(data: CommitRequest): Promise<ImportCommitResponse> {
   return apiClient.post('/import/commit', data, {
-    timeout: 120000,
+    timeout: 300000,
   });
 }
 

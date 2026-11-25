@@ -376,6 +376,8 @@ def test_import_and_security_operations_emit_sanitized_logs_with_timezone(tmp_pa
             diag = json.loads(zf.read("diagnostics.json").decode("utf-8"))
             assert re.search(r"[+-]\d{2}:\d{2}$", diag["exported_at"])
             assert diag["runtime"].get("timezone", "").startswith("UTC")
+            for bf in diag["logs"]["backend_files"]:
+                assert re.search(r"[+-]\d{2}:\d{2}$", bf["modified_at"])
 
     joined = "\n".join(rec.getMessage() for rec in caplog.records)
     assert "UNAUTHORIZED" in joined

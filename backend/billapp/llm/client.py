@@ -234,6 +234,88 @@ class LLMConfig:
 # Robust JSON Extractor
 # =========================================================================
 
+def _extract_delta_text(raw_val: Any) -> str:
+    """Extract raw string fragment from a streaming delta field without stripping whitespace."""
+    if raw_val is None:
+        return ""
+    if isinstance(raw_val, str):
+        return raw_val
+    if isinstance(raw_val, list):
+        parts: List[str] = []
+        for item in raw_val:
+            if isinstance(item, dict):
+                txt = item.get("text")
+                if isinstance(txt, str):
+                    parts.append(txt)
+            elif isinstance(item, str):
+                parts.append(item)
+        return "".join(parts)
+    return str(raw_val)
+
+
+def _parse_sse_line(raw_line: str) -> Tuple[str, str, Optional[Dict[str, Any]], bool]:
+    """Parse one SSE line into (content_delta, reasoning_delta, usage_dict, is_done)."""
+    line = raw_line.strip()
+    if not line or line.startswith(":"):
+        return "", "", None, False
+    if not line.startswith("data:"):
+        return "", "", None, False
+    data_str = line[5:].strip()
+    if not data_str:
+        return "", "", None, False
+    if data_str == "[DONE]":
+        return "", "", None, True
+    try:
+        chunk = json.loads(data_str)
+    except Exception:
+        return "", "", None, False
+    if not isinstance(chunk, dict):
+        return "", "", None, False
+    if chunk.get("error") and not chunk.get("choices"):
+        raise RuntimeError(f"LLM stream error: {chunk['error']}")
+    usage = chunk.get("usage") if isinstance(chunk.get("usage"), dict) else None
+    choices = chunk.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        delta = first.get("delta") or first.get("message") or {}
+        if isinstance(delta, dict):
+            content_delta = _extract_delta_text(delta.get("content"))
+            reasoning_delta = _extract_delta_text(
+                delta.get("reasoning_content") if "reasoning_content" in delta else delta.get("reasoning")
+            )
+            return content_delta, reasoning_delta, usage, False
+    return "", "", usage, False
+
+
+def _extract_json_response_content(data: Any) -> Tuple[str, int, int]:
+    """Extract normalized text content and token usage from a non-streaming JSON response."""
+    if isinstance(data, dict) and "choices" in data and data["choices"]:
+        choice = data["choices"][0]
+        msg = choice.get("message", {}) if isinstance(choice, dict) else {}
+        raw_content = msg.get("content", "") if isinstance(msg, dict) else ""
+        content = _normalize_message_content(raw_content)
+        if not content and isinstance(msg, dict):
+            fallback_reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+            content = _normalize_message_content(fallback_reasoning)
+    elif isinstance(data, dict) and "content" in data and isinstance(data["content"], (str, list)):
+        content = _normalize_message_content(data["content"])
+    else:
+        content = json.dumps(data, ensure_ascii=False)
+
+    usage = data.get("usage", {}) if isinstance(data, dict) else {}
+    if not isinstance(usage, dict):
+        usage = {}
+    p_tok = int(usage.get("prompt_tokens", 0) or 0)
+    c_tok = int(usage.get("completion_tokens", 0) or 0)
+    return content, p_tok, c_tok
+
+
+def _resolve_stream_wall_limit(timeout_sec: float) -> float:
+    """Overall wall-clock safety ceiling for an active SSE stream (prevents infinite loops)."""
+    t = max(float(timeout_sec or 60.0), 1.0)
+    return min(max(t * 2.5, t + 30.0), 480.0)
+
+
 def _normalize_message_content(raw_content: Any) -> str:
     """Normalize OpenAI-compatible message content and strip reasoning tags."""
     if raw_content is None:
@@ -428,8 +510,10 @@ class LLMClient:
         temperature: Optional[float] = None,
         use_json_mode: bool = True,
         use_cache: bool = True,
+        retry_on_timeout: bool = True,
+        use_stream: bool = True,
     ) -> Union[Dict[str, Any], List[Any]]:
-        """Asynchronously call chat completion with caching and backoff."""
+        """Asynchronously call chat completion with SSE streaming, caching, and backoff."""
         if not self.is_available():
             raise RuntimeError("LLM is disabled or not configured.")
 
@@ -453,6 +537,7 @@ class LLMClient:
             "Authorization": f"Bearer {self.config.api_key.strip()}",
         }
 
+        effective_stream = bool(use_stream)
         payload: Dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -460,10 +545,14 @@ class LLMClient:
         }
         if use_json_mode:
             payload["response_format"] = {"type": "json_object"}
+        if effective_stream:
+            payload["stream"] = True
 
         backoff_delays = [1.0, 2.0, 4.0]
         attempts = 0
+        max_attempts = max(1, int(self.config.max_retries) + 1)
         last_error: Optional[Exception] = None
+        stream_wall_limit = _resolve_stream_wall_limit(self.config.timeout_sec)
 
         req_timeout = httpx.Timeout(self.config.timeout_sec, connect=min(float(self.config.timeout_sec), 10.0))
         async with httpx.AsyncClient(
@@ -473,41 +562,67 @@ class LLMClient:
         ) as client:
             while attempts <= self.config.max_retries:
                 attempts += 1
+                attempt_start = time.perf_counter()
                 try:
                     self.total_requests += 1
-                    resp = await client.post(url, headers=headers, json=payload)
+                    async with client.stream("POST", url, headers=headers, json=payload) as resp:
+                        # Handle models rejecting response_format or stream (HTTP 400)
+                        if resp.status_code == 400 and (use_json_mode or effective_stream):
+                            await resp.aread()
+                            if use_json_mode:
+                                logger.debug("Server rejected JSON mode (HTTP 400); retrying without response_format")
+                                payload.pop("response_format", None)
+                                use_json_mode = False
+                            else:
+                                logger.debug("Server rejected SSE stream (HTTP 400); retrying without stream")
+                                payload.pop("stream", None)
+                                effective_stream = False
+                            attempts -= 1
+                            continue
 
-                    # Handle models rejecting response_format (400 error)
-                    if resp.status_code == 400 and use_json_mode:
-                        logger.debug("Server rejected JSON mode (HTTP 400); retrying without response_format")
-                        payload.pop("response_format", None)
-                        use_json_mode = False
-                        continue
+                        # Hard auth errors do not retry
+                        if resp.status_code in (401, 403):
+                            await resp.aread()
+                            raise httpx.HTTPStatusError(
+                                f"LLM Authentication failed (HTTP {resp.status_code}): {resp.text[:100]}",
+                                request=resp.request,
+                                response=resp,
+                            )
 
-                    # Hard auth errors do not retry
-                    if resp.status_code in (401, 403):
-                        raise httpx.HTTPStatusError(
-                            f"LLM Authentication failed (HTTP {resp.status_code}): {resp.text[:100]}",
-                            request=resp.request,
-                            response=resp,
-                        )
+                        if resp.status_code >= 400:
+                            await resp.aread()
+                            resp.raise_for_status()
 
-                    resp.raise_for_status()
-                    data = resp.json()
+                        content_type = (resp.headers.get("content-type") or "").lower()
+                        if "text/event-stream" in content_type:
+                            content_parts: List[str] = []
+                            reasoning_parts: List[str] = []
+                            p_tok = 0
+                            c_tok = 0
+                            async for raw_line in resp.aiter_lines():
+                                if (time.perf_counter() - attempt_start) > stream_wall_limit:
+                                    raise httpx.ReadTimeout(
+                                        f"LLM stream exceeded max duration ({stream_wall_limit:.0f}s)",
+                                        request=resp.request,
+                                    )
+                                c_delta, r_delta, usage_obj, is_done = _parse_sse_line(raw_line)
+                                if c_delta:
+                                    content_parts.append(c_delta)
+                                if r_delta:
+                                    reasoning_parts.append(r_delta)
+                                if usage_obj:
+                                    p_tok = int(usage_obj.get("prompt_tokens", p_tok) or p_tok)
+                                    c_tok = int(usage_obj.get("completion_tokens", c_tok) or c_tok)
+                                if is_done:
+                                    break
+                            content = _normalize_message_content("".join(content_parts))
+                            if not content and reasoning_parts:
+                                content = _normalize_message_content("".join(reasoning_parts))
+                        else:
+                            await resp.aread()
+                            data = resp.json()
+                            content, p_tok, c_tok = _extract_json_response_content(data)
 
-                    # Extract text content (supports OpenAI choices envelope or direct JSON)
-                    if "choices" in data and data["choices"]:
-                        choice = data["choices"][0]
-                        content = _normalize_message_content(choice.get("message", {}).get("content", ""))
-                    elif "content" in data and isinstance(data["content"], (str, list)):
-                        content = _normalize_message_content(data["content"])
-                    else:
-                        content = json.dumps(data, ensure_ascii=False)
-
-                    # Extract usage
-                    usage = data.get("usage", {}) if isinstance(data, dict) else {}
-                    p_tok = usage.get("prompt_tokens", 0)
-                    c_tok = usage.get("completion_tokens", 0)
                     self.total_prompt_tokens += p_tok
                     self.total_completion_tokens += c_tok
 
@@ -521,15 +636,46 @@ class LLMClient:
 
                 except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as exc:
                     last_error = exc
+                    elapsed_ms = int((time.perf_counter() - attempt_start) * 1000)
                     # Do not retry on 400, 401, 403, 404
                     if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (400, 401, 403, 404):
                         raise
 
+                    if isinstance(exc, httpx.TimeoutException) and not retry_on_timeout:
+                        logger.warning(
+                            "LLM request timed out (task=%s model=%s timeout=%.1fs elapsed=%dms); skipping retry.",
+                            task_type,
+                            model,
+                            float(self.config.timeout_sec),
+                            elapsed_ms,
+                        )
+                        raise
+
                     if attempts <= self.config.max_retries:
                         delay = backoff_delays[min(attempts - 1, len(backoff_delays) - 1)]
-                        logger.warning("LLM request error (%s). Retrying in %ss...", exc, delay)
+                        logger.warning(
+                            "LLM request error (task=%s model=%s attempt=%d/%d timeout=%.1fs elapsed=%dms err=%s). Retrying in %ss...",
+                            task_type,
+                            model,
+                            attempts,
+                            max_attempts,
+                            float(self.config.timeout_sec),
+                            elapsed_ms,
+                            exc,
+                            delay,
+                        )
                         await asyncio.sleep(delay)
                     else:
+                        logger.warning(
+                            "LLM request failed after %d/%d attempts (task=%s model=%s timeout=%.1fs elapsed=%dms err=%s).",
+                            attempts,
+                            max_attempts,
+                            task_type,
+                            model,
+                            float(self.config.timeout_sec),
+                            elapsed_ms,
+                            exc,
+                        )
                         break
 
         raise last_error or RuntimeError("LLM request failed after retries.")
@@ -541,8 +687,10 @@ class LLMClient:
         temperature: Optional[float] = None,
         use_json_mode: bool = True,
         use_cache: bool = True,
+        retry_on_timeout: bool = True,
+        use_stream: bool = True,
     ) -> Union[Dict[str, Any], List[Any]]:
-        """Synchronously call chat completion with caching and backoff."""
+        """Synchronously call chat completion with SSE streaming, caching, and backoff."""
         if not self.is_available():
             raise RuntimeError("LLM is disabled or not configured.")
 
@@ -566,6 +714,7 @@ class LLMClient:
             "Authorization": f"Bearer {self.config.api_key.strip()}",
         }
 
+        effective_stream = bool(use_stream)
         payload: Dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -573,10 +722,14 @@ class LLMClient:
         }
         if use_json_mode:
             payload["response_format"] = {"type": "json_object"}
+        if effective_stream:
+            payload["stream"] = True
 
         backoff_delays = [0.05, 0.1, 0.2] if self.transport else [1.0, 2.0, 4.0]
         attempts = 0
+        max_attempts = max(1, int(self.config.max_retries) + 1)
         last_error: Optional[Exception] = None
+        stream_wall_limit = _resolve_stream_wall_limit(self.config.timeout_sec)
 
         req_timeout = httpx.Timeout(self.config.timeout_sec, connect=min(float(self.config.timeout_sec), 10.0))
         with httpx.Client(
@@ -586,41 +739,67 @@ class LLMClient:
         ) as client:
             while attempts <= self.config.max_retries:
                 attempts += 1
+                attempt_start = time.perf_counter()
                 try:
                     self.total_requests += 1
-                    resp = client.post(url, headers=headers, json=payload)
+                    with client.stream("POST", url, headers=headers, json=payload) as resp:
+                        # Handle models rejecting response_format or stream (HTTP 400)
+                        if resp.status_code == 400 and (use_json_mode or effective_stream):
+                            resp.read()
+                            if use_json_mode:
+                                logger.debug("Server rejected JSON mode (HTTP 400); retrying without response_format")
+                                payload.pop("response_format", None)
+                                use_json_mode = False
+                            else:
+                                logger.debug("Server rejected SSE stream (HTTP 400); retrying without stream")
+                                payload.pop("stream", None)
+                                effective_stream = False
+                            attempts -= 1
+                            continue
 
-                    # Handle models rejecting response_format (400 error)
-                    if resp.status_code == 400 and use_json_mode:
-                        logger.debug("Server rejected JSON mode (HTTP 400); retrying without response_format")
-                        payload.pop("response_format", None)
-                        use_json_mode = False
-                        continue
+                        # Hard auth errors do not retry
+                        if resp.status_code in (401, 403):
+                            resp.read()
+                            raise httpx.HTTPStatusError(
+                                f"LLM Authentication failed (HTTP {resp.status_code}): {resp.text[:100]}",
+                                request=resp.request,
+                                response=resp,
+                            )
 
-                    # Hard auth errors do not retry
-                    if resp.status_code in (401, 403):
-                        raise httpx.HTTPStatusError(
-                            f"LLM Authentication failed (HTTP {resp.status_code}): {resp.text[:100]}",
-                            request=resp.request,
-                            response=resp,
-                        )
+                        if resp.status_code >= 400:
+                            resp.read()
+                            resp.raise_for_status()
 
-                    resp.raise_for_status()
-                    data = resp.json()
+                        content_type = (resp.headers.get("content-type") or "").lower()
+                        if "text/event-stream" in content_type:
+                            content_parts: List[str] = []
+                            reasoning_parts: List[str] = []
+                            p_tok = 0
+                            c_tok = 0
+                            for raw_line in resp.iter_lines():
+                                if (time.perf_counter() - attempt_start) > stream_wall_limit:
+                                    raise httpx.ReadTimeout(
+                                        f"LLM stream exceeded max duration ({stream_wall_limit:.0f}s)",
+                                        request=resp.request,
+                                    )
+                                c_delta, r_delta, usage_obj, is_done = _parse_sse_line(raw_line)
+                                if c_delta:
+                                    content_parts.append(c_delta)
+                                if r_delta:
+                                    reasoning_parts.append(r_delta)
+                                if usage_obj:
+                                    p_tok = int(usage_obj.get("prompt_tokens", p_tok) or p_tok)
+                                    c_tok = int(usage_obj.get("completion_tokens", c_tok) or c_tok)
+                                if is_done:
+                                    break
+                            content = _normalize_message_content("".join(content_parts))
+                            if not content and reasoning_parts:
+                                content = _normalize_message_content("".join(reasoning_parts))
+                        else:
+                            resp.read()
+                            data = resp.json()
+                            content, p_tok, c_tok = _extract_json_response_content(data)
 
-                    # Extract text content (supports OpenAI choices envelope or direct JSON)
-                    if "choices" in data and data["choices"]:
-                        choice = data["choices"][0]
-                        content = _normalize_message_content(choice.get("message", {}).get("content", ""))
-                    elif "content" in data and isinstance(data["content"], (str, list)):
-                        content = _normalize_message_content(data["content"])
-                    else:
-                        content = json.dumps(data, ensure_ascii=False)
-
-                    # Extract usage
-                    usage = data.get("usage", {}) if isinstance(data, dict) else {}
-                    p_tok = usage.get("prompt_tokens", 0)
-                    c_tok = usage.get("completion_tokens", 0)
                     self.total_prompt_tokens += p_tok
                     self.total_completion_tokens += c_tok
 
@@ -634,15 +813,46 @@ class LLMClient:
 
                 except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as exc:
                     last_error = exc
+                    elapsed_ms = int((time.perf_counter() - attempt_start) * 1000)
                     # Do not retry on 400, 401, 403, 404
                     if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (400, 401, 403, 404):
                         raise
 
+                    if isinstance(exc, httpx.TimeoutException) and not retry_on_timeout:
+                        logger.warning(
+                            "LLM request timed out (task=%s model=%s timeout=%.1fs elapsed=%dms); skipping retry.",
+                            task_type,
+                            model,
+                            float(self.config.timeout_sec),
+                            elapsed_ms,
+                        )
+                        raise
+
                     if attempts <= self.config.max_retries:
                         delay = backoff_delays[min(attempts - 1, len(backoff_delays) - 1)]
-                        logger.warning("LLM request error (%s). Retrying in %ss...", exc, delay)
+                        logger.warning(
+                            "LLM request error (task=%s model=%s attempt=%d/%d timeout=%.1fs elapsed=%dms err=%s). Retrying in %ss...",
+                            task_type,
+                            model,
+                            attempts,
+                            max_attempts,
+                            float(self.config.timeout_sec),
+                            elapsed_ms,
+                            exc,
+                            delay,
+                        )
                         time.sleep(delay)
                     else:
+                        logger.warning(
+                            "LLM request failed after %d/%d attempts (task=%s model=%s timeout=%.1fs elapsed=%dms err=%s).",
+                            attempts,
+                            max_attempts,
+                            task_type,
+                            model,
+                            float(self.config.timeout_sec),
+                            elapsed_ms,
+                            exc,
+                        )
                         break
 
         raise last_error or RuntimeError("LLM request failed after retries.")

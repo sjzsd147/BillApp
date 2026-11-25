@@ -588,6 +588,7 @@ export interface RuleSuggestionOut {
 export interface LLMClassifyRequest {
   batch_id?: number | null;
   transaction_ids?: number[] | null;
+  exclude_ids?: number[] | null;
   limit?: number;
   holder_name?: string | null;
   update_db?: boolean;
@@ -672,6 +673,7 @@ export interface LLMStatusResponse {
   enabled: boolean;
   base_url: string;
   model: string;
+  timeout_sec?: number;
   cache_count: number;
 }
 

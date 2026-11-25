@@ -751,7 +751,7 @@ async function handleAiSuggest(options?: { autoTriggered?: boolean } | Event) {
         file_name: fileName.value || undefined,
         file_type: detectedFileType.value || 'csv',
       },
-      { silent: autoTriggered }
+      { silent: autoTriggered, timeoutSec: appStore.llmStatus?.timeout_sec }
     );
     if (res.amount_mode) {
       amountMode.value = res.amount_mode;

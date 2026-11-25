@@ -14,11 +14,14 @@ Offline/disabled LLM mode NEVER raises unhandled exceptions and always falls bac
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Literal, Optional, Tuple
+
+import httpx
 
 from billapp.classify.categories import BUILTIN_TAXONOMY
 from billapp.classify.pipeline import ClassificationResult
@@ -51,6 +54,7 @@ from billapp.llm.prompts import (
     build_review_classification_prompt,
     build_statement_account_prompt,
     prepare_statement_lines_for_llm,
+    sanitize_prompt_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -234,17 +238,102 @@ def _parse_classify_chunk_response(
 # Task 1: Fallback Classification
 # =========================================================================
 
+DEFAULT_CLASSIFY_CHUNK_SIZE = 10
+_MIN_BISECT_CHUNK_SIZE = 6
+
+
+def _supports_kwarg(fn: Any, param_name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.kind == inspect.Parameter.VAR_KEYWORD or name == param_name
+        for name, p in sig.parameters.items()
+    )
+
+
+def _amount_tier_for_dedup(amount_cents: Any) -> str:
+    try:
+        amt = abs(int(amount_cents or 0))
+    except (TypeError, ValueError):
+        amt = 0
+    if amt <= 5000:
+        return "s"
+    if amt <= 50000:
+        return "m"
+    return "l"
+
+
+def _classify_dedup_signature(txn: Any, holder_name: Any = None) -> Optional[Tuple[str, ...]]:
+    """Build a semantic merchant signature for collapsing identical LLM classification items."""
+    cp = sanitize_prompt_text(str(_get_val(txn, "counterparty", "") or ""), holder_name).strip().lower()
+    mn = sanitize_prompt_text(str(_get_val(txn, "merchant_norm", "") or ""), holder_name).strip().lower()
+    desc = sanitize_prompt_text(str(_get_val(txn, "description", "") or ""), holder_name).strip().lower()
+    if not (cp or mn or desc):
+        return None
+    plat_cat = str(_get_val(txn, "platform_category", "") or "").strip().lower()
+    direction = str(_get_val(txn, "direction", "expense") or "expense").strip().lower()
+    currency = str(_get_val(txn, "currency", "CNY") or "CNY").strip().upper()
+    tier = _amount_tier_for_dedup(_get_val(txn, "amount_cents", 0))
+    return (direction, currency, cp, mn, desc, plat_cat, tier)
+
+
+def _deduplicate_txns_for_classify(
+    transactions: List[Any],
+    holder_name: Any = None,
+) -> Tuple[List[Any], List[int]]:
+    """Collapse transactions sharing the same semantic merchant signature into representatives."""
+    unique_txns: List[Any] = []
+    sig_to_rep_idx: Dict[Tuple[str, ...], int] = {}
+    orig_to_rep_idx: List[int] = []
+
+    for txn in transactions:
+        sig = _classify_dedup_signature(txn, holder_name=holder_name)
+        if sig is not None and sig in sig_to_rep_idx:
+            orig_to_rep_idx.append(sig_to_rep_idx[sig])
+        else:
+            rep_idx = len(unique_txns)
+            unique_txns.append(txn)
+            if sig is not None:
+                sig_to_rep_idx[sig] = rep_idx
+            orig_to_rep_idx.append(rep_idx)
+
+    return unique_txns, orig_to_rep_idx
+
+
+def _fanout_classification_results(
+    unique_results: List[ClassificationResult],
+    orig_to_rep_idx: List[int],
+) -> List[ClassificationResult]:
+    out: List[ClassificationResult] = []
+    for rep_idx in orig_to_rep_idx:
+        src = unique_results[rep_idx]
+        out.append(
+            ClassificationResult(
+                category_id=src.category_id,
+                source=src.source,
+                confidence=src.confidence,
+                rule_id=src.rule_id,
+                reason=src.reason,
+                category_key=src.category_key,
+                subcategory_key=src.subcategory_key,
+            )
+        )
+    return out
+
+
 async def classify_fallback_async(
     transactions: List[Any],
     client: LLMClient,
     key_to_id: Dict[str, int],
     holder_name: Optional[str] = None,
-    chunk_size: int = 25,
+    chunk_size: int = DEFAULT_CLASSIFY_CHUNK_SIZE,
     taxonomy: Optional[List[Dict[str, Any]]] = None,
     name_to_id: Optional[Dict[str, int]] = None,
     raise_on_error: bool = False,
 ) -> List[ClassificationResult]:
-    """Classify transactions via LLM in chunked batches."""
+    """Classify transactions via LLM with merchant-signature dedup and one-level timeout bisection."""
     if not transactions:
         return []
 
@@ -259,35 +348,57 @@ async def classify_fallback_async(
             for _ in transactions
         ]
 
-    results: List[ClassificationResult] = []
+    unique_txns, orig_to_rep_idx = _deduplicate_txns_for_classify(transactions, holder_name=holder_name)
+    unique_results: List[ClassificationResult] = []
     active_taxonomy = taxonomy or BUILTIN_TAXONOMY
+    supports_retry_flag = _supports_kwarg(client.chat_completion_async, "retry_on_timeout")
+    eff_chunk_size = max(1, int(chunk_size))
 
-    # Process in manageable chunks
-    for i in range(0, len(transactions), chunk_size):
-        chunk = transactions[i : i + chunk_size]
+    async def _run_subchunk(sub_chunk: List[Any], allow_bisect: bool) -> List[ClassificationResult]:
         sys_prompt, user_prompt = build_classify_fallback_prompt(
-            chunk, active_taxonomy, holder_name
+            sub_chunk, active_taxonomy, holder_name
         )
         messages = [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_prompt},
         ]
-
+        can_bisect = allow_bisect and len(sub_chunk) >= _MIN_BISECT_CHUNK_SIZE
+        call_kwargs: Dict[str, Any] = {
+            "task_type": "classify",
+            "messages": messages,
+            "temperature": 0.1,
+            "use_json_mode": True,
+        }
+        if supports_retry_flag and (can_bisect or not allow_bisect):
+            call_kwargs["retry_on_timeout"] = False
         try:
-            resp = await client.chat_completion_async(
-                task_type="classify",
-                messages=messages,
-                temperature=0.1,
-                use_json_mode=True,
-            )
-            results.extend(_parse_classify_chunk_response(resp, chunk, key_to_id, name_to_id))
+            resp = await client.chat_completion_async(**call_kwargs)
+            return _parse_classify_chunk_response(resp, sub_chunk, key_to_id, name_to_id)
+        except httpx.TimeoutException:
+            if can_bisect:
+                mid = len(sub_chunk) // 2
+                logger.warning(
+                    "LLM classify chunk timed out (size=%d); bisecting into %d + %d",
+                    len(sub_chunk),
+                    mid,
+                    len(sub_chunk) - mid,
+                )
+                left_res = await _run_subchunk(sub_chunk[:mid], allow_bisect=False)
+                right_res = await _run_subchunk(sub_chunk[mid:], allow_bisect=False)
+                return left_res + right_res
+            raise
 
+    # Process unique representatives in manageable chunks
+    for i in range(0, len(unique_txns), eff_chunk_size):
+        chunk = unique_txns[i : i + eff_chunk_size]
+        try:
+            unique_results.extend(await _run_subchunk(chunk, allow_bisect=True))
         except Exception as exc:
             logger.warning("LLM fallback classification failed: %s; falling back to none", exc)
             if raise_on_error:
                 raise
             for _ in chunk:
-                results.append(
+                unique_results.append(
                     ClassificationResult(
                         category_id=None,
                         source="none",
@@ -296,7 +407,7 @@ async def classify_fallback_async(
                     )
                 )
 
-    return results
+    return _fanout_classification_results(unique_results, orig_to_rep_idx)
 
 
 def classify_fallback_sync(
@@ -304,12 +415,12 @@ def classify_fallback_sync(
     client: LLMClient,
     key_to_id: Dict[str, int],
     holder_name: Optional[str] = None,
-    chunk_size: int = 25,
+    chunk_size: int = DEFAULT_CLASSIFY_CHUNK_SIZE,
     taxonomy: Optional[List[Dict[str, Any]]] = None,
     name_to_id: Optional[Dict[str, int]] = None,
     raise_on_error: bool = False,
 ) -> List[ClassificationResult]:
-    """Classify transactions via LLM in chunked batches synchronously."""
+    """Classify transactions via LLM synchronously with merchant dedup and timeout bisection."""
     if not transactions:
         return []
 
@@ -324,34 +435,56 @@ def classify_fallback_sync(
             for _ in transactions
         ]
 
-    results: List[ClassificationResult] = []
+    unique_txns, orig_to_rep_idx = _deduplicate_txns_for_classify(transactions, holder_name=holder_name)
+    unique_results: List[ClassificationResult] = []
     active_taxonomy = taxonomy or BUILTIN_TAXONOMY
+    supports_retry_flag = _supports_kwarg(client.chat_completion_sync, "retry_on_timeout")
+    eff_chunk_size = max(1, int(chunk_size))
 
-    for i in range(0, len(transactions), chunk_size):
-        chunk = transactions[i : i + chunk_size]
+    def _run_subchunk(sub_chunk: List[Any], allow_bisect: bool) -> List[ClassificationResult]:
         sys_prompt, user_prompt = build_classify_fallback_prompt(
-            chunk, active_taxonomy, holder_name
+            sub_chunk, active_taxonomy, holder_name
         )
         messages = [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_prompt},
         ]
-
+        can_bisect = allow_bisect and len(sub_chunk) >= _MIN_BISECT_CHUNK_SIZE
+        call_kwargs: Dict[str, Any] = {
+            "task_type": "classify",
+            "messages": messages,
+            "temperature": 0.1,
+            "use_json_mode": True,
+        }
+        if supports_retry_flag and (can_bisect or not allow_bisect):
+            call_kwargs["retry_on_timeout"] = False
         try:
-            resp = client.chat_completion_sync(
-                task_type="classify",
-                messages=messages,
-                temperature=0.1,
-                use_json_mode=True,
-            )
-            results.extend(_parse_classify_chunk_response(resp, chunk, key_to_id, name_to_id))
+            resp = client.chat_completion_sync(**call_kwargs)
+            return _parse_classify_chunk_response(resp, sub_chunk, key_to_id, name_to_id)
+        except httpx.TimeoutException:
+            if can_bisect:
+                mid = len(sub_chunk) // 2
+                logger.warning(
+                    "LLM classify chunk timed out (size=%d); bisecting into %d + %d",
+                    len(sub_chunk),
+                    mid,
+                    len(sub_chunk) - mid,
+                )
+                left_res = _run_subchunk(sub_chunk[:mid], allow_bisect=False)
+                right_res = _run_subchunk(sub_chunk[mid:], allow_bisect=False)
+                return left_res + right_res
+            raise
 
+    for i in range(0, len(unique_txns), eff_chunk_size):
+        chunk = unique_txns[i : i + eff_chunk_size]
+        try:
+            unique_results.extend(_run_subchunk(chunk, allow_bisect=True))
         except Exception as exc:
             logger.warning("LLM fallback classification failed: %s; falling back to none", exc)
             if raise_on_error:
                 raise
             for _ in chunk:
-                results.append(
+                unique_results.append(
                     ClassificationResult(
                         category_id=None,
                         source="none",
@@ -360,7 +493,7 @@ def classify_fallback_sync(
                     )
                 )
 
-    return results
+    return _fanout_classification_results(unique_results, orig_to_rep_idx)
 
 
 # =========================================================================
@@ -416,7 +549,7 @@ async def review_classification_async(
     client: LLMClient,
     key_to_id: Dict[str, int],
     holder_name: Optional[str] = None,
-    chunk_size: int = 25,
+    chunk_size: int = DEFAULT_CLASSIFY_CHUNK_SIZE,
     taxonomy: Optional[List[Dict[str, Any]]] = None,
     name_to_id: Optional[Dict[str, int]] = None,
     raise_on_error: bool = False,
@@ -459,7 +592,7 @@ def review_classification_sync(
     client: LLMClient,
     key_to_id: Dict[str, int],
     holder_name: Optional[str] = None,
-    chunk_size: int = 25,
+    chunk_size: int = DEFAULT_CLASSIFY_CHUNK_SIZE,
     taxonomy: Optional[List[Dict[str, Any]]] = None,
     name_to_id: Optional[Dict[str, int]] = None,
     raise_on_error: bool = False,

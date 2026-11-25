@@ -1,4 +1,5 @@
 import apiClient from './client';
+import { resolveLlmBatchHttpTimeout } from './llm';
 import { MAX_STATEMENT_UPLOAD_BYTES, snapshotFileToMemory } from '@/utils/uploadFile';
 import type {
   ProfileSummary,
@@ -48,10 +49,10 @@ export async function testProfile(
 
 export function suggestMapping(
   data: SuggestMappingRequest,
-  options?: { silent?: boolean }
+  options?: { silent?: boolean; timeoutSec?: number | null }
 ): Promise<SuggestMappingResponse> {
   return apiClient.post('/profiles/suggest', data, {
-    timeout: 120000,
+    timeout: resolveLlmBatchHttpTimeout(options?.timeoutSec),
     ...(options?.silent ? { silent: true } : {}),
   } as any);
 }

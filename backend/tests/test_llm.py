@@ -1068,3 +1068,299 @@ class TestRegressionIssueFixes:
             sb = sug.json()
             assert sb["bank"] == "招商银行"
             assert sb["card_tail"] == "1234"
+
+    def test_classify_bisects_on_timeout_and_api_commits_incrementally(self, tmp_path, monkeypatch):
+        from fastapi.testclient import TestClient
+        from billapp.app import create_app
+        from billapp.core.db import create_connection
+        import billapp.api.llm as llm_api
+
+        # 1) Unit test: chunk of 10 times out -> bisects once into 5 + 5 and succeeds without 3x retry burn
+        seen_sizes: list[int] = []
+
+        def bisect_handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            user_msg = body["messages"][1]["content"]
+            marker = "【待分类交易记录】:\n"
+            raw_json = user_msg.split(marker, 1)[1].split("\n\n请对上述所有记录", 1)[0]
+            txns_in = json.loads(raw_json)
+            seen_sizes.append(len(txns_in))
+            if len(txns_in) > 5:
+                raise httpx.ReadTimeout("timed out", request=request)
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "results": [
+                        {
+                            "id": item["id"],
+                            "category_key": "food",
+                            "subcategory_key": "food.dining",
+                            "confidence": 0.93,
+                            "reason": "餐饮测试",
+                        }
+                        for item in txns_in
+                    ]
+                },
+            )
+
+        mem_conn = init_db(":memory:")
+        CategoryService.init_builtin_categories(mem_conn)
+        key_map = {r["key"]: r["id"] for r in mem_conn.execute("SELECT id, key FROM categories WHERE key IS NOT NULL")}
+        cfg = LLMConfig(base_url="https://api.test.com/v1", api_key="sk-key", max_retries=2, enabled=True)
+        cli = LLMClient(config=cfg, conn=mem_conn, transport=httpx.MockTransport(bisect_handler))
+        ten_txns = [{"id": i, "counterparty": f"餐厅{i}", "amount_cents": 2500, "direction": "expense"} for i in range(1, 11)]
+        res = classify_fallback_sync(ten_txns, cli, key_map, raise_on_error=True)
+        mem_conn.close()
+
+        assert seen_sizes == [10, 5, 5]
+        assert len(res) == 10
+        assert all(r.source == "llm" and r.category_id == key_map["food.dining"] for r in res)
+
+        # 2) API test: /api/llm/status exposes timeout_sec, /api/llm/classify caps retries,
+        #    commits chunk 1 even if chunk 2 times out, and respects exclude_ids.
+        db_path = tmp_path / "incremental_classify.db"
+        with TestClient(create_app(db_path=str(db_path))) as client:
+            client.put(
+                "/api/settings",
+                json={
+                    "llm": {
+                        "enabled": True,
+                        "base_url": "https://mock.llm/v1",
+                        "api_key": "sk-test",
+                        "model": "mock-model",
+                        "timeout_sec": 75.0,
+                        "task_classify_enabled": True,
+                    }
+                },
+            )
+            st = client.get("/api/llm/status")
+            assert st.status_code == 200
+            assert st.json()["timeout_sec"] == pytest.approx(75.0)
+
+            with create_connection(db_path) as conn:
+                conn.execute(
+                    "INSERT INTO accounts (kind, bank, tail, alias, currency) VALUES ('bank_debit', '测试银行', '0002', '测试卡', 'CNY')"
+                )
+                acct_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                conn.execute(
+                    "INSERT INTO import_batches (file_name, file_sha1, file_size, source, row_count) VALUES ('t2.csv', 'sha-inc-1', 100, 'manual', 12)"
+                )
+                batch_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                txn_ids = []
+                for idx in range(1, 13):
+                    conn.execute(
+                        """
+                        INSERT INTO transactions (batch_id, source, account_id, txn_time, time_precision, amount_cents, currency, direction, counterparty, description, category_id, category_source, fingerprint)
+                        VALUES (?, 'manual', ?, '2026-10-01 12:00:00', 'second', 1800, 'CNY', 'expense', ?, '测试消费', NULL, NULL, ?)
+                        """,
+                        (batch_id, acct_id, f"商户{idx}", f"fp-inc-{idx}"),
+                    )
+                    txn_ids.append(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                conn.commit()
+
+            captured_retries: list[int] = []
+            chunk_call = 0
+
+            def partial_timeout_handler(request: httpx.Request) -> httpx.Response:
+                nonlocal chunk_call
+                chunk_call += 1
+                body = json.loads(request.content.decode("utf-8"))
+                user_msg = body["messages"][1]["content"]
+                marker = "【待分类交易记录】:\n"
+                raw_json = user_msg.split(marker, 1)[1].split("\n\n请对上述所有记录", 1)[0]
+                txns_in = json.loads(raw_json)
+                if chunk_call == 1:
+                    return httpx.Response(
+                        status_code=200,
+                        json={
+                            "results": [
+                                {
+                                    "id": item["id"],
+                                    "category_key": "food",
+                                    "subcategory_key": "food.dining",
+                                    "confidence": 0.91,
+                                    "reason": "首批成功",
+                                }
+                                for item in txns_in
+                            ]
+                        },
+                    )
+                raise httpx.ReadTimeout("timed out", request=request)
+
+            def _make_client(config, conn=None):
+                captured_retries.append(config.max_retries)
+                return LLMClient(
+                    config=config,
+                    conn=conn,
+                    transport=httpx.MockTransport(partial_timeout_handler),
+                )
+
+            monkeypatch.setattr(llm_api, "LLMClient", _make_client)
+
+            # Request 12 rows -> chunk 1 (10 rows) succeeds & commits, chunk 2 (2 rows) times out
+            resp = client.post("/api/llm/classify", json={"limit": 12, "update_db": True})
+            assert resp.status_code == 200
+            body = resp.json()
+            assert captured_retries == [1]
+            assert body["success"] is True
+            assert body["status"] == "ok"
+            assert body["classified_count"] == 10
+            assert "部分批次分类中断" in (body["reason"] or "")
+
+            # Remaining 2 unclassified rows can be skipped with exclude_ids
+            remaining = client.get("/api/transactions?unclassified=true").json()["items"]
+            rem_ids = [item["id"] for item in remaining]
+            assert len(rem_ids) == 2
+
+            excl_resp = client.post(
+                "/api/llm/classify",
+                json={"limit": 10, "exclude_ids": rem_ids, "update_db": True},
+            )
+            assert excl_resp.status_code == 200
+            assert excl_resp.json()["results"] == []
+
+    def test_prompts_context_direction_scoping_merchant_dedup_and_sse_streaming(self, db_conn: sqlite3.Connection):
+        from billapp.classify.categories import BUILTIN_TAXONOMY
+
+        # 1) Task 3 dedup arbitration includes txn_time/time_precision/post_date/channel/source without leaking PII
+        p_txn = {
+            "id": 1,
+            "source": "alipay",
+            "txn_time": "2026-10-15 12:30:15",
+            "time_precision": "second",
+            "channel": "alipay",
+            "counterparty": "麦当劳(张三)",
+            "merchant_norm": "麦当劳",
+            "description": "午餐",
+            "amount_cents": 2750,
+            "direction": "expense",
+        }
+        s_txn = {
+            "id": 2,
+            "source": "icbc_credit",
+            "txn_time": "2026-10-15",
+            "time_precision": "day",
+            "post_date": "2026-10-16",
+            "channel": "alipay",
+            "counterparty": "支付宝-金拱门",
+            "merchant_norm": "金拱门",
+            "amount_cents": 2750,
+            "direction": "expense",
+            "currency": "USD",
+        }
+        _, dedup_user = build_dedup_arbitration_prompt(p_txn, s_txn, score=0.78, holder_name="张三")
+        assert "2026-10-15 12:30:15" in dedup_user
+        assert "2026-10-16" in dedup_user
+        assert '"channel":"alipay"' in dedup_user
+        assert '"time_precision":"day"' in dedup_user
+        assert '"currency":"USD"' in dedup_user
+        assert "张三" not in dedup_user
+
+        # 2) Task 1 prompt filters taxonomy to expense-only when all txns are expenses and emits compact JSON
+        exp_sys, exp_user = build_classify_fallback_prompt([p_txn], BUILTIN_TAXONOMY, holder_name="张三")
+        assert 'direction="expense"' in exp_sys
+        assert "food.dining" in exp_user
+        assert "salary.payroll" not in exp_user
+        assert "\n  {" not in exp_user
+
+        # 3) Merchant-signature deduplication collapses repeated merchants before calling LLM
+        sent_counts: list[int] = []
+
+        def dedup_classify_handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            user_msg = body["messages"][1]["content"]
+            marker = "【待分类交易记录】:\n"
+            raw_json = user_msg.split(marker, 1)[1].split("\n\n请对上述所有记录", 1)[0]
+            txns_in = json.loads(raw_json)
+            sent_counts.append(len(txns_in))
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "results": [
+                        {
+                            "id": item["id"],
+                            "category_key": "food",
+                            "subcategory_key": "food.dining" if item["amount_yuan"] < 100 else "housing.rent_mortgage",
+                            "confidence": 0.94,
+                            "reason": "去重测试",
+                        }
+                        for item in txns_in
+                    ]
+                },
+            )
+
+        key_map = {r["key"]: r["id"] for r in db_conn.execute("SELECT id, key FROM categories WHERE key IS NOT NULL")}
+        dedup_client = LLMClient(
+            config=LLMConfig(base_url="https://api.test.com/v1", api_key="sk-key", enabled=True),
+            conn=db_conn,
+            transport=httpx.MockTransport(dedup_classify_handler),
+        )
+        repeated_txns = [
+            {"id": 11, "counterparty": "楼下面馆", "merchant_norm": "楼下面馆", "amount_cents": 2200, "direction": "expense"},
+            {"id": 12, "counterparty": "楼下面馆", "merchant_norm": "楼下面馆", "amount_cents": 2800, "direction": "expense"},
+            {"id": 13, "counterparty": "楼下面馆", "merchant_norm": "楼下面馆", "amount_cents": 1900, "direction": "expense"},
+            {"id": 14, "counterparty": "物业中心", "merchant_norm": "物业中心", "amount_cents": 80000, "direction": "expense"},
+            {"id": 15, "counterparty": "物业中心", "merchant_norm": "物业中心", "amount_cents": 85000, "direction": "expense"},
+            # Same counterparty as #14/#15 but much smaller amount tier -> evaluated separately
+            {"id": 16, "counterparty": "物业中心", "merchant_norm": "物业中心", "amount_cents": 1500, "direction": "expense"},
+        ]
+        dedup_res = classify_fallback_sync(repeated_txns, dedup_client, key_map, raise_on_error=True)
+        assert sent_counts == [3]
+        assert len(dedup_res) == 6
+        assert all(r.category_id == key_map["food.dining"] for r in dedup_res[:3])
+        assert dedup_res[3].category_id == key_map["housing.rent_mortgage"]
+        assert dedup_res[4].category_id == key_map["housing.rent_mortgage"]
+        assert dedup_res[5].category_id == key_map["food.dining"]
+
+        # 4) SSE streaming parser separates reasoning_content from content & falls back cleanly on HTTP 400
+        sse_lines = [
+            'data: {"choices":[{"delta":{"reasoning_content":"Thinking about {fake: json}..."}}]}\n\n',
+            'data: {"choices":[{"delta":{"content":"{\\"verdict\\": \\"sa"}}]}\n\n',
+            'data: {"choices":[{"delta":{"content":"me\\", \\"confidence\\": 0.96}"}}],"usage":{"prompt_tokens":42,"completion_tokens":18}}\n\n',
+            "data: [DONE]\n\n",
+        ]
+        sse_body = "".join(sse_lines).encode("utf-8")
+
+        def sse_handler(request: httpx.Request) -> httpx.Response:
+            req_payload = json.loads(request.content.decode("utf-8"))
+            assert req_payload.get("stream") is True
+            return httpx.Response(
+                status_code=200,
+                headers={"Content-Type": "text/event-stream; charset=utf-8"},
+                content=sse_body,
+            )
+
+        sse_client = LLMClient(
+            config=LLMConfig(base_url="https://api.test.com/v1", api_key="sk-key", enabled=True),
+            conn=db_conn,
+            transport=httpx.MockTransport(sse_handler),
+        )
+        sse_out = sse_client.chat_completion_sync("arbitrate", [{"role": "user", "content": "sse-test"}], use_cache=False)
+        assert sse_out == {"verdict": "same", "confidence": 0.96}
+        assert sse_client.total_prompt_tokens == 42
+        assert sse_client.total_completion_tokens == 18
+
+        # 5) HTTP 400 rejecting response_format and stream downgrades transparently without burning retries
+        seen_payloads: list[dict] = []
+
+        def downgrade_handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            seen_payloads.append(body)
+            if "response_format" in body or body.get("stream"):
+                return httpx.Response(status_code=400, text="unsupported param")
+            return httpx.Response(
+                status_code=200,
+                json={"choices": [{"message": {"content": '{"downgraded": true}'}}]},
+            )
+
+        dg_client = LLMClient(
+            config=LLMConfig(base_url="https://api.test.com/v1", api_key="sk-key", max_retries=0, enabled=True),
+            conn=db_conn,
+            transport=httpx.MockTransport(downgrade_handler),
+        )
+        dg_out = dg_client.chat_completion_sync("classify", [{"role": "user", "content": "dg-test"}], use_cache=False)
+        assert dg_out == {"downgraded": True}
+        assert len(seen_payloads) == 3
+        assert "response_format" in seen_payloads[0] and seen_payloads[0].get("stream") is True
+        assert "response_format" not in seen_payloads[1] and seen_payloads[1].get("stream") is True
+        assert "response_format" not in seen_payloads[2] and "stream" not in seen_payloads[2]

@@ -7,7 +7,7 @@ import { useTransactionsStore } from '@/stores/transactions';
 import * as importApi from '@/api/import';
 import * as txApi from '@/api/transactions';
 import apiClient from '@/api/client';
-import { testLLM, listLLMModels } from '@/api/llm';
+import { testLLM, listLLMModels, classifyWithLLM, reviewWithLLM, resolveLlmBatchHttpTimeout } from '@/api/llm';
 
 describe('Pinia stores', () => {
   beforeEach(() => {
@@ -193,6 +193,24 @@ describe('Pinia stores', () => {
       '/llm/models',
       expect.objectContaining({ timeout_sec: 10 }),
       { timeout: 30000 }
+    );
+
+    expect(resolveLlmBatchHttpTimeout(60)).toBe(210000);
+    expect(resolveLlmBatchHttpTimeout(120)).toBe(390000);
+    expect(resolveLlmBatchHttpTimeout(180)).toBe(570000);
+
+    await classifyWithLLM({ limit: 10, exclude_ids: [1, 2] }, { timeoutSec: 90 });
+    expect(postSpy).toHaveBeenLastCalledWith(
+      '/llm/classify',
+      expect.objectContaining({ limit: 10, exclude_ids: [1, 2] }),
+      { timeout: 300000 }
+    );
+
+    await reviewWithLLM({ limit: 10 }, { timeoutSec: 60 });
+    expect(postSpy).toHaveBeenLastCalledWith(
+      '/llm/review',
+      expect.objectContaining({ limit: 10 }),
+      { timeout: 210000 }
     );
 
     postSpy.mockRestore();

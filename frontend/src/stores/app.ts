@@ -86,6 +86,7 @@ export const useAppStore = defineStore('app', () => {
         enabled: false,
         base_url: '',
         model: '',
+        timeout_sec: 60,
         cache_count: 0,
       };
     }

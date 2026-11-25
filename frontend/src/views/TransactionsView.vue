@@ -130,9 +130,10 @@
             plain
             size="default"
             :loading="aiClassifying"
+            :disabled="aiClassifying"
             @click="handleAiClassify"
           >
-            AI 智能分类
+            {{ aiClassifyProgress || 'AI 智能分类' }}
           </el-button>
           <el-button type="primary" plain size="default" :icon="Download" @click="handleExport">
             导出 Excel
@@ -520,6 +521,7 @@ import { useAppStore } from '@/stores/app';
 import { getTransaction, patchTransaction, getExportUrl } from '@/api/transactions';
 import { saveFxRate, retryTxnFx } from '@/api/fx';
 import { classifyWithLLM } from '@/api/llm';
+import { recordFrontendLog } from '@/utils/logCollector';
 import AmountText from '@/components/AmountText.vue';
 import DirectionTag from '@/components/DirectionTag.vue';
 import StatusTag from '@/components/StatusTag.vue';
@@ -886,6 +888,7 @@ const showManualRateDialog = ref(false);
 const savingFx = ref(false);
 const retryingFx = ref(false);
 const aiClassifying = ref(false);
+const aiClassifyProgress = ref('');
 const manualFxForm = reactive({
   currency: 'USD',
   rate: undefined as number | undefined,
@@ -1030,40 +1033,133 @@ function handleExport() {
   window.open(url, '_blank');
 }
 
+const AI_CLASSIFY_BATCH_SIZE = 10;
+const AI_CLASSIFY_MAX_AUTO_TOTAL = 100;
+
 async function handleAiClassify() {
+  if (aiClassifying.value) return;
   aiClassifying.value = true;
+  aiClassifyProgress.value = 'AI 分类中...';
+  const startedAt = Date.now();
+  let totalClassified = 0;
+  let totalEvaluated = 0;
+  let batchCount = 0;
+
   try {
-    const payload =
-      txnStore.selectedIds.length > 0
-        ? { transaction_ids: txnStore.selectedIds, limit: 100, update_db: true }
-        : { limit: 100, update_db: true };
-    const res = await classifyWithLLM(payload);
-    if (res.status === 'offline') {
-      ElMessage.warning('请先在“系统设置 -> 大语言模型 (AI 辅助)”中启用并保存 AI 配置');
-      return;
+    if (appStore.llmStatus?.timeout_sec == null) {
+      await appStore.fetchLLMStatus();
     }
-    if (res.status === 'disabled') {
-      ElMessage.warning(res.reason || '已在设置中关闭「未知交易兜底智能分类」开关');
-      return;
+    const timeoutSec = appStore.llmStatus?.timeout_sec ?? 60;
+    const selectedSnapshot = [...txnStore.selectedIds];
+    const hasSelection = selectedSnapshot.length > 0;
+    const evaluatedIds: number[] = [];
+    let stopReason: string | null = null;
+
+    if (hasSelection) {
+      const totalSelected = selectedSnapshot.length;
+      for (let offset = 0; offset < totalSelected; offset += AI_CLASSIFY_BATCH_SIZE) {
+        const slice = selectedSnapshot.slice(offset, offset + AI_CLASSIFY_BATCH_SIZE);
+        batchCount += 1;
+        aiClassifyProgress.value = `AI 分类中 (${Math.min(offset + slice.length, totalSelected)}/${totalSelected})...`;
+        const res = await classifyWithLLM(
+          { transaction_ids: slice, limit: slice.length, update_db: true },
+          { timeoutSec }
+        );
+        if (res.status === 'offline') {
+          ElMessage.warning('请先在“系统设置 -> 大语言模型 (AI 辅助)”中启用并保存 AI 配置');
+          return;
+        }
+        if (res.status === 'disabled') {
+          ElMessage.warning(res.reason || '已在设置中关闭「未知交易兜底智能分类」开关');
+          return;
+        }
+        if (!res.success) {
+          stopReason = res.reason || 'AI 分类请求失败';
+          break;
+        }
+        totalClassified += res.classified_count;
+        totalEvaluated += res.results.length;
+        if (res.reason) {
+          stopReason = res.reason;
+          break;
+        }
+      }
+    } else {
+      const maxBatches = Math.ceil(AI_CLASSIFY_MAX_AUTO_TOTAL / AI_CLASSIFY_BATCH_SIZE);
+      for (let b = 0; b < maxBatches; b += 1) {
+        batchCount += 1;
+        aiClassifyProgress.value =
+          totalClassified > 0
+            ? `AI 分类中 (已归类 ${totalClassified} 笔)...`
+            : `AI 分类中 (第 ${batchCount} 批)...`;
+        const res = await classifyWithLLM(
+          {
+            limit: AI_CLASSIFY_BATCH_SIZE,
+            exclude_ids: evaluatedIds.length > 0 ? evaluatedIds : undefined,
+            update_db: true,
+          },
+          { timeoutSec }
+        );
+        if (res.status === 'offline') {
+          ElMessage.warning('请先在“系统设置 -> 大语言模型 (AI 辅助)”中启用并保存 AI 配置');
+          return;
+        }
+        if (res.status === 'disabled') {
+          ElMessage.warning(res.reason || '已在设置中关闭「未知交易兜底智能分类」开关');
+          return;
+        }
+        if (!res.success) {
+          stopReason = res.reason || 'AI 分类请求失败';
+          break;
+        }
+        totalClassified += res.classified_count;
+        totalEvaluated += res.results.length;
+        for (const item of res.results) {
+          if (item.transaction_id) {
+            evaluatedIds.push(item.transaction_id);
+          }
+        }
+        if (res.reason) {
+          stopReason = res.reason;
+          break;
+        }
+        if (res.results.length < AI_CLASSIFY_BATCH_SIZE) {
+          break;
+        }
+      }
     }
-    if (!res.success) {
-      ElMessage.error(res.reason || 'AI 分类请求失败');
-      return;
-    }
-    if (res.classified_count > 0) {
-      ElMessage.success(`AI 已完成 ${res.classified_count} 笔未归类交易的智能分类`);
+
+    const elapsedMs = Date.now() - startedAt;
+    recordFrontendLog(
+      stopReason ? 'warn' : 'info',
+      'llm',
+      `classify batches=${batchCount} evaluated=${totalEvaluated} classified=${totalClassified} timeoutSec=${timeoutSec} (${elapsedMs}ms)${stopReason ? ` stop=${stopReason}` : ''}`
+    );
+
+    if (totalClassified > 0) {
       await Promise.all([txnStore.fetchList(), appStore.fetchMeta()]);
-    } else if (res.results.length === 0) {
+      if (stopReason) {
+        ElMessage.warning(`已完成 ${totalClassified} 笔智能分类，后续批次中断：${stopReason}`);
+      } else {
+        ElMessage.success(`AI 已完成 ${totalClassified} 笔未归类交易的智能分类`);
+      }
+    } else if (stopReason) {
+      ElMessage.error(stopReason);
+    } else if (totalEvaluated === 0) {
       ElMessage.info('当前暂无未分类交易需要 AI 处理');
     } else {
       ElMessage.info('AI 已评估待分类交易，暂无高置信度可自动落库的结果');
     }
   } catch (err: any) {
-    if (!err?.toasted) {
+    if (totalClassified > 0) {
+      await Promise.all([txnStore.fetchList(), appStore.fetchMeta()]);
+      ElMessage.warning(`已完成 ${totalClassified} 笔智能分类，后续请求异常：${err?.message || '请稍后重试'}`);
+    } else if (!err?.toasted) {
       ElMessage.error(err?.message || 'AI 分类失败');
     }
   } finally {
     aiClassifying.value = false;
+    aiClassifyProgress.value = '';
   }
 }
 

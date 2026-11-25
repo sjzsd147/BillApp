@@ -56,6 +56,7 @@ test('createDesktopLogger writes sanitized logs, rotates on size limit, and coll
     assert.ok(info.files.length >= 2, `Expected rotated backups, got ${info.files.length}`);
     assert.ok(info.files.length <= 3, `Expected at most 1 active + 2 backups, got ${info.files.length}`);
     assert.ok(info.totalSizeBytes > 0);
+    assert.match(info.files[0].modified_at, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/);
 
     const collected = logger.collectLogs();
     assert.equal(collected.length, info.files.length);
@@ -71,6 +72,7 @@ test('desktop log timestamps include explicit local UTC offset and main.cjs omit
   const sampleDate = new Date(2026, 10, 25, 21, 38, 42, 123);
   const ts = formatLocalTimestamp(sampleDate);
   assert.match(ts, /^2026-11-25 21:38:42\.123[+-]\d{2}:\d{2}$/);
+  assert.match(formatLocalTimestamp(sampleDate, { includeMs: false }), /^2026-11-25 21:38:42[+-]\d{2}:\d{2}$/);
   assert.equal(formatLocalFilenameStamp(sampleDate), '20261125-213842');
 
   const mainSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.cjs'), 'utf8');

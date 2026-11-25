@@ -1197,6 +1197,7 @@ def import_commit(
 
     # 5. Classification Pipeline (with optional LLM fallback when enabled; keep outer transaction atomic)
     llm_cfg = LLMConfig.load_from_db(db)
+    llm_cfg.max_retries = min(max(int(llm_cfg.max_retries), 0), 1)
     llm_client = (
         LLMClient(llm_cfg, conn=db, auto_commit=False)
         if (llm_cfg.enabled and llm_cfg.task_classify_enabled and llm_cfg.base_url.strip())
