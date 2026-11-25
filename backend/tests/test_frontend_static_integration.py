@@ -46,4 +46,4 @@ def test_api_health_works_with_static_mount(static_client: TestClient):
     """Test standard API endpoints work untouched when static distribution is mounted."""
     resp = static_client.get("/api/health")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok", "version": "1.2.2"}
+    assert resp.json() == {"status": "ok", "version": "1.2.3"}

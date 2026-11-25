@@ -16,7 +16,7 @@ describe('Pinia stores', () => {
 
   it('initializes app store with defaults', () => {
     const app = useAppStore();
-    expect(app.version).toBe('1.2.2');
+    expect(app.version).toBe('1.2.3');
     expect(app.pendingReviewCount).toBe(0);
     app.setPendingReviewCount(5);
     expect(app.pendingReviewCount).toBe(5);
